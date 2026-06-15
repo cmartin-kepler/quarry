@@ -54,6 +54,9 @@ enum Command {
         /// Only show tables whose impression is Suspect.
         #[arg(long)]
         suspect_only: bool,
+        /// Emit per-table evidence as a JSON array (for tooling).
+        #[arg(long)]
+        json: bool,
     },
     /// Import a real parser's output (Docling JSON) → artifacts, bypassing .qdoc.
     /// Proves the detector core runs on any parser's tables, not just the cheap one.
@@ -82,13 +85,13 @@ fn main() -> Result<()> {
         Command::ImportDocling { json, pdf, out } => {
             cmd_import_docling(&json, pdf.as_deref(), &out)
         }
-        Command::Explain { artifact_dir, suspect_only } => {
-            cmd_explain(&artifact_dir, suspect_only)
+        Command::Explain { artifact_dir, suspect_only, json } => {
+            cmd_explain(&artifact_dir, suspect_only, json)
         }
     }
 }
 
-fn cmd_explain(artifact_dir: &Path, suspect_only: bool) -> Result<()> {
+fn cmd_explain(artifact_dir: &Path, suspect_only: bool, json: bool) -> Result<()> {
     use quarry::analysis::RowKind;
     use quarry::evidence::{Impression, assess};
 
@@ -96,6 +99,37 @@ fn cmd_explain(artifact_dir: &Path, suspect_only: bool) -> Result<()> {
     let artifacts = store
         .current_artifacts()
         .with_context(|| "loading artifacts (did you `parse`/`import-docling` first?)")?;
+
+    if json {
+        let mut out = Vec::new();
+        for a in &artifacts {
+            let Some(t) = a.as_any().downcast_ref::<HtmlTable>() else {
+                continue;
+            };
+            let ev = assess(t);
+            let impression = match ev.impression {
+                Impression::Confirmed => "confirmed",
+                Impression::NoIssues => "no_issues",
+                Impression::Suspect => "suspect",
+            };
+            let signals: Vec<serde_json::Value> = ev
+                .signals
+                .iter()
+                .map(|s| serde_json::json!({"positive": s.positive, "detail": s.detail}))
+                .collect();
+            out.push(serde_json::json!({
+                "id": a.id().to_string(),
+                "rows": ev.n_rows,
+                "cols": ev.n_cols,
+                "header_rows": ev.header_rows,
+                "col_types": ev.col_types.iter().map(|c| col_tag(*c)).collect::<Vec<_>>(),
+                "impression": impression,
+                "signals": signals,
+            }));
+        }
+        println!("{}", serde_json::to_string(&out)?);
+        return Ok(());
+    }
 
     let mut shown = 0;
     let mut counts = (0usize, 0usize, 0usize); // confirmed, no-issues, suspect
