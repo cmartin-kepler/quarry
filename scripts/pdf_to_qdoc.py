@@ -35,21 +35,29 @@ import pdfplumber
 
 def words_to_spans(page) -> list[dict]:
     spans = []
-    for w in page.extract_words(use_text_flow=False, keep_blank_chars=False):
-        spans.append(
-            {
-                "text": w["text"],
-                "bbox": [
-                    round(float(w["x0"]), 2),
-                    round(float(w["top"]), 2),
-                    round(float(w["x1"]), 2),
-                    round(float(w["bottom"]), 2),
-                ],
-                # pdfplumber has no per-word confidence on born-digital text;
-                # 1.0 == digital. An OCR front-end would populate this.
-                "confidence": 1.0,
-            }
-        )
+    # extra_attrs=["upright"] splits words by orientation and tags each with
+    # `upright` (False for rotated/vertical text — e.g. figure axis labels or
+    # the attention-heatmap tokens in ML papers). pdfplumber emits rotated glyphs
+    # in reversed order, so flagging them lets the detectors discount the region
+    # instead of trusting garbled "cells".
+    for w in page.extract_words(
+        use_text_flow=False, keep_blank_chars=False, extra_attrs=["upright"]
+    ):
+        span = {
+            "text": w["text"],
+            "bbox": [
+                round(float(w["x0"]), 2),
+                round(float(w["top"]), 2),
+                round(float(w["x1"]), 2),
+                round(float(w["bottom"]), 2),
+            ],
+            # pdfplumber has no per-word confidence on born-digital text;
+            # 1.0 == digital. An OCR front-end would populate this.
+            "confidence": 1.0,
+        }
+        if not w.get("upright", True):
+            span["rotated"] = True  # omitted when upright (defaults to false)
+        spans.append(span)
     return spans
 
 
