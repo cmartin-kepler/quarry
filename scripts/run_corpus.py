@@ -25,9 +25,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
+
+# "N table(s): X likely-correct, Y no-issues, Z suspect"
+_SUMMARY_RE = re.compile(r":\s*(\d+) likely-correct,\s*(\d+) no-issues,\s*(\d+) suspect")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -53,8 +57,9 @@ def process(pdf: str, outdir: str, max_pages: int, timeout: int) -> dict:
     stem = os.path.splitext(os.path.basename(pdf))[0]
     qdoc = os.path.join(outdir, stem + ".qdoc")
     art = os.path.join(outdir, stem + ".artifacts")
-    row = {"doc": stem, "pages": 0, "spans": 0, "regions": 0,
-           "tables": 0, "flagged": 0, "status": "ok"}
+    row = {"doc": stem, "pages": 0, "spans": 0, "regions": 0, "tables": 0,
+           "confirmed": 0, "no_issues": 0, "suspect": 0, "suspect_detail": "",
+           "status": "ok"}
     try:
         # 1. bridge: pdf -> qdoc
         rc, _, err = run(
@@ -83,9 +88,13 @@ def process(pdf: str, outdir: str, max_pages: int, timeout: int) -> dict:
         manifest = json.load(open(os.path.join(art, "manifest.json")))
         row["tables"] = sum(1 for a in manifest["artifacts"] if a.get("kind") == "HtmlTable")
 
-        # 3. detectors: count tables with >=1 flag (from append-only verdicts)
-        verdicts = json.load(open(os.path.join(art, "verdicts.json")))
-        row["flagged"] = sum(1 for v in verdicts if v.get("flagged"))
+        # 3. evidence: per-table impression + the "why" for suspect tables.
+        rc, out, _ = run([QUARRY, "explain", art, "--suspect-only"], timeout)
+        m = _SUMMARY_RE.search(out)
+        if m:
+            row["confirmed"], row["no_issues"], row["suspect"] = (int(g) for g in m.groups())
+        # Keep the suspect blocks (everything before the trailing summary rule).
+        row["suspect_detail"] = out.split("\n────")[0].strip()
     except subprocess.TimeoutExpired:
         row["status"] = f"timeout(>{timeout}s)"
     except Exception as e:  # noqa: BLE001 - surface any failure per-doc, keep going
@@ -102,6 +111,8 @@ def main():
     ap.add_argument("--max-pages", type=int, default=50, help="page cap per doc")
     ap.add_argument("--max-mb", type=float, default=40.0, help="skip PDFs larger than this")
     ap.add_argument("--timeout", type=int, default=120, help="per-doc wall-clock limit (s)")
+    ap.add_argument("--examples", type=int, default=3,
+                    help="how many docs' suspect-table evidence to print at the end")
     args = ap.parse_args()
 
     if not os.path.exists(QUARRY):
@@ -124,28 +135,45 @@ def main():
         row["doc"] = name
         rows.append(row)
         print(f"  {row['status']:<14} {name}  "
-              f"({row['tables']} tables, {row['flagged']} flagged, "
+              f"({row['tables']} tables, {row['suspect']} suspect, "
               f"{time.monotonic() - t0:.1f}s)", file=sys.stderr)
 
-    # Summary table to stdout.
-    print(f"\n{'document':<48} {'pages':>5} {'spans':>7} {'regions':>7} "
-          f"{'tables':>6} {'flagged':>7}  status")
+    # Summary table to stdout. Impression columns come from `quarry explain`:
+    # confirmed = arithmetic reconciles, ok = no issues found, suspect = a signal
+    # suggests a mis-parse.
+    print(f"\n{'document':<46} {'pages':>5} {'tables':>6} {'confirm':>7} "
+          f"{'ok':>4} {'suspect':>7}  status")
     print("-" * 100)
     for r in rows:
-        print(f"{r['doc'][:48]:<48} {r['pages']:>5} {r['spans']:>7} {r['regions']:>7} "
-              f"{r['tables']:>6} {r['flagged']:>7}  {r['status']}")
+        print(f"{r['doc'][:46]:<46} {r['pages']:>5} {r['tables']:>6} {r['confirmed']:>7} "
+              f"{r['no_issues']:>4} {r['suspect']:>7}  {r['status']}")
 
     ok = [r for r in rows if r["status"] == "ok"]
     no_text = [r for r in rows if r["status"] == "no-text-layer"]
     tot_tables = sum(r["tables"] for r in ok)
-    tot_flagged = sum(r["flagged"] for r in ok)
-    print(f"\n{len(ok)}/{len(rows)} processed OK; "
-          f"{tot_tables} tables reconstructed, {tot_flagged} flagged by >=1 detector "
-          f"({100 * tot_flagged / tot_tables:.0f}%)" if tot_tables else
-          f"\n{len(ok)}/{len(rows)} processed OK; no tables reconstructed")
+    tot_conf = sum(r["confirmed"] for r in ok)
+    tot_suspect = sum(r["suspect"] for r in ok)
+    if tot_tables:
+        print(f"\n{len(ok)}/{len(rows)} processed OK; {tot_tables} tables: "
+              f"{tot_conf} arithmetic-confirmed, {tot_suspect} suspect "
+              f"({100 * tot_suspect / tot_tables:.0f}%).")
+    else:
+        print(f"\n{len(ok)}/{len(rows)} processed OK; no tables reconstructed")
     if no_text:
         print(f"{len(no_text)} doc(s) had NO text layer (scanned/outlined-vector — "
               f"need an OCR/VLM tier): {', '.join(r['doc'] for r in no_text)}")
+
+    # Examples: what got flagged SUSPECT and why (the per-table evidence).
+    examples = [r for r in rows if r["suspect"] and r["suspect_detail"]]
+    if examples:
+        shown = examples[: args.examples]
+        print(f"\n{'=' * 30} EXAMPLES: flagged SUSPECT and why {'=' * 30}")
+        for r in shown:
+            print(f"\n### {r['doc']}")
+            print(r["suspect_detail"])
+        if len(examples) > len(shown):
+            print(f"\n(+{len(examples) - len(shown)} more docs with suspect tables; "
+                  f"raise --examples or run `quarry explain <dir> --suspect-only`)")
     if skipped:
         print(f"\nskipped {len(skipped)} (size cap):")
         for name, why in skipped:

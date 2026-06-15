@@ -91,17 +91,30 @@ fn arithmetic_passes_a_table_that_reconciles() {
 }
 
 #[test]
-fn structural_flags_ragged_and_empty_grids() {
-    let risk = RiskMarkers {
-        merged_cell_rows: 2,
-        empty_cells: 3,
-        ..Default::default()
-    };
-    let table = table_from(&[&["a", "b"], &["1", "2"]], risk);
+fn structural_flags_stray_text_in_numeric_column() {
+    // "oops" sitting in an otherwise-numeric column => a shifted/merged cell.
+    let risk = RiskMarkers { min_ocr_confidence: 1.0, ..Default::default() };
+    let table = table_from(
+        &[&["Item", "2024"], &["Cash", "100"], &["Debt", "oops"], &["Misc", "300"]],
+        risk,
+    );
     let check = StructuralValidity;
     let doc = empty_doc();
     let ctx = CheckCtx { source: &doc };
     assert!(check.check(&table, &ctx).is_flag());
+}
+
+#[test]
+fn structural_passes_a_clean_table() {
+    let risk = RiskMarkers { min_ocr_confidence: 1.0, ..Default::default() };
+    let table = table_from(
+        &[&["Item", "2024"], &["Cash", "100"], &["Debt", "200"]],
+        risk,
+    );
+    let check = StructuralValidity;
+    let doc = empty_doc();
+    let ctx = CheckCtx { source: &doc };
+    assert!(!check.check(&table, &ctx).is_flag());
 }
 
 #[test]

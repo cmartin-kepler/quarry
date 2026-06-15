@@ -54,10 +54,13 @@ uv run scripts/run_corpus.py                      # ./input -> corpus/input
 uv run scripts/run_corpus.py /path/to/docs --out corpus/finance
 ```
 
-Recursively bridges every PDF, runs `quarry parse` + `quarry check` (the
-detectors), and prints a per-doc summary (pages, spans, detected regions, tables
-reconstructed, tables flagged). It caps pages/size and time-limits each doc, and
-reports — rather than silently swallowing — three real-world outcomes:
+Recursively bridges every PDF, runs `quarry parse` + `quarry explain` (the
+evidence report), and prints a per-doc summary with **impression counts**
+(`confirm` = arithmetic reconciles, `ok` = no issues, `suspect` = a signal
+suggests a mis-parse), then an **EXAMPLES** section showing the per-table
+evidence for the suspect tables — what got flagged and why. It caps pages/size
+and time-limits each doc, and reports — rather than silently swallowing — three
+real-world outcomes:
 
 - **`no-text-layer`**: 0 spans extracted (scanned or outlined-vector PDFs, e.g.
   some earnings decks). The born-digital path can't see these; they need a
@@ -65,13 +68,17 @@ reports — rather than silently swallowing — three real-world outcomes:
 - **size-skipped**: PDFs over `--max-mb`.
 - **bridge/parse error / timeout**: surfaced per doc.
 
+```bash
+uv run scripts/run_corpus.py --examples 3       # impression counts + suspect examples
+```
+
 No ground truth ⇒ **no catch rate** (that needs to know which extractions are
-actually wrong). `flagged` is how many reconstructed tables ≥1 detector marked
-suspicious. On a real finance set (Berkshire/JPM letters + ARs, investor decks,
-earnings releases) the cheap reconstruction flags ~25% of tables — and on dense
-multi-section earnings tables `intrinsic_arithmetic` catches reconciliations that
-don't hold (a clear sign the grid was mangled). To turn this into a catch rate,
-hand-label a few of the flagged tables and run `quarry eval`.
+actually wrong). Instead the evidence report says *why* each table looks correct
+or not. On the bundled finance+arXiv set, **0 cheap-parser tables are
+arithmetic-confirmed** (the naive reconstruction never produces a table whose
+subtotals reconcile), whereas Docling-parsed tables of the same filing do (run
+`quarry import-docling … && quarry explain …`). To turn suspicion into a catch
+rate, hand-label a few tables and run `quarry eval`.
 
 ## Ground truth — `build_truth.py`
 

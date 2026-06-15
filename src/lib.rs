@@ -20,11 +20,13 @@
 //! the async job queue, and the agents/indexes themselves (brief §6).
 
 pub mod adjudicate;
+pub mod analysis;
 pub mod artifact;
 pub mod check;
 pub mod core;
 pub mod doc;
 pub mod docling;
+pub mod evidence;
 pub mod eval;
 pub mod extract;
 pub mod pipeline;

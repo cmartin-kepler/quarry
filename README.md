@@ -148,19 +148,67 @@ exactly the kind of finding this harness exists to produce.
 To add Reducto / LlamaParse: write the analogous `their JSON → Vec<Box<dyn
 Artifact>>` adapter; nothing downstream changes.
 
+## How do we know a table parsed correctly? (`explain`)
+
+Real documents have no ground truth, so we can't *prove* a parse is right — but
+we can gather the signals an analyst would, each with concrete evidence.
+`quarry explain <artifact-dir>` prints, per table, a typed-column / classified-row
+model and positive/negative signals leading to an overall impression:
+
+```
+▌ art_3c5ca…  (5x3, 1 header row(s))
+  columns: 0:label  1:num  2:num
+  ✓ 1 subtotal/total row(s) reconcile across 2 column-check(s) — e.g. 'Total current assets' col 1 = 7550
+  ✓ all 2 numeric column(s) parse cleanly (no stray text)
+  ✓ every data row fills all 2 numeric column(s)
+  ⇒ LIKELY CORRECT (arithmetic reconciles)
+```
+
+- **Positive** (suggests correct): subtotal/total rows **reconcile** (many
+  independent arithmetic constraints holding is hard to fake — the strongest
+  signal), numeric columns parse cleanly, every data row fills its numeric cells.
+- **Negative** (suggests mis-parse): a total doesn't reconcile, non-numeric text
+  in a numeric column (a shifted/merged cell), empty cells in data rows, rotated
+  text / low OCR confidence.
+- **Impression**: `LIKELY CORRECT` (arithmetic confirms) / `NO ISSUES` (clean but
+  no arithmetic to confirm) / `SUSPECT` (a signal fired).
+
+The detectors are **section-aware** (`src/analysis.rs`): they skip all header
+rows (so a date header isn't summed), exclude percentage columns, treat
+section-label rows ("Exclude:", "Add (subtract):") as annotations, and reconcile
+each subtotal against the data rows since the previous total. This is what lets a
+real multi-section filing reconcile instead of false-alarming — and it shifts the
+bottleneck from the parser to table semantics.
+
+Run it across a folder (per-doc impression counts + examples of what got flagged
+and why):
+
+```bash
+uv run scripts/run_corpus.py --examples 3        # bridge -> parse -> explain, with examples
+cargo run -- explain corpus/foo.artifacts --suspect-only
+```
+
+On the bundled finance+arXiv corpus this surfaces, e.g., the Transformer paper's
+`"positionalembeddinginsteadofsinusoids"` shifted into a numeric column, and — the
+headline contrast — **0 cheap-parser tables are arithmetic-confirmed, while
+Docling-parsed tables of the same filing reconcile** (3 confirmed).
+
 ## What's implemented (brief §6 Phase 0)
 
 | Piece | Where | Notes |
 |---|---|---|
 | Object-safe `Artifact` core + `Text`/`HtmlTable` | `src/artifact.rs` | hybrid payload strategy (see below) |
 | `PdfTextLayerReconstructor` | `src/extract.rs` | naive geometric table reconstruction from a `.qdoc` text layer (NOT a PDF-byte parser — that's `scripts/pdf_to_qdoc.py`) |
-| `IntrinsicArithmetic` detector | `src/check.rs` | rows-sum-to-total reconciliation (~free) |
-| `StructuralValidity` detector | `src/check.rs` | ragged columns, empty/merged cells, OCR conf |
+| Table model (typed cols, classified rows, reconciliation) | `src/analysis.rs` | section-aware; shared by detectors + `explain` |
+| `IntrinsicArithmetic` detector | `src/check.rs` | section-aware subtotal/total reconciliation |
+| `StructuralValidity` detector | `src/check.rs` | stray text in numeric cols, empty data cells, rotation |
 | `AnswerSupport` (claim-time) | `src/check.rs` | crops cited bbox, verifies the claim |
+| Evidence report ("how do we know") | `src/evidence.rs` | positive/negative signals + impression |
 | `Adjudicator` + append-only verdicts | `src/adjudicate.rs` | default-at-parse, surface only ambiguity |
 | Flat store + single current-view fn | `src/store.rs` | `current_artifacts()` is the one access point |
+| Docling adapter (real parser → Artifact) | `src/docling.rs` | bypasses `.qdoc`; `import-docling` CLI |
 | `eval` catch-rate harness | `src/eval.rs` | structural diff vs ground truth, per-detector |
-| `parse`/`check`/`eval`/`inspect` CLIs | `src/main.rs` | brief §5 |
+| `parse`/`check`/`eval`/`explain`/`inspect`/`import-docling` CLIs | `src/main.rs` | brief §5 + evidence |
 
 ### Deliberately deferred (brief §6)
 

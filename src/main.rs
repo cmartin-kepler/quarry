@@ -47,6 +47,14 @@ enum Command {
     },
     /// Dump document structure: pages, elements, anchors, reading order.
     Inspect { file: PathBuf },
+    /// Explain, per table, the evidence that it was parsed correctly (or not):
+    /// reconciliation, column typing, row classification, and every signal.
+    Explain {
+        artifact_dir: PathBuf,
+        /// Only show tables whose impression is Suspect.
+        #[arg(long)]
+        suspect_only: bool,
+    },
     /// Import a real parser's output (Docling JSON) → artifacts, bypassing .qdoc.
     /// Proves the detector core runs on any parser's tables, not just the cheap one.
     ImportDocling {
@@ -74,6 +82,88 @@ fn main() -> Result<()> {
         Command::ImportDocling { json, pdf, out } => {
             cmd_import_docling(&json, pdf.as_deref(), &out)
         }
+        Command::Explain { artifact_dir, suspect_only } => {
+            cmd_explain(&artifact_dir, suspect_only)
+        }
+    }
+}
+
+fn cmd_explain(artifact_dir: &Path, suspect_only: bool) -> Result<()> {
+    use quarry::analysis::RowKind;
+    use quarry::evidence::{Impression, assess};
+
+    let store = FlatStore::open(artifact_dir);
+    let artifacts = store
+        .current_artifacts()
+        .with_context(|| "loading artifacts (did you `parse`/`import-docling` first?)")?;
+
+    let mut shown = 0;
+    let mut counts = (0usize, 0usize, 0usize); // confirmed, no-issues, suspect
+    for a in &artifacts {
+        let Some(t) = a.as_any().downcast_ref::<HtmlTable>() else {
+            continue;
+        };
+        let ev = assess(t);
+        match ev.impression {
+            Impression::Confirmed => counts.0 += 1,
+            Impression::NoIssues => counts.1 += 1,
+            Impression::Suspect => counts.2 += 1,
+        }
+        if suspect_only && ev.impression != Impression::Suspect {
+            continue;
+        }
+        shown += 1;
+
+        println!("\n{}", "═".repeat(76));
+        println!("▌ {}  ({}x{}, {} header row(s))", a.id(), ev.n_rows, ev.n_cols, ev.header_rows);
+        // Column typing + row classification — the model the signals reason over.
+        let coltypes: Vec<String> = ev
+            .col_types
+            .iter()
+            .enumerate()
+            .map(|(i, ct)| format!("{i}:{}", col_tag(*ct)))
+            .collect();
+        println!("  columns: {}", coltypes.join("  "));
+        let (h, s, d, t_) = (
+            ev.row_kinds.iter().filter(|k| **k == RowKind::Header).count(),
+            ev.row_kinds.iter().filter(|k| **k == RowKind::Section).count(),
+            ev.row_kinds.iter().filter(|k| **k == RowKind::Data).count(),
+            ev.row_kinds.iter().filter(|k| **k == RowKind::Total).count(),
+        );
+        println!("  rows: {h} header, {s} section-label, {d} data, {t_} total/subtotal");
+
+        for sig in ev.positives() {
+            println!("  ✓ {}", sig.detail);
+        }
+        for sig in ev.negatives() {
+            println!("  ✗ {}", sig.detail);
+        }
+        println!("  ⇒ {}", ev.impression.label());
+    }
+
+    println!("\n{}", "─".repeat(76));
+    println!(
+        "{} table(s): {} likely-correct, {} no-issues, {} suspect{}",
+        counts.0 + counts.1 + counts.2,
+        counts.0,
+        counts.1,
+        counts.2,
+        if suspect_only {
+            format!(" (showed {shown} suspect)")
+        } else {
+            String::new()
+        }
+    );
+    Ok(())
+}
+
+fn col_tag(c: quarry::analysis::ColType) -> &'static str {
+    use quarry::analysis::ColType::*;
+    match c {
+        Label => "label",
+        Numeric => "num",
+        Ratio => "ratio",
+        Empty => "empty",
     }
 }
 

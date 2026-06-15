@@ -5,6 +5,7 @@
 //! takes a claim + artifact, not just an artifact (a tension the brief flags in
 //! §4). It gets its own trait.
 
+use crate::analysis::{TableModel, reconcile, type_violations};
 use crate::artifact::*;
 use crate::core::*;
 use crate::doc::QDoc;
@@ -61,62 +62,37 @@ impl QualityCheck for IntrinsicArithmetic {
         let Some(t) = artifact.as_any().downcast_ref::<HtmlTable>() else {
             return CheckOutcome::Pass { confidence: 0.5 };
         };
-        let grid = t.grid();
-        if grid.len() < 2 {
-            return CheckOutcome::Pass { confidence: 0.5 };
+        // Section-aware reconciliation: skip all header rows (multi-level),
+        // ignore ratio/percentage columns, and sum the data rows since the
+        // previous total — so subtotals in multi-section tables reconcile
+        // instead of misfiring. abs tolerance absorbs cent-rounding in sums.
+        let model = TableModel::from_table(t);
+        let recon = reconcile(&model, self.rel_tolerance, 0.06);
+        if recon.is_empty() {
+            return CheckOutcome::Pass { confidence: 0.6 }; // no total rows to check
         }
 
-        // Find a "total" row by label in column 0.
-        let total_row = grid.iter().position(|row| {
-            row.first()
-                .map(|c| {
-                    let l = c.to_lowercase();
-                    l.contains("total") || l.contains("net ") || l == "sum"
-                })
-                .unwrap_or(false)
-        });
-
-        let Some(tr) = total_row else {
-            // Nothing to check arithmetically; weak pass.
-            return CheckOutcome::Pass { confidence: 0.6 };
-        };
-
-        let mut checked = 0;
-        let mut mismatches = Vec::new();
-        for col in 1..t.n_cols as usize {
-            let Some(total) = parse_num(&grid[tr][col]) else {
-                continue;
-            };
-            // Sum the data rows above the total row (skip header row 0).
-            let mut sum = 0.0;
-            let mut any = false;
-            for row in grid.iter().take(tr).skip(1) {
-                if let Some(v) = parse_num(&row[col]) {
-                    sum += v;
-                    any = true;
-                }
-            }
-            if !any {
-                continue;
-            }
-            checked += 1;
-            let denom = total.abs().max(1.0);
-            if (sum - total).abs() / denom > self.rel_tolerance {
-                mismatches.push(format!(
-                    "col {col}: rows sum to {sum:.2} but total row says {total:.2}"
+        let mut fails = Vec::new();
+        for tr in &recon {
+            for c in tr.cols.iter().filter(|c| !c.ok) {
+                fails.push(format!(
+                    "'{}' col {}: rows sum to {:.2} but total says {:.2}",
+                    tr.label.trim(),
+                    c.col,
+                    c.sum,
+                    c.total
                 ));
             }
         }
 
-        if !mismatches.is_empty() {
+        if fails.is_empty() {
+            // Many independent subtotals reconciling is strong evidence.
+            CheckOutcome::Pass { confidence: 0.97 }
+        } else {
             CheckOutcome::Flag {
-                reason: format!("arithmetic does not hold — {}", mismatches.join("; ")),
+                reason: format!("arithmetic does not reconcile — {}", fails.join("; ")),
                 severity: Severity::Error,
             }
-        } else if checked > 0 {
-            CheckOutcome::Pass { confidence: 0.95 }
-        } else {
-            CheckOutcome::Pass { confidence: 0.6 }
         }
     }
 }
@@ -135,43 +111,78 @@ impl QualityCheck for StructuralValidity {
         matches!(kind, ArtifactKind::HtmlTable | ArtifactKind::DbTable)
     }
     fn check(&self, artifact: &dyn Artifact, _ctx: &CheckCtx<'_>) -> CheckOutcome {
-        // This check leans on the parse-time risk markers — they ARE the
-        // structural signal, computed once during extraction.
-        let r = artifact.risk();
+        let Some(t) = artifact.as_any().downcast_ref::<HtmlTable>() else {
+            return CheckOutcome::Pass { confidence: 0.5 };
+        };
+        let model = TableModel::from_table(t);
+        let nums = model.numeric_cols();
         let mut reasons = Vec::new();
-        if r.column_count_variance > 0.5 {
+        let mut hard = false; // error vs warn
+
+        // Stray non-numeric text in a numeric column => a shifted/merged cell.
+        let tv = type_violations(&model);
+        if !tv.is_empty() {
+            hard = true;
+            let (r, c, ref txt) = tv[0];
             reasons.push(format!(
-                "ragged column counts (variance {:.2})",
-                r.column_count_variance
+                "{} non-numeric cell(s) in numeric column(s) (e.g. [{r},{c}] {txt:?})",
+                tv.len()
             ));
         }
-        if r.merged_cell_rows > 0 {
-            reasons.push(format!("{} row(s) with missing cells", r.merged_cell_rows));
+
+        // Empty cells and ragged fill among DATA rows only — section-label rows
+        // and multi-level header blanks are legitimate and not counted.
+        if !nums.is_empty() {
+            let fills: Vec<usize> = (model.header_rows..model.n_rows)
+                .filter(|&r| model.row_kinds[r] == crate::analysis::RowKind::Data)
+                .map(|r| {
+                    nums.iter()
+                        .filter(|&&c| !cell_blank(&model, r, c))
+                        .count()
+                })
+                .collect();
+            let empty_data: usize = fills.iter().map(|&f| nums.len() - f).sum();
+            let ragged = fills.iter().any(|&f| f != 0 && f != nums.len());
+            if empty_data > 0 {
+                hard = true;
+                reasons.push(format!("{empty_data} empty cell(s) in data rows"));
+            }
+            if ragged {
+                reasons.push("ragged numeric-cell counts across data rows".into());
+            }
         }
-        if r.empty_cells > 0 {
-            reasons.push(format!("{} empty cell(s)", r.empty_cells));
+
+        // Parse-time signals not derivable from the grid.
+        let rk = artifact.risk();
+        // 0.0 means "not measured" (born-digital); only flag a real low value.
+        if rk.min_ocr_confidence > 0.0 && rk.min_ocr_confidence < 0.85 {
+            reasons.push(format!("low OCR confidence {:.2}", rk.min_ocr_confidence));
+            if rk.min_ocr_confidence < 0.6 {
+                hard = true;
+            }
         }
-        if r.min_ocr_confidence < 0.85 {
-            reasons.push(format!("low OCR confidence {:.2}", r.min_ocr_confidence));
-        }
-        if r.rotated_text {
+        if rk.rotated_text {
             reasons.push("rotated text in region".into());
         }
 
         if reasons.is_empty() {
             CheckOutcome::Pass { confidence: 0.9 }
         } else {
-            let severity = if r.merged_cell_rows > 0 || r.min_ocr_confidence < 0.6 {
-                Severity::Error
-            } else {
-                Severity::Warn
-            };
             CheckOutcome::Flag {
                 reason: reasons.join("; "),
-                severity,
+                severity: if hard { Severity::Error } else { Severity::Warn },
             }
         }
     }
+}
+
+fn cell_blank(model: &TableModel, r: usize, c: usize) -> bool {
+    model
+        .grid
+        .get(r)
+        .and_then(|row| row.get(c))
+        .map(|s| s.trim().is_empty())
+        .unwrap_or(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -247,36 +258,4 @@ fn normalize(s: &str) -> String {
         .filter(|c| !c.is_whitespace() && *c != ',' && *c != '$')
         .collect::<String>()
         .to_lowercase()
-}
-
-/// Parse a financial-table number: strips `$ , %`, handles `(123)` as negative.
-pub fn parse_num(s: &str) -> Option<f64> {
-    let t = s.trim();
-    if t.is_empty() {
-        return None;
-    }
-    let neg = t.starts_with('(') && t.ends_with(')');
-    let cleaned: String = t
-        .chars()
-        .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
-        .collect();
-    if cleaned.is_empty() || cleaned == "-" || cleaned == "." {
-        return None;
-    }
-    let v: f64 = cleaned.parse().ok()?;
-    Some(if neg { -v.abs() } else { v })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_financial_numbers() {
-        assert_eq!(parse_num("$1,234.50"), Some(1234.50));
-        assert_eq!(parse_num("(500)"), Some(-500.0));
-        assert_eq!(parse_num("12%"), Some(12.0));
-        assert_eq!(parse_num("—"), None);
-        assert_eq!(parse_num("Revenue"), None);
-    }
 }
