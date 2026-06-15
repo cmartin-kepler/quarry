@@ -17,6 +17,7 @@ pathological inputs, and time-limits each doc — reporting skips/timeouts rathe
 than silently dropping them.
 
 Usage:
+  uv run scripts/run_corpus.py                       # defaults to ./input -> corpus/input
   uv run scripts/run_corpus.py /path/to/docs --out corpus/finance
 """
 from __future__ import annotations
@@ -94,8 +95,10 @@ def process(pdf: str, outdir: str, max_pages: int, timeout: int) -> dict:
 
 def main():
     ap = argparse.ArgumentParser(description="Run Quarry across a directory of PDFs.")
-    ap.add_argument("input", help="directory to scan recursively for PDFs")
-    ap.add_argument("--out", default="corpus/finance", help="output dir for qdoc/artifacts")
+    ap.add_argument("input", nargs="?", default=os.path.join(REPO, "input"),
+                    help="directory to scan recursively for PDFs (default: ./input)")
+    ap.add_argument("--out", default=os.path.join(REPO, "corpus", "input"),
+                    help="output dir for qdoc/artifacts (default: corpus/input)")
     ap.add_argument("--max-pages", type=int, default=50, help="page cap per doc")
     ap.add_argument("--max-mb", type=float, default=40.0, help="skip PDFs larger than this")
     ap.add_argument("--timeout", type=int, default=120, help="per-doc wall-clock limit (s)")

@@ -3,6 +3,11 @@
 # Fetched / generated corpus (large, reproducible via scripts/)
 /corpus
 
+# Input corpus: track the folder structure, ignore the documents dropped in.
+/input/*
+!/input/README.md
+!/input/.gitkeep
+
 # Scratch parse output (e.g. `parse --out tmp/out`)
 /tmp/
 

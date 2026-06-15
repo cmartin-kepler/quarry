@@ -46,7 +46,11 @@ modes stay in Quarry, so the eval still measures something real.
 
 ## Run the pipeline across a folder of real PDFs — `run_corpus.py`
 
+Drop PDFs into the repo's [`input/`](../input/) folder (gitignored; see its
+README) and run with no args, or point at any directory:
+
 ```bash
+uv run scripts/run_corpus.py                      # ./input -> corpus/input
 uv run scripts/run_corpus.py /path/to/docs --out corpus/finance
 ```
 
