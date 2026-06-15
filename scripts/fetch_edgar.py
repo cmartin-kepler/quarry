@@ -21,11 +21,11 @@ SEC etiquette (enforced by SEC, not optional):
     or pass --user-agent. Requests without it get blocked.
   - Keep under ~10 requests/sec. This script self-throttles.
 
-Usage:
+Usage (Python deps via uv: run `uv sync` once at the repo root):
   export SEC_USER_AGENT="Kepler AI corpus-builder you@kepler.ai"
-  python3 fetch_edgar.py --out ./corpus --per-company 1
-  python3 fetch_edgar.py --forms 8-K --decks-only --per-company 3
-  python3 fetch_edgar.py --ticker AAPL --ticker JPM
+  uv run scripts/fetch_edgar.py --out ./corpus --per-company 1
+  uv run scripts/fetch_edgar.py --forms 8-K --decks-only --per-company 3
+  uv run scripts/fetch_edgar.py --ticker AAPL --ticker JPM
 """
 from __future__ import annotations
 

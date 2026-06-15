@@ -51,15 +51,15 @@ The `.qdoc` files above are hand-authored fixtures. To run the parser against
 tooling in [`scripts/`](./scripts/):
 
 ```bash
-pip install pdfplumber reportlab
+uv sync                                     # one-time: Python env for scripts/ (uv-managed)
 
 # Generate a born-digital PDF (tables + a bar-chart figure) with known truth...
 scripts/latex/build.sh                      # via LaTeX (needs a TeX install), OR
-python3 scripts/gen_synthetic_pdf.py --out corpus/synthetic   # via reportlab (no TeX)
+uv run scripts/gen_synthetic_pdf.py --out corpus/synthetic   # via reportlab (no TeX)
 
 # ...bridge it into .qdoc and eval:
-python3 scripts/pdf_to_qdoc.py corpus/synthetic.pdf -o corpus/synthetic.qdoc
-python3 scripts/build_truth.py --cells corpus/synthetic.cells.json \
+uv run scripts/pdf_to_qdoc.py corpus/synthetic.pdf -o corpus/synthetic.qdoc
+uv run scripts/build_truth.py --cells corpus/synthetic.cells.json \
         --qdoc corpus/synthetic.qdoc -o corpus/synthetic.truth.json
 cargo run -- eval corpus/synthetic.qdoc --truth corpus/synthetic.truth.json
 ```

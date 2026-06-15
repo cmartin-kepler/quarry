@@ -20,10 +20,9 @@ Table regions:
     (used by generators that already know where their tables are).
   - --no-detect: emit spans only, no regions.
 
-Usage:
-  pip install pdfplumber
-  python3 pdf_to_qdoc.py input.pdf -o out.qdoc
-  python3 pdf_to_qdoc.py input.pdf -o out.qdoc --regions regions.json
+Usage (Python deps via uv: run `uv sync` once at the repo root):
+  uv run scripts/pdf_to_qdoc.py input.pdf -o out.qdoc
+  uv run scripts/pdf_to_qdoc.py input.pdf -o out.qdoc --regions regions.json
 """
 from __future__ import annotations
 

@@ -10,16 +10,21 @@ eval harness. Two halves:
 
 ## TL;DR — generate a PDF and measure catch rate
 
+Python deps are managed by **uv** (`pyproject.toml` + `uv.lock` at the repo root).
+Run `uv sync` once, then invoke scripts with `uv run` — no manual venv, no
+`pip install`.
+
 ```bash
-pip install pdfplumber reportlab          # bridge + no-TeX generator
+uv sync                                   # create the env from the lockfile
 
 # Option A: LaTeX (needs a TeX install; MacTeX/TeX Live or `brew install tectonic`)
 scripts/latex/build.sh                    # tex -> pdf -> qdoc -> truth -> quarry eval
+                                          # (its Python steps already use `uv run`)
 
 # Option B: no TeX — reportlab generates an equivalent born-digital PDF
-python3 scripts/gen_synthetic_pdf.py --out corpus/synthetic
-python3 scripts/pdf_to_qdoc.py corpus/synthetic.pdf -o corpus/synthetic.qdoc
-python3 scripts/build_truth.py --cells corpus/synthetic.cells.json \
+uv run scripts/gen_synthetic_pdf.py --out corpus/synthetic
+uv run scripts/pdf_to_qdoc.py corpus/synthetic.pdf -o corpus/synthetic.qdoc
+uv run scripts/build_truth.py --cells corpus/synthetic.cells.json \
         --qdoc corpus/synthetic.qdoc -o corpus/synthetic.truth.json
 cargo run -- eval corpus/synthetic.qdoc --truth corpus/synthetic.truth.json
 ```
@@ -55,7 +60,7 @@ sample doc the figure is last, so order-pairing drops the spurious region cleanl
 
 ```bash
 export SEC_USER_AGENT="Kepler AI corpus-builder you@kepler.ai"   # REQUIRED by SEC
-python3 fetch_edgar.py --out ./corpus --per-company 1
+uv run scripts/fetch_edgar.py --out ./corpus --per-company 1
 ```
 
 What you get, by format (this is just what EDGAR exposes):
@@ -87,8 +92,7 @@ run without one) and it self-throttles under SEC's ~10 req/s limit.
 ## `fetch_benchmarks.py` — pre-labeled benchmarks from HuggingFace
 
 ```bash
-pip install huggingface_hub
-python3 fetch_benchmarks.py --out ./corpus/benchmarks
+uv run scripts/fetch_benchmarks.py --out ./corpus/benchmarks
 ```
 
 - **`piushorn/pdf-parse-bench`** — ~synthetic PDFs from LaTeX with automatic ground
@@ -123,7 +127,7 @@ all three formats once the catch-rate number says the approach holds.
 
 ## Network note
 
-`fetch_edgar.py` was run successfully against live SEC EDGAR (it needs the
-`requests` package and a contact-bearing `SEC_USER_AGENT`). `fetch_benchmarks.py`
-needs `huggingface_hub`. In a restricted network, allow `data.sec.gov`,
-`www.sec.gov`, and `huggingface.co`.
+`fetch_edgar.py` was run successfully against live SEC EDGAR (it needs a
+contact-bearing `SEC_USER_AGENT`; the `requests` dependency is provided by
+`uv sync`). In a restricted network, allow `data.sec.gov`, `www.sec.gov`, and
+`huggingface.co`.

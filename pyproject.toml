@@ -1,0 +1,17 @@
+[project]
+name = "quarry-tooling"
+version = "0.1.0"
+description = "Python corpus + PDF-bridge tooling for the Quarry parser eval harness"
+readme = "scripts/README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "pdfplumber>=0.11",   # PDF -> .qdoc bridge (word boxes, table detection)
+    "reportlab>=4",       # no-TeX born-digital PDF generator
+    "requests>=2.32",     # fetch_edgar.py
+    "huggingface-hub>=0.20",  # fetch_benchmarks.py
+]
+
+# Non-packaged project: uv manages the env/lock but does not build/install this
+# repo as a wheel (the deliverables are the Rust crate + standalone scripts).
+[tool.uv]
+package = false

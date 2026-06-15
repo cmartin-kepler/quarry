@@ -16,10 +16,9 @@ Pulls:
 After download it prints a small inventory (file-type counts) so you can see at a
 glance whether you got PDFs or page images.
 
-Usage:
-  pip install huggingface_hub
-  python3 fetch_benchmarks.py --out ./corpus/benchmarks
-  python3 fetch_benchmarks.py --only piushorn/pdf-parse-bench
+Usage (Python deps via uv: run `uv sync` once at the repo root):
+  uv run scripts/fetch_benchmarks.py --out ./corpus/benchmarks
+  uv run scripts/fetch_benchmarks.py --only piushorn/pdf-parse-bench
 """
 from __future__ import annotations
 

@@ -6,7 +6,8 @@
 #                    --build_truth.py--> filing.truth.json   (known cells + anchors)
 #                    --quarry eval--> silent-failure catch rate
 #
-# Requires a TeX install (pdflatex or tectonic) and pdfplumber.
+# Requires a TeX install (pdflatex or tectonic). Python deps are managed by uv
+# (run `uv sync` once); the Python steps run via `uv run`.
 # Usage:  scripts/latex/build.sh [name]      (default name: filing)
 set -euo pipefail
 
@@ -29,10 +30,10 @@ else
 fi
 
 echo "== bridge: pdf -> qdoc =="
-python3 "$REPO/scripts/pdf_to_qdoc.py" "$NAME.pdf" -o "$NAME.qdoc"
+uv run --project "$REPO" "$REPO/scripts/pdf_to_qdoc.py" "$NAME.pdf" -o "$NAME.qdoc"
 
 echo "== build truth from cells + detected regions =="
-python3 "$REPO/scripts/build_truth.py" --cells "$NAME.cells.json" --qdoc "$NAME.qdoc" -o "$NAME.truth.json"
+uv run --project "$REPO" "$REPO/scripts/build_truth.py" --cells "$NAME.cells.json" --qdoc "$NAME.qdoc" -o "$NAME.truth.json"
 
 echo "== quarry eval =="
 ( cd "$REPO" && cargo run -q -- eval "$HERE/$NAME.qdoc" --truth "$HERE/$NAME.truth.json" )

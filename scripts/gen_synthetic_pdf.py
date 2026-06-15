@@ -13,9 +13,8 @@ The tables use right-aligned numeric columns of varying width on purpose: that i
 what defeats a cheap parser's global column model and yields realistic
 clean-looking-but-wrong reconstructions -- the silent failures Quarry hunts.
 
-Usage:
-  pip install reportlab
-  python3 gen_synthetic_pdf.py --out corpus/synthetic
+Usage (Python deps via uv: run `uv sync` once at the repo root):
+  uv run scripts/gen_synthetic_pdf.py --out corpus/synthetic
   # produces corpus/synthetic.pdf and corpus/synthetic.cells.json
 """
 from __future__ import annotations
