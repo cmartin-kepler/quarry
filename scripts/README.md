@@ -44,6 +44,31 @@ Table regions default to pdfplumber's ruled-line detection (override with
 spans the cheap extractor reconstructs — the naive reconstruction and its failure
 modes stay in Quarry, so the eval still measures something real.
 
+## Run the pipeline across a folder of real PDFs — `run_corpus.py`
+
+```bash
+uv run scripts/run_corpus.py /path/to/docs --out corpus/finance
+```
+
+Recursively bridges every PDF, runs `quarry parse` + `quarry check` (the
+detectors), and prints a per-doc summary (pages, spans, detected regions, tables
+reconstructed, tables flagged). It caps pages/size and time-limits each doc, and
+reports — rather than silently swallowing — three real-world outcomes:
+
+- **`no-text-layer`**: 0 spans extracted (scanned or outlined-vector PDFs, e.g.
+  some earnings decks). The born-digital path can't see these; they need a
+  render+OCR/VLM tier (deferred in the brief).
+- **size-skipped**: PDFs over `--max-mb`.
+- **bridge/parse error / timeout**: surfaced per doc.
+
+No ground truth ⇒ **no catch rate** (that needs to know which extractions are
+actually wrong). `flagged` is how many reconstructed tables ≥1 detector marked
+suspicious. On a real finance set (Berkshire/JPM letters + ARs, investor decks,
+earnings releases) the cheap reconstruction flags ~25% of tables — and on dense
+multi-section earnings tables `intrinsic_arithmetic` catches reconciliations that
+don't hold (a clear sign the grid was mangled). To turn this into a catch rate,
+hand-label a few of the flagged tables and run `quarry eval`.
+
 ## Ground truth — `build_truth.py`
 
 A generator emits the logical table values in document order (`*.cells.json`);

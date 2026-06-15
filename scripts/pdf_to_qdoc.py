@@ -76,11 +76,12 @@ def load_explicit_regions(path: str) -> dict[int, list[dict]]:
     return by_page
 
 
-def convert(pdf_path: str, regions_path: str | None, detect: bool) -> dict:
+def convert(pdf_path: str, regions_path: str | None, detect: bool, max_pages: int | None) -> dict:
     explicit = load_explicit_regions(regions_path) if regions_path else {}
     pages_out = []
     with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
+        pages = pdf.pages if max_pages is None else pdf.pages[:max_pages]
+        for page in pages:
             pno = page.page_number  # 1-based
             if explicit:
                 regions = explicit.get(pno, [])
@@ -106,9 +107,10 @@ def main():
     ap.add_argument("-o", "--out", required=True, help="output .qdoc path")
     ap.add_argument("--regions", help="explicit regions JSON: [[page,x0,y0,x1,y1],...]")
     ap.add_argument("--no-detect", action="store_true", help="do not auto-detect tables")
+    ap.add_argument("--max-pages", type=int, help="cap pages (for very large PDFs)")
     args = ap.parse_args()
 
-    doc = convert(args.pdf, args.regions, detect=not args.no_detect)
+    doc = convert(args.pdf, args.regions, detect=not args.no_detect, max_pages=args.max_pages)
     with open(args.out, "w") as fh:
         json.dump(doc, fh, indent=2)
 
