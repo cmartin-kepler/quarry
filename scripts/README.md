@@ -80,6 +80,46 @@ subtotals reconcile), whereas Docling-parsed tables of the same filing do (run
 `quarry import-docling … && quarry explain …`). To turn suspicion into a catch
 rate, hand-label a few tables and run `quarry eval`.
 
+## Reconstruction-error validator — `recon_validate.py`
+
+A **label-free** validator (see `reconstruction-validator-brief.md`): score whether
+a parsed HTML table faithfully represents its source PDF region by checking it can
+*reconstruct the observed glyph layout*. A transposed column / dropped cell /
+shifted header produces HTML that can't account for where the glyphs landed — it
+fails reconstruction even when the text "looks clean". Comparison is **relational**
+(which tokens share a row/column band), not pixels, so font/renderer drift can't
+swamp the signal. No ground truth, no browser.
+
+```bash
+# 1. Self-test FIRST (the deliverable): inject known corruptions, prove the error
+#    spikes + localizes, emit a TP/FP curve over tau.
+uv run scripts/recon_validate.py selftest
+
+# 2. Batch over a quarry artifact store -> CSV sorted by error (worst first).
+uv run scripts/recon_validate.py store --store corpus/input/jpm-2023-ar.artifacts \
+    --pdf input/finance/jpm-2023-ar.pdf
+
+# 3. One region + one HTML hypothesis.
+uv run scripts/recon_validate.py single doc.pdf --page 2 --bbox 48,73,560,351 --html parse.html
+```
+
+Self-test result: clean tables score **0.000**; all five corruption types
+(column swap, dropped cell, merge, shifted header, 2×2 transpose) score higher and
+are **correctly localized 15/15** (a swap → `column transposition [0,2,1]`; a drop
+→ the token in `missing`; …); **0% false positives** at every τ, so τ≈0.015 gives
+100% TP. That curve — not a unit test — is what says the idea holds.
+
+It catches what the arithmetic/structural detectors can't (transpositions and
+shifts that keep the text clean), so it's **complementary**: e.g. on the synthetic
+corpus the cheap parser's mis-parse scores 0.067 vs the clean table's 0.000.
+
+**Known limitation (honest):** on real tables with multi-level headers / wrapped
+cells, the crude interval-merge banding produces residual "band violations"
+(~0.05–0.13) even on faithful parses (e.g. Docling's q2 tables), so the floor is
+raised and τ must be set with care. The brief flags banding (with per-column
+left/right/decimal alignment detection) as the crux; that's the next step, along
+with porting behind the `QualityCheck` trait once the curve justifies it.
+
 ## Ground truth — `build_truth.py`
 
 A generator emits the logical table values in document order (`*.cells.json`);
