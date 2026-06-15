@@ -116,6 +116,38 @@ before clustering columns (`src/extract.rs`). On the generated filing the cheap
 parser reconstructs a uniform-width table correctly (no false alarm) but splits a
 table of mixed-width right-aligned numbers — caught by the detectors.
 
+## Using a real parser (Docling / Reducto / LlamaParse)
+
+`.qdoc` and the cheap reconstructor are the *low-end* path. A real
+table-producing parser already does layout + table-structure recognition and
+emits tables with cells and bounding boxes — it is the parser **and** the
+reconstructor — so it **bypasses `.qdoc` entirely**. The only glue is a thin
+adapter onto the `Artifact` / `SourceAnchor` model; the detector / adjudicator /
+eval core then runs unchanged. That core — not the cheap parser — is the
+reusable, differentiated part of Quarry.
+
+`src/docling.rs` is a reference adapter for [Docling](https://github.com/docling-project/docling)
+(open-source, no API key). It maps Docling JSON tables → `HtmlTable` artifacts
+(per-cell anchors, handling Docling's BOTTOMLEFT bbox origin):
+
+```bash
+# Docling is heavy (torch + models); run on demand, not a project dep:
+uv run --with docling scripts/docling_to_json.py input/foo.pdf -o corpus/foo.docling.json
+cargo run -- import-docling corpus/foo.docling.json --pdf input/foo.pdf --out corpus/foo.docling.artifacts
+cargo run -- check corpus/foo.docling.artifacts        # detectors run on Docling's tables
+```
+
+Validated on real Docling output: a multi-level-header cash-flow table is
+preserved faithfully with anchors, and the detectors run on it. Notably this
+shifts the bottleneck — on a *clean* Docling parse, `intrinsic_arithmetic` still
+misfires on multi-section tables and `structural_validity` flags legitimately
+sparse hierarchical headers as "empty cells." With the parser no longer the weak
+link, the detectors' table-semantics understanding becomes the thing to improve —
+exactly the kind of finding this harness exists to produce.
+
+To add Reducto / LlamaParse: write the analogous `their JSON → Vec<Box<dyn
+Artifact>>` adapter; nothing downstream changes.
+
 ## What's implemented (brief §6 Phase 0)
 
 | Piece | Where | Notes |

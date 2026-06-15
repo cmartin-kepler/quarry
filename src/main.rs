@@ -47,6 +47,16 @@ enum Command {
     },
     /// Dump document structure: pages, elements, anchors, reading order.
     Inspect { file: PathBuf },
+    /// Import a real parser's output (Docling JSON) → artifacts, bypassing .qdoc.
+    /// Proves the detector core runs on any parser's tables, not just the cheap one.
+    ImportDocling {
+        json: PathBuf,
+        /// Original PDF, hashed for document identity (doc_hash). Recommended.
+        #[arg(long)]
+        pdf: Option<PathBuf>,
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -61,22 +71,29 @@ fn main() -> Result<()> {
             detail,
         } => cmd_eval(&file, &truth, tier, detail),
         Command::Inspect { file } => cmd_inspect(&file),
+        Command::ImportDocling { json, pdf, out } => {
+            cmd_import_docling(&json, pdf.as_deref(), &out)
+        }
     }
 }
 
-fn cmd_parse(file: &Path, tier: u8, out: &Path) -> Result<()> {
-    let (doc, doc_hash) = QDoc::load(file)?;
-    let artifacts = pipeline::cheap_parse(&doc, doc_hash, tier)?;
-
-    // Adjudicate per anchor group. In Phase 0 there's one candidate per anchor,
-    // so this mostly records check outcomes as append-only verdicts.
+/// Run the parse-time detectors (arithmetic + structural) over table artifacts,
+/// record append-only adjudication verdicts, and write the store. Shared by the
+/// cheap-parse path and the Docling import path. These checks read only the
+/// artifact, so no source text layer is needed here.
+fn adjudicate_and_store(
+    artifacts: &[Box<dyn Artifact>],
+    doc_hash: quarry::core::DocHash,
+    out: &Path,
+) -> Result<usize> {
     let arithmetic = IntrinsicArithmetic::default();
     let structural = StructuralValidity;
-    let ctx = CheckCtx { source: &doc };
+    let dummy = QDoc { format: quarry::doc::DocFormat::Pdf, pages: vec![] };
+    let ctx = CheckCtx { source: &dummy };
     let adj = DefaultAdjudicator;
 
     let mut verdicts = Vec::new();
-    for a in &artifacts {
+    for a in artifacts {
         if a.kind() != ArtifactKind::HtmlTable {
             continue;
         }
@@ -88,19 +105,48 @@ fn cmd_parse(file: &Path, tier: u8, out: &Path) -> Result<()> {
         verdicts.push(adj.adjudicate(&candidate, &outcomes));
     }
 
-    let store = FlatStore::open(out);
-    store.write(doc_hash, &artifacts, &verdicts)?;
-
-    let n_tables = artifacts
+    FlatStore::open(out).write(doc_hash, artifacts, &verdicts)?;
+    Ok(artifacts
         .iter()
         .filter(|a| a.kind() == ArtifactKind::HtmlTable)
-        .count();
+        .count())
+}
+
+fn cmd_parse(file: &Path, tier: u8, out: &Path) -> Result<()> {
+    let (doc, doc_hash) = QDoc::load(file)?;
+    let artifacts = pipeline::cheap_parse(&doc, doc_hash, tier)?;
+    let n_tables = adjudicate_and_store(&artifacts, doc_hash, out)?;
     println!(
         "parsed {} (doc {}) → {} artifact(s), {} table(s) → {}",
         file.display(),
         doc_hash.short(),
         artifacts.len(),
         n_tables,
+        out.display()
+    );
+    Ok(())
+}
+
+fn cmd_import_docling(json: &Path, pdf: Option<&Path>, out: &Path) -> Result<()> {
+    let json_text = std::fs::read_to_string(json)
+        .with_context(|| format!("reading {}", json.display()))?;
+    // doc_hash IS document identity (brief §3): hash the original PDF bytes when
+    // available, else fall back to hashing the Docling JSON.
+    let doc_hash = match pdf {
+        Some(p) => quarry::core::DocHash::of(
+            &std::fs::read(p).with_context(|| format!("reading {}", p.display()))?,
+        ),
+        None => quarry::core::DocHash::of(json_text.as_bytes()),
+    };
+    let artifacts =
+        quarry::docling::artifacts_from_docling(&json_text, doc_hash, quarry::core::Generation(0))?;
+    let n_tables = adjudicate_and_store(&artifacts, doc_hash, out)?;
+    println!(
+        "imported {} (doc {}) via Docling → {} table(s) → {}\nrun `quarry check {}` to see detector flags.",
+        json.display(),
+        doc_hash.short(),
+        n_tables,
+        out.display(),
         out.display()
     );
     Ok(())

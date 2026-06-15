@@ -83,7 +83,22 @@ anchor format the brief asks for. It **warns** if region and table counts differ
 (e.g. a chart frame detected as a table) rather than silently truncating; for the
 sample doc the figure is last, so order-pairing drops the spurious region cleanly.
 
-## `fetch_edgar.py` — real born-digital financial docs from SEC EDGAR
+## Use a real parser — `docling_to_json.py` + `gen_docling_sample.py`
+
+A real table-producing parser bypasses `.qdoc`: it emits tables with cells +
+bboxes, and `src/docling.rs` adapts that straight onto the `Artifact` model.
+
+- `docling_to_json.py` — runs [Docling](https://github.com/docling-project/docling)
+  on a PDF and dumps `DoclingDocument` JSON. Docling is heavy (torch + models), so
+  it's not a project dep — run it with uv's `--with`:
+  ```bash
+  uv run --with docling scripts/docling_to_json.py input/foo.pdf -o corpus/foo.docling.json
+  cargo run -- import-docling corpus/foo.docling.json --pdf input/foo.pdf --out corpus/foo.docling.artifacts
+  cargo run -- check corpus/foo.docling.artifacts
+  ```
+- `gen_docling_sample.py` — emits a schema-faithful `DoclingDocument` JSON (built
+  from `docling-core`'s own models, no heavy pipeline) used as the deterministic
+  fixture for the Rust adapter's unit tests (`tests/data/sample.docling.json`).
 
 ## `fetch_edgar.py` — real born-digital financial docs from SEC EDGAR
 

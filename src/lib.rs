@@ -24,6 +24,7 @@ pub mod artifact;
 pub mod check;
 pub mod core;
 pub mod doc;
+pub mod docling;
 pub mod eval;
 pub mod extract;
 pub mod pipeline;
