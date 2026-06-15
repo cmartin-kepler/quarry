@@ -1,0 +1,29 @@
+{
+  "tables": [
+    {
+      "name": "income_statement",
+      "difficulty": "right-aligned-varying-width",
+      "column_types": ["text", "currency", "currency"],
+      "cells": [
+        ["Line item", "FY2024", "FY2023"],
+        ["Product revenue", "1,200", "1,000"],
+        ["Service revenue", "800", "650"],
+        ["Total revenue", "2,000", "1,650"],
+        ["Cost of revenue", "1,100", "950"],
+        ["Gross profit", "900", "700"]
+      ]
+    },
+    {
+      "name": "balance_sheet",
+      "difficulty": "right-aligned-varying-width",
+      "column_types": ["text", "currency", "currency"],
+      "cells": [
+        ["Item", "2024", "2023"],
+        ["Cash and equivalents", "5,400", "4,100"],
+        ["Accounts receivable", "1,250", "1,100"],
+        ["Inventory", "900", "850"],
+        ["Total current assets", "7,550", "6,050"]
+      ]
+    }
+  ]
+}

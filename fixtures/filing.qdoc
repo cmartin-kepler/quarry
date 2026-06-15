@@ -1,0 +1,55 @@
+{
+  "format": "pdf",
+  "pages": [
+    {
+      "page": 1,
+      "width": 612.0,
+      "height": 792.0,
+      "table_regions": [
+        { "bbox": [40, 90, 480, 200], "note": "income statement, clean digital, left-aligned" }
+      ],
+      "spans": [
+        { "text": "Line item", "bbox": [60, 100, 140, 110] },
+        { "text": "2023",      "bbox": [300, 100, 330, 110] },
+        { "text": "2022",      "bbox": [420, 100, 450, 110] },
+
+        { "text": "Product",   "bbox": [60, 125, 120, 135] },
+        { "text": "600",        "bbox": [300, 125, 322, 135] },
+        { "text": "550",        "bbox": [420, 125, 442, 135] },
+
+        { "text": "Service",   "bbox": [60, 150, 120, 160] },
+        { "text": "300",        "bbox": [300, 150, 322, 160] },
+        { "text": "250",        "bbox": [420, 150, 442, 160] },
+
+        { "text": "Total revenue", "bbox": [60, 175, 180, 185] },
+        { "text": "900",        "bbox": [300, 175, 322, 185] },
+        { "text": "800",        "bbox": [420, 175, 442, 185] }
+      ]
+    },
+    {
+      "page": 2,
+      "width": 612.0,
+      "height": 792.0,
+      "table_regions": [
+        { "bbox": [40, 90, 380, 175], "note": "balance sheet, right-aligned numbers w/ varying width" }
+      ],
+      "spans": [
+        { "text": "Item", "bbox": [50, 100, 78, 110] },
+        { "text": "2023", "bbox": [277, 100, 305, 110] },
+        { "text": "2022", "bbox": [332, 100, 360, 110] },
+
+        { "text": "Cash",  "bbox": [50, 120, 85, 130] },
+        { "text": "1,250", "bbox": [270, 120, 305, 130] },
+        { "text": "1,100", "bbox": [325, 120, 360, 130] },
+
+        { "text": "Debt",  "bbox": [50, 140, 85, 150] },
+        { "text": "5",      "bbox": [298, 140, 305, 150] },
+        { "text": "1,500", "bbox": [325, 140, 360, 150] },
+
+        { "text": "Total", "bbox": [50, 160, 90, 170] },
+        { "text": "1,255", "bbox": [270, 160, 305, 170] },
+        { "text": "2,600", "bbox": [325, 160, 360, 170] }
+      ]
+    }
+  ]
+}

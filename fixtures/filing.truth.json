@@ -1,0 +1,28 @@
+{
+  "tables": [
+    {
+      "name": "income_statement_p1",
+      "page": 1,
+      "bbox": [40, 90, 480, 200],
+      "column_types": ["text", "currency", "currency"],
+      "cells": [
+        ["Line item", "2023", "2022"],
+        ["Product", "600", "550"],
+        ["Service", "300", "250"],
+        ["Total revenue", "900", "800"]
+      ]
+    },
+    {
+      "name": "balance_sheet_p2",
+      "page": 2,
+      "bbox": [40, 90, 380, 175],
+      "column_types": ["text", "currency", "currency"],
+      "cells": [
+        ["Item", "2023", "2022"],
+        ["Cash", "1,250", "1,100"],
+        ["Debt", "5", "1,500"],
+        ["Total", "1,255", "2,600"]
+      ]
+    }
+  ]
+}
