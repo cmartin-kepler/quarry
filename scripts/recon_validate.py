@@ -254,33 +254,80 @@ def obs_reading_order(tokens: list[Obs]) -> list[int]:
     return sorted(range(len(tokens)), key=lambda i: (tokens[i].row, tokens[i].x0))
 
 
+def _find_run(seq, normfn, target):
+    """A contiguous sublist of `seq` whose concatenated norm == target, or None.
+    Handles tokenization mismatches: a glued observed token ("ElementPassRate")
+    matched by consuming consecutive hyp tokens ("Element","Pass","Rate")."""
+    for s in range(len(seq)):
+        acc = ""
+        run = []
+        for t in range(s, len(seq)):
+            acc += normfn(seq[t])
+            run.append(seq[t])
+            if acc == target:
+                return run
+            if not target.startswith(acc):
+                break
+    return None
+
+
 def align(obs: list[Obs], hyp: list[HypTok]):
     """Match by normalized TEXT (so a token still matches even if the parser put
-    it in the wrong cell — which is exactly what we want to detect as a structural
-    violation). Duplicates of the same text are paired by reading order.
-    Returns (matched [(obs_i, hyp_j)], missing obs idx, spurious hyp idx)."""
+    it in the wrong cell — which we want to detect as a structural violation).
+    Duplicates are paired by reading order; then a merge pass reconciles
+    tokenization differences (glued vs split words) so they aren't reported as
+    spurious/missing. Returns (matched [(obs_i, hyp_j)], missing, spurious)."""
     from collections import defaultdict
 
-    obs_by: dict[str, list[int]] = defaultdict(list)
-    for i in obs_reading_order(obs):
-        if norm(obs[i].text):
-            obs_by[norm(obs[i].text)].append(i)
-
+    obs_order = [i for i in obs_reading_order(obs) if norm(obs[i].text)]
     hyp_order = sorted(
         (j for j in range(len(hyp)) if norm(hyp[j].text)),
         key=lambda j: (hyp[j].row, hyp[j].col),
     )
+
+    obs_by: dict[str, list[int]] = defaultdict(list)
+    for i in obs_order:
+        obs_by[norm(obs[i].text)].append(i)
     hyp_by: dict[str, list[int]] = defaultdict(list)
     for j in hyp_order:
         hyp_by[norm(hyp[j].text)].append(j)
 
-    matched, missing, spurious = [], [], []
-    for key in set(obs_by) | set(hyp_by):
-        o, h = obs_by.get(key, []), hyp_by.get(key, [])
-        n = min(len(o), len(h))
-        matched.extend(zip(o[:n], h[:n]))
-        missing.extend(o[n:])
-        spurious.extend(h[n:])
+    matched, m_obs, m_hyp = [], set(), set()
+    for key in set(obs_by) & set(hyp_by):
+        o, h = obs_by[key], hyp_by[key]
+        for oi, hj in zip(o, h):
+            matched.append((oi, hj))
+            m_obs.add(oi)
+            m_hyp.add(hj)
+
+    # Merge pass A: a glued observed token == consecutive hyp tokens.
+    rem_hyp = [j for j in hyp_order if j not in m_hyp]
+    for i in obs_order:
+        if i in m_obs:
+            continue
+        run = _find_run(rem_hyp, lambda j: norm(hyp[j].text), norm(obs[i].text))
+        if run:
+            for j in run:
+                matched.append((i, j))
+                m_hyp.add(j)
+            m_obs.add(i)
+            rem_hyp = [j for j in rem_hyp if j not in m_hyp]
+
+    # Merge pass B: a glued hyp token == consecutive observed tokens.
+    rem_obs = [i for i in obs_order if i not in m_obs]
+    for j in hyp_order:
+        if j in m_hyp:
+            continue
+        run = _find_run(rem_obs, lambda i: norm(obs[i].text), norm(hyp[j].text))
+        if run:
+            for i in run:
+                matched.append((i, j))
+                m_obs.add(i)
+            m_hyp.add(j)
+            rem_obs = [i for i in rem_obs if i not in m_obs]
+
+    missing = [i for i in obs_order if i not in m_obs]
+    spurious = [j for j in hyp_order if j not in m_hyp]
     return matched, missing, spurious
 
 

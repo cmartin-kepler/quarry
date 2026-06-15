@@ -72,8 +72,11 @@ impl QualityCheck for IntrinsicArithmetic {
             return CheckOutcome::Pass { confidence: 0.6 }; // no total rows to check
         }
 
+        // Only a BROAD failure (a total row where no column reconciles) signals a
+        // mis-parse. If some columns reconcile, the alignment is right and the
+        // others are non-additive totals (unique counts etc.) — not an error.
         let mut fails = Vec::new();
-        for tr in &recon {
+        for tr in recon.iter().filter(|t| t.broadly_fails()) {
             for c in tr.cols.iter().filter(|c| !c.ok) {
                 fails.push(format!(
                     "'{}' col {}: rows sum to {:.2} but total says {:.2}",

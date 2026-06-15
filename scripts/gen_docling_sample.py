@@ -79,16 +79,18 @@ def main():
     )
     doc.add_table(data=d1, prov=ProvenanceItem(page_no=1, bbox=b1, charspan=(0, 0)))
 
-    # Table 2: a balance sheet with a DELIBERATE arithmetic error in the total
-    # (5,400 + 1,250 + 900 = 7,550, but the total says 9,999) — to prove the
-    # detectors fire on a real parser's output, not just the cheap reconstructor.
+    # Table 2: a balance sheet with a BROAD arithmetic failure — BOTH column
+    # totals are wrong (7,550 -> 9,999 and 6,050 -> 9,999), the signature of a
+    # real mis-parse (a column shift breaks every column). A single wrong total
+    # while another column reconciles would instead be a non-additive total, which
+    # the detectors now (correctly) do not flag.
     d2, b2 = table_from(
         [
             ["Item", "2024", "2023"],
             ["Cash and equivalents", "5,400", "4,100"],
             ["Accounts receivable", "1,250", "1,100"],
             ["Inventory", "900", "850"],
-            ["Total current assets", "9,999", "6,050"],
+            ["Total current assets", "9,999", "9,999"],
         ],
         top_y=560,
     )

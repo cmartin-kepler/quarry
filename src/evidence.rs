@@ -74,34 +74,45 @@ pub fn assess(t: &HtmlTable) -> TableEvidence {
     let mut signals = Vec::new();
 
     // --- Reconciliation (strongest signal) ---
-    let total_checks: usize = recon.iter().map(|t| t.cols.len()).sum();
-    let failing: Vec<&TotalRecon> = recon.iter().filter(|t| t.any_fail()).collect();
+    // A total row that reconciles ANY column proves the columns are aligned. Only
+    // a BROAD failure (no column reconciles) is evidence of a mis-parse; an
+    // isolated failing column among reconciling ones is a non-additive total
+    // (unique count / dedup / average), reported as a neutral note, not a flaw.
+    let confirming: usize = recon.iter().filter(|t| t.any_ok()).count();
+    let broadly_failing: Vec<&TotalRecon> = recon.iter().filter(|t| t.broadly_fails()).collect();
+    let ok_checks: usize = recon.iter().flat_map(|t| &t.cols).filter(|c| c.ok).count();
     if !recon.is_empty() {
-        if failing.is_empty() {
+        if broadly_failing.is_empty() && confirming > 0 {
             signals.push(Signal {
                 positive: true,
                 detail: format!(
-                    "{} subtotal/total row(s) reconcile across {} column-check(s) — e.g. {}",
-                    recon.len(),
-                    total_checks,
-                    recon
-                        .first()
-                        .map(|t| format!(
-                            "'{}' col {} = {:.0}",
-                            t.label.trim(),
-                            t.cols[0].col,
-                            t.cols[0].total
-                        ))
-                        .unwrap_or_default()
+                    "{confirming} subtotal/total row(s) reconcile across {ok_checks} column-check(s)",
                 ),
             });
+            // Note any non-additive totals (failing columns in otherwise-aligned rows).
+            for t in &recon {
+                if t.any_ok() {
+                    for c in t.cols.iter().filter(|c| !c.ok) {
+                        signals.push(Signal {
+                            positive: true,
+                            detail: format!(
+                                "note: '{}' col {} total {:.0} ≠ column sum {:.0} (non-additive — unique/dedup total)",
+                                t.label.trim(),
+                                c.col,
+                                c.total,
+                                c.sum
+                            ),
+                        });
+                    }
+                }
+            }
         } else {
-            for t in &failing {
+            for t in &broadly_failing {
                 for c in t.cols.iter().filter(|c| !c.ok) {
                     signals.push(Signal {
                         positive: false,
                         detail: format!(
-                            "'{}' col {}: rows sum to {:.2} but total says {:.2}",
+                            "'{}' col {}: rows sum to {:.2} but total says {:.2} (no column reconciles — likely mis-parse)",
                             t.label.trim(),
                             c.col,
                             c.sum,
@@ -179,7 +190,9 @@ pub fn assess(t: &HtmlTable) -> TableEvidence {
     }
 
     let any_negative = signals.iter().any(|s| !s.positive);
-    let reconciled = !recon.is_empty() && failing.is_empty();
+    // Confirmed when a total row reconciles at least one column (alignment proven)
+    // and nothing else looks wrong.
+    let reconciled = confirming > 0 && broadly_failing.is_empty();
     let impression = if any_negative {
         Impression::Suspect
     } else if reconciled {

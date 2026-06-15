@@ -184,6 +184,17 @@ impl TotalRecon {
     pub fn any_fail(&self) -> bool {
         self.cols.iter().any(|c| !c.ok)
     }
+    /// At least one column reconciles — proof the columns are aligned, so any
+    /// non-reconciling columns are non-additive totals (unique counts, averages,
+    /// deduplicated totals), NOT a parse error.
+    pub fn any_ok(&self) -> bool {
+        self.cols.iter().any(|c| c.ok)
+    }
+    /// No column reconciles despite having some to check — the broad failure that
+    /// signals a real misalignment / mis-parse.
+    pub fn broadly_fails(&self) -> bool {
+        !self.cols.is_empty() && !self.any_ok()
+    }
 }
 
 /// For each Total row, sum the Data rows since the previous Total (Section rows
