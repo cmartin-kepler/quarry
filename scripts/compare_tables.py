@@ -97,11 +97,18 @@ def cluster_regions(by_parser: dict[str, list[dict]]):
     return regions
 
 
-def crop_png(pdf, page: int, bbox, pad=6, resolution=120) -> str:
+def crop_png(pdf, page: int, bbox, pad=6, resolution=120, detail=None) -> str:
     pg = pdf.pages[page - 1]
     x0, y0, x1, y1 = bbox
     box = (max(0, x0 - pad), max(0, y0 - pad), min(pg.width, x1 + pad), min(pg.height, y1 + pad))
     im = pg.crop(box).to_image(resolution=resolution)
+    if detail:
+        # Overlay observed tokens, colored by reconstruction status.
+        colors = {"matched": (0, 160, 110), "misplaced": (235, 140, 0), "missing": (215, 0, 0)}
+        for tok in detail["obs"]:
+            c = colors[tok["status"]]
+            w = 1 if tok["status"] == "matched" else 2
+            im.draw_rect(tok["bbox"], stroke=c, stroke_width=w, fill=c + (30,))
     buf = io.BytesIO()
     im.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode()
@@ -126,14 +133,19 @@ th { background:#eef; } .miss { color:#b00; font-style:italic; padding:20px 0; }
 .sig-pos { color:#0a7; } .sig-neg { color:#c00; }
 .recon { margin-top:5px; }
 .err { font-weight:700; } .err-lo { color:#0a7; } .err-mid { color:#c80; } .err-hi { color:#d33; }
-.diag { color:#666; }
+.diag { color:#666; margin-top:3px; }
 .costtable td, .costtable th { font-size:12px; white-space:nowrap; }
 .costtable { margin:6px 0 18px; }
+details { margin-top:5px; } summary { cursor:pointer; }
+details img { max-width:520px; margin-top:6px; }
+.legend { font-size:11px; margin-top:6px; }
+.lg-ok { color:#0a0; } .lg-mis { color:#e88c00; } .lg-miss { color:#d00; }
 """
 
 
-def render_validators(t: dict, pdf_path: str) -> str:
-    """Per-table validator panel: evidence (simple) + reconstruction error (complex)."""
+def render_validators(t: dict, pdf, pdf_path: str) -> str:
+    """Per-table validator panel: evidence (simple) + reconstruction error (complex),
+    the latter expandable to an annotated source crop showing where it differs."""
     out = ["<div class='val'>"]
 
     # --- Evidence (the simple validator) ---
@@ -149,7 +161,7 @@ def render_validators(t: dict, pdf_path: str) -> str:
             out.append(f"<div class='{cls}'>{mark} {html_lib.escape(s['detail'])}</div>")
 
     # --- Reconstruction error (the complex validator) ---
-    res = recon_validate.validate_table(pdf_path, t["page"], t["bbox"], t["html"])
+    res, detail = recon_validate.validate_detail(pdf_path, t["page"], t["bbox"], t["html"])
     out.append("<div class='recon'>")
     if res.status != "ok":
         out.append("<span class='diag'>reconstruction: n/a (no text layer)</span>")
@@ -157,17 +169,29 @@ def render_validators(t: dict, pdf_path: str) -> str:
         e = res.error
         cls = "err-lo" if e <= 0.10 else "err-mid" if e <= 0.20 else "err-hi"
         d = res.diagnostics
-        out.append(f"reconstruction error <span class='err {cls}'>{e:.3f}</span> "
-                   f"<span class='diag'>({html_lib.escape(res.top_diagnostic())})</span>")
-        bits = [f"coverage {d.coverage:.0%}"]
+        n_miss = sum(1 for o in detail["obs"] if o["status"] == "missing")
+        n_mis = sum(1 for o in detail["obs"] if o["status"] == "misplaced")
+        # Annotated source crop: where the reconstruction differs.
+        png = crop_png(pdf, t["page"], t["bbox"], resolution=150, detail=detail)
+        out.append(
+            "<details><summary>reconstruction error "
+            f"<span class='err {cls}'>{e:.3f}</span> "
+            f"<span class='diag'>({html_lib.escape(res.top_diagnostic())}; "
+            f"{n_miss} missing, {n_mis} misplaced)</span></summary>")
+        out.append("<div class='legend'>source tokens: "
+                   "<span class='lg-ok'>■ matched</span> "
+                   "<span class='lg-mis'>■ misplaced (wrong column)</span> "
+                   "<span class='lg-miss'>■ missing (dropped)</span></div>")
+        out.append(f"<img src='data:image/png;base64,{png}'>")
         if d.column_permutation and d.column_permutation != sorted(
                 x for x in d.column_permutation if x is not None):
-            bits.append(f"col-permutation {d.column_permutation}")
-        if d.missing_tokens:
-            bits.append("missing: " + html_lib.escape(", ".join(d.missing_tokens[:6])))
+            out.append(f"<div class='diag'>column permutation {d.column_permutation} "
+                       "(a transposition)</div>")
         if d.spurious_tokens:
-            bits.append("spurious: " + html_lib.escape(", ".join(d.spurious_tokens[:6])))
-        out.append("<div class='diag'>" + " &nbsp;·&nbsp; ".join(bits) + "</div>")
+            out.append("<div class='diag'>spurious (in parse, not in source): "
+                       + html_lib.escape(", ".join(d.spurious_tokens[:10])) + "</div>")
+        out.append(f"<div class='diag'>coverage {d.coverage:.0%}</div>")
+        out.append("</details>")
     out.append("</div></div>")
     return "\n".join(out)
 
@@ -216,7 +240,7 @@ def render(pdf_path: str, by_parser: dict[str, list[dict]], parsers: list[str],
             if t:
                 parts.append(f"<div class='cell'><h3>{html_lib.escape(p)} "
                              f"<span class='tag'>{t['rows']}×{t['cols']}</span></h3>{t['html']}"
-                             f"{render_validators(t, pdf_path)}</div>")
+                             f"{render_validators(t, pdf, pdf_path)}</div>")
             else:
                 parts.append(f"<div class='cell'><h3>{html_lib.escape(p)}</h3>"
                              "<div class='miss'>— no table detected here —</div></div>")

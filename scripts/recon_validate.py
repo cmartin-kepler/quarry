@@ -379,6 +379,53 @@ def validate_table(pdf_path, page, bbox, html) -> ReconResult:
     return ReconResult("ok", error, diag)
 
 
+def validate_detail(pdf_path, page, bbox, html):
+    """Like validate_table, but also return per-observed-token status for drawing
+    the diff: 'matched' (green), 'misplaced' (orange — matched but landed in the
+    wrong column band), 'missing' (red — in the source, dropped by the parser).
+    Returns (ReconResult, detail | None)."""
+    from collections import Counter, defaultdict
+
+    obs = observe(pdf_path, page, bbox)
+    if not obs:
+        return ReconResult("not_applicable", None, None), None
+    band_cols(obs)
+    band_rows(obs)
+    grid, header_rows = parse_html_grid(html)
+    hyp = hyp_tokens(grid, header_rows)
+    matched, missing, spurious = align(obs, hyp)
+    error, diag = score(obs, hyp, matched, missing, spurious, 0)
+
+    # Where did each hyp column mostly land in observed space? And is an observed
+    # column split across several hyp columns?
+    hypcol_obscols: dict[int, Counter] = defaultdict(Counter)
+    obscol_hypcols: dict[int, set] = defaultdict(set)
+    obs_to_hyp = {}
+    for oi, hj in matched:
+        hypcol_obscols[hyp[hj].col][obs[oi].col] += 1
+        obscol_hypcols[obs[oi].col].add(hyp[hj].col)
+        obs_to_hyp[oi] = hj
+    dom = {hc: cc.most_common(1)[0][0] for hc, cc in hypcol_obscols.items()}
+
+    obs_detail = []
+    for i, o in enumerate(obs):
+        if not norm(o.text):
+            continue
+        if i not in obs_to_hyp:
+            status = "missing"
+        else:
+            hj = obs_to_hyp[i]
+            misplaced = dom.get(hyp[hj].col) != o.col or len(obscol_hypcols[o.col]) > 1
+            status = "misplaced" if misplaced else "matched"
+        obs_detail.append({
+            "text": o.text,
+            "bbox": (o.x0, o.cy - o.h / 2, o.x1, o.cy + o.h / 2),
+            "status": status,
+        })
+    detail = {"obs": obs_detail, "spurious": [hyp[j].text for j in spurious][:30]}
+    return ReconResult("ok", error, diag), detail
+
+
 # ---------------------------------------------------------------------------
 # HTML rendering (for the self-test corruptions)
 # ---------------------------------------------------------------------------
