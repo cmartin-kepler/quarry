@@ -41,6 +41,9 @@ enum Command {
         truth: PathBuf,
         #[arg(long, default_value_t = 0)]
         tier: u8,
+        /// Show per-table detail: reconstructed grid, cell diffs, detector evidence.
+        #[arg(long)]
+        detail: bool,
     },
     /// Dump document structure: pages, elements, anchors, reading order.
     Inspect { file: PathBuf },
@@ -51,7 +54,12 @@ fn main() -> Result<()> {
     match cli.cmd {
         Command::Parse { file, tier, out } => cmd_parse(&file, tier, &out),
         Command::Check { artifact_dir } => cmd_check(&artifact_dir),
-        Command::Eval { file, truth, tier } => cmd_eval(&file, &truth, tier),
+        Command::Eval {
+            file,
+            truth,
+            tier,
+            detail,
+        } => cmd_eval(&file, &truth, tier, detail),
         Command::Inspect { file } => cmd_inspect(&file),
     }
 }
@@ -143,34 +151,44 @@ fn cmd_check(artifact_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_eval(file: &Path, truth: &Path, tier: u8) -> Result<()> {
+fn cmd_eval(file: &Path, truth: &Path, tier: u8, detail: bool) -> Result<()> {
     let (doc, doc_hash) = QDoc::load(file)?;
     let truth = GroundTruth::load(truth)?;
     let report = run_eval(&doc, doc_hash, &truth, tier)?;
-    print_report(file, &report);
+    print_report(file, &report, detail);
     Ok(())
 }
 
-fn print_report(file: &Path, report: &CatchReport) {
-    println!("eval: {}\n", file.display());
+fn print_report(file: &Path, report: &CatchReport, detail: bool) {
+    println!("eval: {}", file.display());
     println!(
-        "{:<26} {:<8} {:<7} {:<30} detail",
-        "table", "matched", "wrong", "flagged_by"
+        "cheap parser reconstructed {} table(s); {} truth table(s) to check.\n",
+        report.total_extracted,
+        report.tables.len()
     );
-    println!("{}", "-".repeat(96));
+
+    // Summary line per table.
+    println!(
+        "{:<26} {:<8} {:<7} {:<6} flagged_by",
+        "table", "matched", "wrong", "iou"
+    );
+    println!("{}", "-".repeat(80));
     for t in &report.tables {
+        let fb = t.flagged_by();
         println!(
-            "{:<26} {:<8} {:<7} {:<30} {}",
+            "{:<26} {:<8} {:<7} {:<6} {}",
             truncate(&t.name, 25),
             if t.matched { "yes" } else { "NO" },
             if t.wrong { "WRONG" } else { "ok" },
-            if t.flagged_by.is_empty() {
-                "-".to_string()
-            } else {
-                t.flagged_by.join(",")
-            },
-            truncate(&t.diff_summary, 40),
+            format!("{:.2}", t.iou),
+            if fb.is_empty() { "-".to_string() } else { fb.join(",") },
         );
+    }
+
+    if detail {
+        for t in &report.tables {
+            print_table_detail(t);
+        }
     }
 
     println!("\n=== silent-failure catch rate ===");
@@ -191,6 +209,117 @@ fn print_report(file: &Path, report: &CatchReport) {
     println!("\nper-detector (of the {wrong} wrong, how many each caught):");
     for (name, c) in report.per_detector_catches() {
         println!("  {name:<22} {c}");
+    }
+
+    // The dangerous case: wrong extractions no detector flagged.
+    let missed = report.missed();
+    if missed.is_empty() {
+        println!("\nMISSED (wrong but unflagged): none");
+    } else {
+        println!("\nMISSED (wrong but unflagged) — these are the silent failures:");
+        for t in missed {
+            println!("  {} — {}", t.name, t.cell_diffs.first().map(String::as_str).unwrap_or(""));
+        }
+        if !detail {
+            println!("  (re-run with --detail to see grids and detector evidence)");
+        }
+    }
+}
+
+fn print_table_detail(t: &quarry::eval::TableEval) {
+    let diff = t.difficulty.as_deref().unwrap_or("?");
+    println!("\n{}", "═".repeat(72));
+    println!(
+        "▌ {}   [difficulty: {diff}]   {}",
+        t.name,
+        if t.wrong { "WRONG" } else { "correct" }
+    );
+    if !t.matched {
+        println!("  no reconstructed table mapped to this region (IoU>0.3 found none)");
+        return;
+    }
+    let (gr, gc) = t.got_dims();
+    let (wr, wc) = t.want_dims();
+    println!(
+        "  matched {} at anchor IoU {:.2};  reconstructed {gr}x{gc}, truth {wr}x{wc}",
+        t.matched_id.as_deref().unwrap_or("?"),
+        t.iou
+    );
+
+    println!("\n  RECONSTRUCTED (what the cheap parser produced):");
+    print_grid(&t.got_grid, "    ");
+    println!("\n  GROUND TRUTH (hand-labeled):");
+    print_grid(&t.want_grid, "    ");
+
+    if t.cell_diffs.is_empty() {
+        println!("\n  diff: exact match");
+    } else {
+        println!("\n  diff: {} divergence(s)", t.cell_diffs.len());
+        for d in t.cell_diffs.iter().take(12) {
+            println!("    {d}");
+        }
+        if t.cell_diffs.len() > 12 {
+            println!("    (+{} more)", t.cell_diffs.len() - 12);
+        }
+    }
+
+    if let Some(r) = &t.risk {
+        println!(
+            "\n  parse-time risk markers: col_count_variance {:.2}, merged_rows {}, \
+             empty_cells {}, min_ocr_conf {:.2}{}",
+            r.column_count_variance,
+            r.merged_cell_rows,
+            r.empty_cells,
+            r.min_ocr_confidence,
+            if r.rotated_text { ", rotated" } else { "" }
+        );
+    }
+
+    println!("\n  detectors (the evidence — how we know):");
+    for d in &t.detectors {
+        let tag = if d.flagged {
+            match d.severity {
+                Some(Severity::Error) => "FLAG/ERROR",
+                Some(Severity::Warn) => "FLAG/WARN",
+                _ => "FLAG",
+            }
+        } else {
+            "pass"
+        };
+        println!("    {:<22} {:<11} {}", d.detector, tag, d.detail);
+    }
+
+    let fb = t.flagged_by();
+    let verdict = match (t.wrong, fb.is_empty()) {
+        (true, false) => format!("WRONG, caught by [{}]", fb.join(", ")),
+        (true, true) => "WRONG, MISSED by all detectors (silent failure)".to_string(),
+        (false, false) => format!("correct, but flagged by [{}] (false alarm)", fb.join(", ")),
+        (false, true) => "correct, no flags".to_string(),
+    };
+    println!("\n  VERDICT: {verdict}");
+}
+
+/// Render a grid as an aligned text table.
+fn print_grid(grid: &[Vec<String>], indent: &str) {
+    if grid.is_empty() {
+        println!("{indent}(empty)");
+        return;
+    }
+    let n_cols = grid.iter().map(|r| r.len()).max().unwrap_or(0);
+    let mut widths = vec![0usize; n_cols];
+    for row in grid {
+        for (c, cell) in row.iter().enumerate() {
+            widths[c] = widths[c].max(cell.chars().count());
+        }
+    }
+    for row in grid {
+        let mut line = String::from(indent);
+        line.push_str("│ ");
+        for (c, w) in widths.iter().enumerate() {
+            let cell = row.get(c).map(String::as_str).unwrap_or("");
+            line.push_str(&format!("{cell:<w$} │ "));
+        }
+        println!("{}", line.trim_end());
     }
 }
 

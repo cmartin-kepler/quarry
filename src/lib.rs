@@ -6,8 +6,10 @@
 //!
 //! What's here (brief §6 Phase 0):
 //! - the object-safe [`artifact::Artifact`] core + `Text`/`HtmlTable` payloads,
-//! - one cheap PDF [`extract::Extractor`] doing naive geometric table
-//!   reconstruction (so it produces *realistic* silent failures),
+//! - one [`extract::PdfTextLayerReconstructor`] doing naive geometric table
+//!   reconstruction from an already-extracted text layer (so it produces
+//!   *realistic* silent failures); note the actual PDF-byte parsing lives in the
+//!   pdfplumber bridge `scripts/pdf_to_qdoc.py`, not in this crate,
 //! - three detectors: [`check::IntrinsicArithmetic`], [`check::StructuralValidity`],
 //!   and claim-time [`check::AnswerSupport`],
 //! - a default [`adjudicate::Adjudicator`], a flat [`store::FlatStore`] fronted by

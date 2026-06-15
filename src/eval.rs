@@ -26,6 +26,9 @@ pub struct TruthTable {
     /// Optional per-column types (e.g. "text", "currency", "percent").
     #[serde(default)]
     pub column_types: Vec<String>,
+    /// Optional difficulty tag (merged-cells / hierarchical-header / …).
+    #[serde(default)]
+    pub difficulty: Option<String>,
 }
 
 impl TruthTable {
@@ -48,25 +51,69 @@ impl GroundTruth {
 
 // ---- Per-table eval result ------------------------------------------------
 
+/// What one detector saw on one table — flagged or not, plus the evidence
+/// (the "how we know"): an arithmetic mismatch, the parse-time risk markers, or
+/// the cited crop that didn't support a cell.
+#[derive(Clone, Debug)]
+pub struct DetectorOutcome {
+    pub detector: String,
+    pub flagged: bool,
+    pub severity: Option<Severity>,
+    pub detail: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct TableEval {
     pub name: String,
+    pub difficulty: Option<String>,
+    /// Did any reconstructed table map to this truth region (by anchor IoU)?
     pub matched: bool,
+    pub matched_id: Option<String>,
+    pub iou: f32,
+    /// The reconstructed grid (what the cheap parser produced).
+    pub got_grid: Vec<Vec<String>>,
+    /// The hand-labeled correct grid.
+    pub want_grid: Vec<Vec<String>>,
+    /// Parse-time risk markers of the matched extraction.
+    pub risk: Option<RiskMarkers>,
     pub wrong: bool,
-    /// Detector → did it flag this table.
-    pub flagged_by: Vec<String>,
-    pub diff_summary: String,
+    /// Every cell-level divergence from truth.
+    pub cell_diffs: Vec<String>,
+    pub detectors: Vec<DetectorOutcome>,
 }
 
 impl TableEval {
     pub fn flagged(&self) -> bool {
-        !self.flagged_by.is_empty()
+        self.detectors.iter().any(|d| d.flagged)
     }
+    pub fn flagged_by(&self) -> Vec<String> {
+        self.detectors
+            .iter()
+            .filter(|d| d.flagged)
+            .map(|d| d.detector.clone())
+            .collect()
+    }
+    pub fn got_dims(&self) -> (usize, usize) {
+        dims(&self.got_grid)
+    }
+    pub fn want_dims(&self) -> (usize, usize) {
+        dims(&self.want_grid)
+    }
+    /// A wrong extraction that NO detector flagged — the dangerous case.
+    pub fn missed(&self) -> bool {
+        self.wrong && !self.flagged()
+    }
+}
+
+fn dims(grid: &[Vec<String>]) -> (usize, usize) {
+    (grid.len(), grid.iter().map(|r| r.len()).max().unwrap_or(0))
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct CatchReport {
     pub tables: Vec<TableEval>,
+    /// Total tables the cheap parser reconstructed across the document.
+    pub total_extracted: usize,
 }
 
 impl CatchReport {
@@ -98,23 +145,24 @@ impl CatchReport {
         Some(noisy as f32 / correct as f32)
     }
 
-    /// Per-detector: how many of the wrong tables each detector alone caught.
+    /// Wrong extractions that slipped past every detector.
+    pub fn missed(&self) -> Vec<&TableEval> {
+        self.tables.iter().filter(|t| t.missed()).collect()
+    }
+
+    /// Per-detector: how many of the wrong tables each detector caught.
     pub fn per_detector_catches(&self) -> Vec<(String, usize)> {
-        let mut names = vec![
-            "intrinsic_arithmetic".to_string(),
-            "structural_validity".to_string(),
-            "answer_support".to_string(),
-        ];
-        let mut out = Vec::new();
-        for n in names.drain(..) {
-            let c = self
-                .tables
-                .iter()
-                .filter(|t| t.wrong && t.flagged_by.contains(&n))
-                .count();
-            out.push((n, c));
-        }
-        out
+        ["intrinsic_arithmetic", "structural_validity", "answer_support"]
+            .iter()
+            .map(|n| {
+                let c = self
+                    .tables
+                    .iter()
+                    .filter(|t| t.wrong && t.flagged_by().iter().any(|f| f == n))
+                    .count();
+                (n.to_string(), c)
+            })
+            .collect()
     }
 }
 
@@ -131,7 +179,10 @@ pub fn run_eval(doc: &QDoc, doc_hash: DocHash, truth: &GroundTruth, tier: u8) ->
     let verifier = SourceCropVerifier;
     let ctx = CheckCtx { source: doc };
 
-    let mut report = CatchReport::default();
+    let mut report = CatchReport {
+        total_extracted: tables.len(),
+        ..Default::default()
+    };
 
     for tt in &truth.tables {
         // Match by anchor IoU on the same page.
@@ -152,97 +203,137 @@ pub fn run_eval(doc: &QDoc, doc_hash: DocHash, truth: &GroundTruth, tier: u8) ->
             .filter(|(_, iou)| *iou > 0.3)
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap());
 
-        let Some((table, _iou)) = best else {
+        let Some((table, iou)) = best else {
             // No extraction mapped here at all — a wrong "extraction" nobody can
             // flag with cell checks. Count it wrong & unflagged (worst case).
             report.tables.push(TableEval {
                 name: tt.name.clone(),
+                difficulty: tt.difficulty.clone(),
                 matched: false,
+                matched_id: None,
+                iou: 0.0,
+                got_grid: vec![],
+                want_grid: tt.cells.clone(),
+                risk: None,
                 wrong: true,
-                flagged_by: vec![],
-                diff_summary: "no extracted table matched this region".into(),
+                cell_diffs: vec!["no reconstructed table mapped to this region".into()],
+                detectors: vec![],
             });
             continue;
         };
 
-        let (wrong, diff) = diff_grid(&table.grid(), &tt.cells);
+        let got = table.grid();
+        let (wrong, cell_diffs) = diff_grid(&got, &tt.cells);
 
-        // Run the three detectors.
-        let mut flagged_by = Vec::new();
-        if arithmetic.check(*table, &ctx).is_flag() {
-            flagged_by.push("intrinsic_arithmetic".to_string());
-        }
-        if structural.check(*table, &ctx).is_flag() {
-            flagged_by.push("structural_validity".to_string());
-        }
-        if answer_support_flags(table, &verifier, doc) {
-            flagged_by.push("answer_support".to_string());
-        }
+        // Run the three detectors, keeping their full outcome (the evidence).
+        let detectors = vec![
+            to_outcome("intrinsic_arithmetic", &arithmetic.check(*table, &ctx)),
+            to_outcome("structural_validity", &structural.check(*table, &ctx)),
+            answer_support_outcome(table, &verifier, doc),
+        ];
 
         report.tables.push(TableEval {
             name: tt.name.clone(),
+            difficulty: tt.difficulty.clone(),
             matched: true,
+            matched_id: Some(table.id().to_string()),
+            iou,
+            got_grid: got,
+            want_grid: tt.cells.clone(),
+            risk: Some(table.risk().clone()),
             wrong,
-            flagged_by,
-            diff_summary: diff,
+            cell_diffs,
+            detectors,
         });
     }
 
     Ok(report)
 }
 
+fn to_outcome(name: &str, o: &CheckOutcome) -> DetectorOutcome {
+    match o {
+        CheckOutcome::Pass { confidence } => DetectorOutcome {
+            detector: name.to_string(),
+            flagged: false,
+            severity: None,
+            detail: format!("pass (confidence {confidence:.2})"),
+        },
+        CheckOutcome::Flag { reason, severity } => DetectorOutcome {
+            detector: name.to_string(),
+            flagged: true,
+            severity: Some(*severity),
+            detail: reason.clone(),
+        },
+    }
+}
+
 /// Sampled AnswerSupport: for each non-header cell, treat the extracted value as
 /// the agent's claim and verify it against the source crop at the cell's cited
 /// anchor. A misassigned cell's text won't be inside its band rectangle → flag.
-fn answer_support_flags(table: &HtmlTable, verifier: &SourceCropVerifier, source: &QDoc) -> bool {
+/// Reports the first unsupported cell (with the cited crop) as the evidence.
+fn answer_support_outcome(
+    table: &HtmlTable,
+    verifier: &SourceCropVerifier,
+    source: &QDoc,
+) -> DetectorOutcome {
+    let mut sampled = 0;
+    let mut first_fail = None;
     for c in &table.cells {
         if c.is_header || c.text.trim().is_empty() {
             continue;
+        }
+        sampled += 1;
+        if first_fail.is_some() {
+            continue; // keep counting `sampled`, but only report the first failure
         }
         let claim = Claim {
             element: table.id(),
             anchor: c.anchor.clone(),
             asserted: c.text.clone(),
         };
-        if let SupportOutcome::Unsupported { .. } = verifier.verify(&claim, source) {
-            return true;
+        if let SupportOutcome::Unsupported { reason } = verifier.verify(&claim, source) {
+            first_fail = Some(format!("cell [{},{}] {:?} — {}", c.row, c.col, c.text, reason));
         }
     }
-    false
+    match first_fail {
+        Some(detail) => DetectorOutcome {
+            detector: "answer_support".to_string(),
+            flagged: true,
+            severity: Some(Severity::Error),
+            detail,
+        },
+        None => DetectorOutcome {
+            detector: "answer_support".to_string(),
+            flagged: false,
+            severity: None,
+            detail: format!("{sampled} sampled cell(s) all present in their cited crops"),
+        },
+    }
 }
 
-/// Structural diff. Returns (is_wrong, human_summary). Normalizes whitespace and
-/// financial punctuation so formatting differences aren't counted as errors.
-fn diff_grid(got: &[Vec<String>], want: &[Vec<String>]) -> (bool, String) {
-    if got.len() != want.len() {
-        return (
-            true,
-            format!("row count differs: got {}, want {}", got.len(), want.len()),
-        );
-    }
+/// Structural diff. Returns (is_wrong, all cell-level diffs). Normalizes
+/// whitespace and financial punctuation so formatting isn't counted as error.
+fn diff_grid(got: &[Vec<String>], want: &[Vec<String>]) -> (bool, Vec<String>) {
     let mut diffs = Vec::new();
-    for (r, (gr, wr)) in got.iter().zip(want.iter()).enumerate() {
-        if gr.len() != wr.len() {
-            diffs.push(format!("row {r}: col count got {} want {}", gr.len(), wr.len()));
-            continue;
-        }
-        for (c, (g, w)) in gr.iter().zip(wr.iter()).enumerate() {
+    let (gr, gc) = dims(got);
+    let (wr, wc) = dims(want);
+    if (gr, gc) != (wr, wc) {
+        diffs.push(format!("dimensions: got {gr}x{gc}, want {wr}x{wc}"));
+    }
+    let rows = gr.max(wr);
+    for r in 0..rows {
+        let g_row = got.get(r);
+        let w_row = want.get(r);
+        let cols = g_row.map_or(0, |x| x.len()).max(w_row.map_or(0, |x| x.len()));
+        for c in 0..cols {
+            let g = g_row.and_then(|x| x.get(c)).map(String::as_str).unwrap_or("");
+            let w = w_row.and_then(|x| x.get(c)).map(String::as_str).unwrap_or("");
             if norm(g) != norm(w) {
                 diffs.push(format!("[{r},{c}] got {g:?} want {w:?}"));
             }
         }
     }
-    if diffs.is_empty() {
-        (false, "exact match".into())
-    } else {
-        let n = diffs.len();
-        diffs.truncate(4);
-        let mut s = diffs.join("; ");
-        if n > 4 {
-            s.push_str(&format!("; (+{} more)", n - 4));
-        }
-        (true, s)
-    }
+    (!diffs.is_empty(), diffs)
 }
 
 fn norm(s: &str) -> String {

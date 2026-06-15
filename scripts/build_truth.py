@@ -60,6 +60,7 @@ def main():
                 "page": page,
                 "bbox": bbox,
                 "column_types": tbl.get("column_types", []),
+                "difficulty": tbl.get("difficulty"),
                 "cells": tbl["cells"],
             }
         )

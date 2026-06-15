@@ -11,7 +11,7 @@ use anyhow::{Result, bail};
 /// Resolve the extractor for a (format, tier) pair.
 pub fn extractor_for(format: DocFormat, tier: u8) -> Result<Box<dyn Extractor>> {
     match (format, tier) {
-        (DocFormat::Pdf, 0) => Ok(Box::new(CheapPdfExtractor)),
+        (DocFormat::Pdf, 0) => Ok(Box::new(PdfTextLayerReconstructor)),
         (DocFormat::Pdf, t) => bail!("PDF tier {t} not built yet (Phase 0 ships tier 0 only)"),
         (DocFormat::Pptx, _) => bail!("PPTX extractor deferred (brief §6)"),
         (DocFormat::Xlsx, _) => bail!("XLSX extractor deferred (brief §6)"),

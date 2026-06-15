@@ -1,10 +1,15 @@
-//! The `Extractor` trait + the Phase-0 cheap PDF extractor.
+//! The `Extractor` trait + the Phase-0 PDF text-layer reconstructor.
 //!
-//! Cost tiers are FORMAT-SPECIFIC, not a global ladder (brief §4). The cheap PDF
-//! extractor reconstructs tables from positioned spans using naive x/y
-//! clustering. That naivety is the point: right-aligned numeric columns,
-//! multi-level headers, and merged cells make it produce a clean-looking grid
-//! that is wrong — the silent failures detector quality is measured against.
+//! IMPORTANT: this does NOT parse PDF bytes. Turning a `.pdf` into positioned
+//! text spans (the actual "PDF parsing") happens upstream in the pdfplumber
+//! bridge (`scripts/pdf_to_qdoc.py`), which emits the `.qdoc` text layer this
+//! consumes. `PdfTextLayerReconstructor` takes that already-extracted text layer
+//! and *reconstructs tables* from it using naive x/y clustering.
+//!
+//! Cost tiers are FORMAT-SPECIFIC, not a global ladder (brief §4). The naivety
+//! of the reconstruction is the point: right-aligned numeric columns, multi-level
+//! headers, and merged cells make it produce a clean-looking grid that is wrong —
+//! the silent failures detector quality is measured against.
 
 use crate::artifact::*;
 use crate::core::*;
@@ -48,16 +53,18 @@ pub trait Extractor: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// Cheap PDF extractor (tier 0 for the PDF format).
+// PDF text-layer reconstructor (tier 0 for the PDF format).
+// Consumes a `.qdoc` text layer (produced by the pdfplumber bridge); it does not
+// read PDF bytes itself. "Pdf" names the format whose text layer it handles.
 // ---------------------------------------------------------------------------
 
-pub struct CheapPdfExtractor;
+pub struct PdfTextLayerReconstructor;
 
 const ACCEPTS: [InputKind; 1] = [InputKind::DocumentRegion];
 
-impl Extractor for CheapPdfExtractor {
+impl Extractor for PdfTextLayerReconstructor {
     fn id(&self) -> ExtractorId {
-        ExtractorId("cheap_pdf".into())
+        ExtractorId("pdf_textlayer".into())
     }
     fn version(&self) -> Version {
         Version(1)
@@ -81,9 +88,11 @@ impl Extractor for CheapPdfExtractor {
         let (doc, page_no) = match input {
             ExtractInput::DocumentRegion { doc, anchor } => match anchor {
                 SourceAnchor::Pdf { page, .. } => (doc, page),
-                _ => bail!("cheap_pdf only handles PDF anchors"),
+                _ => bail!("pdf_textlayer only handles PDF anchors"),
             },
-            ExtractInput::Artifacts(_) => bail!("cheap_pdf consumes raw regions, not artifacts"),
+            ExtractInput::Artifacts(_) => {
+                bail!("pdf_textlayer consumes raw regions, not artifacts")
+            }
         };
 
         let page = ctx

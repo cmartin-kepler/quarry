@@ -20,6 +20,7 @@ cargo test
 
 # THE point of the build — measure catch rate vs hand-labeled truth:
 cargo run -- eval fixtures/filing.qdoc --truth fixtures/filing.truth.json
+cargo run -- eval fixtures/filing.qdoc --truth fixtures/filing.truth.json --detail  # full breakdown
 
 # Supporting commands:
 cargo run -- inspect fixtures/filing.qdoc            # dump structure & anchors
@@ -27,12 +28,12 @@ cargo run -- parse   fixtures/filing.qdoc --out /tmp/out --tier 0
 cargo run -- check   /tmp/out                         # run quality checks
 ```
 
-Example `eval` output:
+Example `eval` output (summary):
 
 ```
-table                      matched  wrong   flagged_by
-income_statement_p1        yes      ok      -
-balance_sheet_p2           yes      WRONG   structural_validity,answer_support
+table                      matched  wrong   iou    flagged_by
+income_statement_p1        yes      ok      1.00   -
+balance_sheet_p2           yes      WRONG   1.00   structural_validity,answer_support
 
 === silent-failure catch rate ===
 wrong extractions: 1 / 2
@@ -42,7 +43,50 @@ per-detector (of the 1 wrong, how many each caught):
   intrinsic_arithmetic   0
   structural_validity    1
   answer_support         1
+
+MISSED (wrong but unflagged): none
 ```
+
+### `--detail`: what was reconstructed, where it failed, and how we know
+
+`--detail` prints, per table, the reconstructed grid beside the ground truth,
+every cell-level divergence, the parse-time risk markers, and each detector's
+verdict **with the evidence it acted on**. Excerpt for a table whose right-aligned
+columns split into phantom columns:
+
+```
+▌ income_statement   [difficulty: right-aligned-varying-width]   WRONG
+  matched art_48f0… at anchor IoU 1.00;  reconstructed 6x5, truth 6x3
+
+  RECONSTRUCTED (what the cheap parser produced):
+    │ Line item       │ FY2024 │       │ FY2023 │       │
+    │ Product revenue │        │ 1,200 │        │ 1,000 │
+    ...
+  GROUND TRUTH (hand-labeled):
+    │ Line item       │ FY2024 │ FY2023 │
+    │ Product revenue │ 1,200  │ 1,000  │
+    ...
+  diff: 18 divergence(s)
+    dimensions: got 6x5, want 6x3
+    [1,1] got "" want "1,200"
+    [1,2] got "1,200" want "1,000"
+    ...
+  parse-time risk markers: col_count_variance 0.00, merged_rows 6, empty_cells 12, min_ocr_conf 1.00
+
+  detectors (the evidence — how we know):
+    intrinsic_arithmetic   pass        pass (confidence 0.95)
+    structural_validity    FLAG/ERROR  6 row(s) with missing cells; 12 empty cell(s)
+    answer_support         pass        15 sampled cell(s) all present in their cited crops
+
+  VERDICT: WRONG, caught by [structural_validity]
+```
+
+This case shows the detectors are complementary: the column split is a structural
+artifact, so `structural_validity` fires while `answer_support` honestly passes
+(each cell's text still sits inside its own band — the failure is an index shift,
+not a value in the wrong place). The `MISSED` section at the end of every run
+lists wrong extractions that slipped past *all* detectors — the silent failures
+the whole experiment exists to surface.
 
 ## Testing against real PDFs
 
@@ -77,7 +121,7 @@ table of mixed-width right-aligned numbers — caught by the detectors.
 | Piece | Where | Notes |
 |---|---|---|
 | Object-safe `Artifact` core + `Text`/`HtmlTable` | `src/artifact.rs` | hybrid payload strategy (see below) |
-| Cheap PDF extractor | `src/extract.rs` | naive geometric table reconstruction |
+| `PdfTextLayerReconstructor` | `src/extract.rs` | naive geometric table reconstruction from a `.qdoc` text layer (NOT a PDF-byte parser — that's `scripts/pdf_to_qdoc.py`) |
 | `IntrinsicArithmetic` detector | `src/check.rs` | rows-sum-to-total reconciliation (~free) |
 | `StructuralValidity` detector | `src/check.rs` | ragged columns, empty/merged cells, OCR conf |
 | `AnswerSupport` (claim-time) | `src/check.rs` | crops cited bbox, verifies the claim |

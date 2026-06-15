@@ -36,7 +36,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 
 INCOME = {
     "name": "income_statement",
-    "difficulty": "clean-digital",
+    "difficulty": "right-aligned-varying-width",
     "column_types": ["text", "currency", "currency"],
     "cells": [
         ["Line item", "FY2024", "FY2023"],
