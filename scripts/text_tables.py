@@ -38,8 +38,9 @@ def _markdown_tables(text: str) -> list[list[list[str]]]:
 
 
 def _is_tabular(line: str) -> bool:
-    """A row with >=2 internal multi-space gaps (>=3 segments)."""
-    return len(re.findall(r"\S(?:  +)\S", line)) >= 2 and bool(line.strip())
+    """A row with >=1 internal multi-space gap (>=2 segments) — so two-column
+    tables (Date | Value) are detected, not just 3+ column ones."""
+    return len(re.findall(r"\S(?:  +)\S", line)) >= 1 and bool(line.strip())
 
 
 def _columns_from_text_block(lines: list[str]) -> list[list[str]]:
@@ -95,7 +96,7 @@ def _spacealigned_tables(text: str) -> list[list[list[str]]]:
     out = []
     for blk in grids:
         grid = _columns_from_text_block(blk)
-        if grid and len(grid[0]) >= 3 and len(grid) >= 2:
+        if grid and len(grid[0]) >= 2 and len(grid) >= 2:
             out.append(grid)
     return out
 
@@ -106,6 +107,18 @@ def detect_tables(text: str) -> list[list[list[str]]]:
     if md:
         return md
     return _spacealigned_tables(text)
+
+
+def to_markdown(grid: list[list[str]]) -> str:
+    """Render a grid as a GitHub-flavored markdown pipe table (the '=> md' step).
+    Re-parsing this with _markdown_tables recovers the grid ('md to table')."""
+    n_cols = max(len(r) for r in grid)
+    def row(cells):
+        cells = [c.replace("|", "\\|") for c in (cells + [""] * (n_cols - len(cells)))]
+        return "| " + " | ".join(cells) + " |"
+    out = [row(grid[0]), "| " + " | ".join(["---"] * n_cols) + " |"]
+    out += [row(r) for r in grid[1:]]
+    return "\n".join(out)
 
 
 def to_html(grid: list[list[str]]) -> str:

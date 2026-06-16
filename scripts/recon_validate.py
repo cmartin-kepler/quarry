@@ -32,7 +32,8 @@ from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from html.parser import HTMLParser
 
-import pdfplumber
+# pdfplumber is imported lazily inside the functions that observe a PDF, so the
+# pure-Python HTML/grid parsing (reused by typed_table.from_html) needs no PDF deps.
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +50,8 @@ class Diagnostics:
     merge_split_sites: list[tuple] = field(default_factory=list)
     missing_tokens: list[str] = field(default_factory=list)
     spurious_tokens: list[str] = field(default_factory=list)
+    sign_violations: float = 0.0
+    sign_changes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -66,6 +69,7 @@ class ReconResult:
             (d.spurious_rate, f"spurious {len(d.spurious_tokens)} token(s)"),
             (d.col_violations, "column-band violations"),
             (d.row_violations, "row-band violations"),
+            (d.sign_violations, f"sign lost/changed on {len(d.sign_changes)} number(s)"),
         ]
         if d.column_permutation and d.column_permutation != sorted(d.column_permutation):
             cands.append((1.0, f"column transposition {d.column_permutation}"))
@@ -79,6 +83,27 @@ class ReconResult:
 
 def norm(s: str) -> str:
     return "".join(ch for ch in s.lower() if ch.isalnum())
+
+
+def num_sign(tok: str) -> int | None:
+    """The sign of an accounting-coded number, or None if the token isn't a
+    number. This is what lets reconstruction *unwind* a sign normalization: a
+    parser may render the source's `(2,732)` as `-2,732` (an "up" transform that
+    normalizes the accounting convention to a signed value) — both are negative,
+    so they reconstruct as the same token. But a parser that drops the parens and
+    emits a bare `2,732` has lost the negative; the signs differ and reconstruction
+    flags it. Negative is coded by surrounding parens, a leading/trailing minus, or
+    a `CR` suffix."""
+    t = tok.strip().lower()
+    if not any(c.isdigit() for c in t):
+        return None
+    neg = (
+        (t.startswith("(") and ")" in t)
+        or t.startswith("-")
+        or t.rstrip(")").endswith("-")
+        or t.endswith("cr")
+    )
+    return -1 if neg else 1
 
 
 def tok_split(text: str) -> list[str]:
@@ -101,6 +126,7 @@ class Obs:
 
 
 def observe(pdf_path: str, page: int, bbox: tuple[float, float, float, float]) -> list[Obs]:
+    import pdfplumber
     with pdfplumber.open(pdf_path) as pdf:
         pg = pdf.pages[page - 1]
         x0, y0, x1, y1 = bbox
@@ -394,6 +420,21 @@ def score(obs, hyp, matched, missing, spurious, n_obs_cols) -> tuple[float, Diag
         if len(s) > 1:
             sites.append((f"obs_col {oc}", "split"))
 
+    # Sign reconstruction: a matched number whose source sign (parens / trailing
+    # minus / CR) disagrees with the parsed sign means the parser lost or flipped
+    # the negative. `(2,732)` parsed as `-2,732` agrees (unwound, no violation);
+    # parsed as a bare `2,732` disagrees (the negative was dropped) and is flagged.
+    sign_total = sign_viol = 0
+    sign_changes = []
+    for oi, hj in matched:
+        so, sh = num_sign(obs[oi].text), num_sign(hyp[hj].text)
+        if so is not None and sh is not None:
+            sign_total += 1
+            if so != sh:
+                sign_viol += 1
+                sign_changes.append(f"{obs[oi].text!r}->{hyp[hj].text!r}")
+    sign_violations = sign_viol / sign_total if sign_total else 0.0
+
     error = (
         0.35 * (1 - coverage)
         + 0.10 * spurious_rate
@@ -401,6 +442,7 @@ def score(obs, hyp, matched, missing, spurious, n_obs_cols) -> tuple[float, Diag
         + 0.15 * col_violations
         + 0.10 * col_split_violations
         + 0.15 * perm_penalty
+        + 0.15 * sign_violations
     )
     error = max(0.0, min(1.0, error))
     diag = Diagnostics(
@@ -409,6 +451,7 @@ def score(obs, hyp, matched, missing, spurious, n_obs_cols) -> tuple[float, Diag
         column_permutation=perm, merge_split_sites=sites,
         missing_tokens=[obs[i].text for i in missing][:20],
         spurious_tokens=[hyp[j].text for j in spurious][:20],
+        sign_violations=sign_violations, sign_changes=sign_changes[:20],
     )
     return error, diag
 
@@ -462,7 +505,9 @@ def validate_detail(pdf_path, page, bbox, html):
             status = "missing"
         else:
             hj = obs_to_hyp[i]
-            misplaced = dom.get(hyp[hj].col) != o.col or len(obscol_hypcols[o.col]) > 1
+            so, sh = num_sign(o.text), num_sign(hyp[hj].text)
+            sign_bad = so is not None and sh is not None and so != sh
+            misplaced = sign_bad or dom.get(hyp[hj].col) != o.col or len(obscol_hypcols[o.col]) > 1
             status = "misplaced" if misplaced else "matched"
         obs_detail.append({
             "text": o.text,
@@ -569,7 +614,46 @@ def _selftest_pdf(grid, path):
     doc.build([t])
 
 
+_SIGN_BASE = [
+    ["Cash flow", "FY2024", "FY2023"],
+    ["Operating activities", "6,914", "6,753"],
+    ["Investing activities", "(2,732)", "(1,898)"],
+    ["Financing activities", "(4,146)", "(4,556)"],
+    ["Net change in cash", "36", "299"],
+]
+
+
+def _retext(grid, fn):
+    return [[fn(c) for c in row] for row in grid]
+
+
+def run_sign_demo(workdir: str):
+    """Show that reconstruction UNWINDS a sign normalization (parens -> minus is
+    the same number) but CATCHES a dropped sign (parens -> bare positive)."""
+    import pdfplumber
+    os.makedirs(workdir, exist_ok=True)
+    pdf = os.path.join(workdir, "sign.pdf")
+    _selftest_pdf(_SIGN_BASE, pdf)  # the SOURCE renders the accounting form `(2,732)`
+    with pdfplumber.open(pdf) as p:
+        pg = p.pages[0]
+        bbox, page = (0, 0, pg.width, pg.height), 1
+
+    paren_to_minus = _retext(_SIGN_BASE, lambda c: "-" + c[1:-1] if c.startswith("(") and c.endswith(")") else c)
+    drop_sign = _retext(_SIGN_BASE, lambda c: c[1:-1] if c.startswith("(") and c.endswith(")") else c)
+
+    print("\n=== sign reconstruction (source PDF shows the accounting form `(x)`) ===")
+    for name, grid in [
+        ("faithful  `(2,732)`", _SIGN_BASE),
+        ("normalized `-2,732` (up: convention->signed)", paren_to_minus),
+        ("DROPPED sign `2,732` (negative lost)", drop_sign),
+    ]:
+        res = validate_table(pdf, page, bbox, render_html(grid))
+        d = res.diagnostics
+        print(f"  {name:<46} error {res.error:.3f}  sign_viol {d.sign_violations:.2f}  {res.top_diagnostic()}")
+
+
 def run_selftest(workdir: str, taus: list[float]):
+    import pdfplumber
     os.makedirs(workdir, exist_ok=True)
     clean_errors, corrupt_rows = [], []
 
@@ -707,6 +791,7 @@ def main():
     args = ap.parse_args()
     if args.mode == "selftest":
         run_selftest(args.workdir, [0.02, 0.05, 0.10, 0.15, 0.20, 0.30])
+        run_sign_demo(args.workdir)
     elif args.mode == "single":
         bbox = tuple(float(v) for v in args.bbox.split(","))
         html = open(args.html).read()
