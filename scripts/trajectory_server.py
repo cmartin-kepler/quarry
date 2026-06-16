@@ -346,6 +346,20 @@ loadDocs();
 </script></body></html>"""
 
 
+def warmup():
+    """Load the Docling model at startup so the first escalation is fast. We
+    convert one page and DISCARD it (don't cache), so real on-demand clicks still
+    measure the per-page time with the model already warm."""
+    print("Loading Docling model (one-time)...", flush=True)
+    t = time.monotonic()
+    try:
+        _converter().convert(next(iter(DOCS.values())), page_range=(1, 1))
+        print(f"  Docling ready in {time.monotonic()-t:.0f}s.", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"  Docling warmup skipped: {str(e)[:80]}", flush=True)
+
+
 if __name__ == "__main__":
+    warmup()
     print("open http://127.0.0.1:5000", flush=True)
     app.run(port=5000, debug=False)
