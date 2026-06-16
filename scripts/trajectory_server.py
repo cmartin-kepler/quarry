@@ -18,8 +18,9 @@ Methods are path-dependent (different representations):
   Docling (PDF, per-page) · vision verify (image)
 
 Run (deps declared inline via PEP 723, so plain uv run works):
-  uv run scripts/trajectory_server.py
-  open http://127.0.0.1:5000
+  uv run scripts/trajectory_server.py            # -> http://127.0.0.1:5050
+  PORT=8080 uv run scripts/trajectory_server.py  # pick another port
+(Port 5000 is avoided: macOS AirPlay Receiver squats on it and returns 403.)
 """
 from __future__ import annotations
 
@@ -360,6 +361,7 @@ def warmup():
 
 
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5050))  # avoid 5000 (macOS AirPlay -> 403)
     warmup()
-    print("open http://127.0.0.1:5000", flush=True)
-    app.run(port=5000, debug=False)
+    print(f"open http://127.0.0.1:{port}", flush=True)
+    app.run(host="127.0.0.1", port=port, debug=False)
