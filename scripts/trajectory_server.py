@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["flask>=3", "docling", "pdfplumber>=0.11"]
+# dependencies = ["flask>=3", "docling", "pdfplumber>=0.11", "ultralytics", "huggingface_hub", "doclayout-yolo"]
 # ///
 """
 trajectory_server.py - Interactive, ON-DEMAND parsing-trajectory UI.
@@ -25,13 +25,23 @@ Run (deps declared inline via PEP 723, so plain uv run works):
 from __future__ import annotations
 
 import base64
+import functools
 import io
 import json
 import os
 import re
 import subprocess
 import tempfile
+import threading
 import time
+from dataclasses import asdict, dataclass, field
+from enum import Enum
+from typing import Literal, Optional
+
+# Quiet the harmless "leaked semaphore" warning Docling's HF tokenizers emit at
+# shutdown (multiprocessing parallelism not torn down cleanly). Must be set before
+# tokenizers is imported (Docling loads lazily in _converter()).
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import pdfplumber
 from flask import Flask, Response, jsonify, request
@@ -40,27 +50,63 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import recon_validate as rv  # noqa: E402
 import text_tables as tt  # noqa: E402
+import typed_table as typ  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 QUARRY = os.path.join(REPO, "target", "debug", "quarry")
 DH = "0" * 64
 VISION_RATE, VISION_TIME = 0.02, 1.2
+BUILD = "evidence-21"  # bump on server changes; shown in the UI header to verify what's running
 
-DOCS = {
-    "Disney Q2 reconciliations": "input/finance/disney/q2-fy26-financial-reconciliations.pdf",
-    "ParseBench paper (arXiv)": "input/arxiv/2604.08538v3.pdf",
-    "JPMorgan annual report": "input/finance/jpm-2023-ar.pdf",
+INPUT_DIR = os.path.join(REPO, "input")
+# Friendlier display names for known files; any other PDF shows as its path under input/.
+ALIASES = {
+    "finance/disney/q2-fy26-financial-reconciliations.pdf": "Disney Q2 reconciliations",
+    "arxiv/2604.08538v3.pdf": "ParseBench paper (arXiv)",
+    "finance/jpm-2023-ar.pdf": "JPMorgan annual report",
 }
-INPUTS = {"cheap": "PDF text-layer (glyph boxes)", "text-table": "LiteParse text / markdown",
-          "Docling": "PDF (direct, per page)", "vision": "rendered region image"}
+DOCS: dict[str, str] = {}
+
+
+def refresh_docs():
+    """Discover every PDF under input/ (re-scanned on each /api/docs, so dropping
+    a new PDF in input/ makes it loadable without restarting the server)."""
+    DOCS.clear()
+    for root, _, files in os.walk(INPUT_DIR):
+        for f in sorted(files):
+            if f.lower().endswith(".pdf"):
+                full = os.path.join(root, f)
+                rel = os.path.relpath(full, INPUT_DIR)
+                # Display name must be slash-free: the Flask <name> route segment
+                # doesn't match "/". Show subdirs with a visual separator instead.
+                name = ALIASES.get(rel, rel[:-4].replace(os.sep, " › "))
+                DOCS[name] = full
+    return DOCS
 
 app = Flask(__name__)
 _pdf, _meta, _regions, _pageimg = {}, {}, {}, {}
-_cheap, _lite, _docling, _wd = {}, {}, {}, tempfile.mkdtemp()
+_lite, _docling, _wd = {}, {}, tempfile.mkdtemp()
+_layout = {}
+
+# pypdfium2 / pdfplumber are NOT thread-safe, and the dev server is threaded — so
+# concurrent renders (the viewer lazy-loading page images while a layout pass
+# rasterizes) corrupt the shared document ("PDFium: Data format error"). Serialize
+# every PDF-touching request through one lock.
+_pdf_lock = threading.RLock()
+
+
+def locked(fn):
+    @functools.wraps(fn)
+    def wrapper(*a, **k):
+        with _pdf_lock:
+            return fn(*a, **k)
+    return wrapper
 
 
 def pdf(name):
     if name not in _pdf:
+        if name not in DOCS:
+            refresh_docs()
         _pdf[name] = pdfplumber.open(DOCS[name])
     return _pdf[name]
 
@@ -98,6 +144,56 @@ def iou(a, b):
     return inter / ((a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter + 1e-9)
 
 
+# Region detection. pdfplumber's default find_tables keys off RULED LINES, so it
+# only finds bordered tables (and collapses text-aligned columns to one column).
+# Most finance/academic tables are borderless, which is why "it doesn't find much".
+# The text strategy recovers them from word alignment; we gate it on numeric
+# density so justified prose (which also aligns into pseudo-columns) isn't flagged.
+_TEXT_TS = {"vertical_strategy": "text", "horizontal_strategy": "text",
+            "min_words_vertical": 3, "min_words_horizontal": 2, "intersection_tolerance": 12}
+_NUMRE = re.compile(r"^[\(\-]?\$?[\d,]*\.?\d+%?\)?$")
+
+
+def detect_regions(pg):
+    """Return [(bbox, ncols, source)] combining ruled-line and text-aligned
+    detection, deduped by overlap. Text-aligned tables must be multi-column and
+    numeric enough to be a data table, not prose. Each bbox is snapped out to the
+    full extent of the words in its row band, so find_tables' often-tight box
+    doesn't clip an overhanging cell (e.g. a 'May' month left of the date column)."""
+    words = pg.extract_words()
+
+    def numfrac(bbox):
+        x0, top, x1, bottom = bbox
+        ws = [w for w in words if x0 <= (w["x0"]+w["x1"])/2 <= x1 and top <= (w["top"]+w["bottom"])/2 <= bottom]
+        return sum(1 for w in ws if _NUMRE.match(w["text"])) / len(ws) if ws else 0.0
+
+    def snap(bbox, halo=55):
+        x0, top, x1, bottom = bbox
+        xs, ys = [x0, x1], [top, bottom]
+        for w in words:
+            cy, cx = (w["top"]+w["bottom"])/2, (w["x0"]+w["x1"])/2
+            if top - 2 <= cy <= bottom + 2 and x0 - halo <= cx <= x1 + halo:
+                xs += [w["x0"], w["x1"]]; ys += [w["top"], w["bottom"]]
+        return (min(xs), max(0, min(ys)), max(xs), max(ys))
+
+    out = []
+    try:
+        for t in pg.find_tables(_TEXT_TS):
+            nc = len(t.rows[0].cells) if t.rows else 0
+            if nc >= 2 and len(t.rows) >= 3 and numfrac(t.bbox) >= 0.08:
+                out.append((snap(t.bbox), nc, "text"))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        for t in pg.find_tables():  # ruled lines; add only if not already covered
+            if not any(iou(t.bbox, b) > 0.5 for b, _, _ in out):
+                nc = len(t.rows[0].cells) if t.rows else 0
+                out.append((snap(t.bbox), nc, "lines"))
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 def recon_for(name, page, bbox, html):
     res, det = rv.validate_detail(DOCS[name], page, bbox, html)
     if res.status != "ok":
@@ -115,30 +211,28 @@ def recon_for(name, page, bbox, html):
 
 # ---- on-demand parsing (each runs live, measures real time) ----------------
 
-def ensure_cheap(name):
-    if name not in _cheap:
-        import pdf_to_qdoc as B
-        t = time.monotonic()
-        doc = B.convert(DOCS[name], None, detect=True, max_pages=None)
-        wd = os.path.join(_wd, "cheap_" + str(abs(hash(name))))
-        os.makedirs(wd, exist_ok=True)
-        q = os.path.join(wd, "c.qdoc"); json.dump(doc, open(q, "w"))
-        st = os.path.join(wd, "c.art")
-        sh([QUARRY, "parse", q, "--out", st, "--tier", "0"])
-        _cheap[name] = {"tables": store_tables(st), "secs": time.monotonic()-t,
-                        "n_pages": len(pdf(name).pages)}
-    return _cheap[name]
 
 
 def ensure_lite(name):
     if name not in _lite:
         t = time.monotonic()
         js = os.path.join(_wd, "lp_" + str(abs(hash(name))) + ".json")
-        sh(["lit", "parse", DOCS[name], "--format", "json", "-o", js, "-q"])
-        secs = time.monotonic()-t
-        lj = json.load(open(js))
-        _lite[name] = {"text": {p["page"]: p["text"] for p in lj["pages"]},
-                       "secs": secs, "n_pages": len(lj["pages"])}
+        err = None
+        try:
+            r = sh(["lit", "parse", DOCS[name], "--format", "json", "-o", js, "-q"])
+            lj = json.load(open(js))
+            text = {p["page"]: p["text"] for p in lj["pages"]}
+            n_pages = len(lj["pages"])
+        except FileNotFoundError:
+            err = "the `lit` (LiteParse) CLI is not on the server's PATH"
+            text, n_pages = {}, len(pdf(name).pages)
+        except Exception as e:  # noqa: BLE001 — bad/empty lit output
+            err = f"LiteParse failed: {(r.stderr if 'r' in dir() else str(e))[:120]}"
+            text, n_pages = {}, len(pdf(name).pages)
+        if err:
+            print(f"[lite] {name}: {err}", flush=True)
+        _lite[name] = {"text": text, "secs": time.monotonic()-t,
+                       "n_pages": max(1, n_pages), "err": err}
     return _lite[name]
 
 
@@ -153,6 +247,30 @@ def _converter():
     return _conv
 
 
+# Docling label (snake_case) -> our display label (matches LAYCOLOR / YOLO labels).
+_DL_LABEL = {"text": "Text", "paragraph": "Text", "title": "Title", "section_header": "Section-header",
+             "table": "Table", "picture": "Picture", "figure": "Picture", "caption": "Caption",
+             "list_item": "List-item", "formula": "Formula", "page_header": "Page-header",
+             "page_footer": "Page-footer", "footnote": "Footnote", "code": "Formula"}
+
+
+def _docling_layout(doc, page):
+    """Layout elements from Docling's own document model (it runs a DocLayNet
+    layout detector internally) — boxes in top-left PDF points, like pdfplumber."""
+    els = []
+    for item, _lvl in doc.iterate_items():
+        prov = getattr(item, "prov", None)
+        if not prov or prov[0].page_no != page:
+            continue
+        pg = doc.pages.get(page)
+        ph = pg.size.height if pg else None
+        bb = prov[0].bbox.to_top_left_origin(page_height=ph) if ph else prov[0].bbox
+        raw = getattr(item.label, "value", item.label)
+        els.append({"label": _DL_LABEL.get(str(raw), str(raw).replace("_", " ").title()),
+                    "conf": 1.0, "bbox": [float(bb.l), float(bb.t), float(bb.r), float(bb.b)]})
+    return els
+
+
 def docling_page(name, page):
     key = (name, page)
     if key not in _docling:
@@ -164,7 +282,11 @@ def docling_page(name, page):
         js = os.path.join(wd, "d.json"); json.dump(res.document.export_to_dict(), open(js, "w"))
         st = os.path.join(wd, "d.art")
         sh([QUARRY, "import-docling", js, "--pdf", DOCS[name], "--out", st])
-        _docling[key] = {"tables": store_tables(st), "secs": secs}
+        try:
+            layout = _docling_layout(res.document, page)
+        except Exception as e:  # noqa: BLE001
+            print(f"[docling-layout] {name} p{page}: {str(e)[:120]}", flush=True); layout = []
+        _docling[key] = {"tables": store_tables(st), "secs": secs, "layout": layout}
     return _docling[key]
 
 
@@ -186,317 +308,466 @@ def tokens(s):
     return {"".join(c for c in w.lower() if c.isalnum()) for w in re.split(r"\s+", s)} - {""}
 
 
+def lite_best_grid(name, page, bbox):
+    """The grid LiteParse's text yields for the table under `bbox`, matched to the
+    region's own PDF words. LiteParse splits a page into several grids while the
+    region may be one big box, so we score each grid by max(precision, recall) of
+    token overlap — precision (grid ⊆ region) catches a sub-table inside a big
+    region; recall (region ⊆ grid) catches a region inside one big grid — then,
+    among grids that clear the bar, pick the one covering the most region tokens.
+    Returns (grid|None, secs, score). Shared by text-table and markdown."""
+    lp = ensure_lite(name)
+    pg = pdf(name).pages[page-1]
+    x0, top, x1, bottom = bbox
+    cr = pg.crop((max(0, x0), max(0, top), min(pg.width, x1), min(pg.height, bottom)))
+    ref = tokens(" ".join(w["text"] for w in cr.extract_words()))
+    grids = tt.detect_tables(lp["text"].get(page, ""))
+    best, best_inter, best_score, max_seen = None, -1, 0.0, 0.0
+    for g in grids:
+        gt = tokens(" ".join(c2 for row in g for c2 in row))
+        inter = len(ref & gt)
+        score = max(inter / (len(gt) + 1e-9), inter / (len(ref) + 1e-9))
+        max_seen = max(max_seen, score)
+        if score >= 0.5 and inter > best_inter:
+            best, best_inter, best_score = g, inter, score
+    secs = lp["secs"] / max(1, lp["n_pages"])
+    if best is None:
+        if lp.get("err"):
+            why = lp["err"]
+        elif not grids:
+            why = "LiteParse produced no detectable text grid on this page"
+        else:
+            why = f"{len(grids)} LiteParse grid(s) on this page, best overlap {max_seen:.2f} (<0.50) — none aligns with this region"
+    else:
+        why = None
+    return best, secs, best_score, why
+
+
 # ---- API -------------------------------------------------------------------
+
+@app.get("/api/health")
+def api_health():
+    # The op registry is the authoritative scheme; the UI mirrors it from here.
+    return jsonify({"build": BUILD,
+                    "ops": [{"name": o.name, "kind": o.kind.value,
+                             "consumes": o.consumes.value,
+                             "produces": o.produces.value if o.produces else None,
+                             "reads": o.reads, "label": o.label} for o in OPS.values()]})
+
 
 @app.get("/api/docs")
 def api_docs():
-    return jsonify(list(DOCS))
+    return jsonify(list(refresh_docs()))
 
 
 @app.get("/api/doc/<name>")
+@locked
 def api_doc(name):
     """Just page dimensions — instant for any doc size. Images and regions load
     lazily per page as the viewer scrolls."""
     if name not in _meta:
-        _meta[name] = [{"page": pg.page_number, "w": float(pg.width), "h": float(pg.height)}
-                       for pg in pdf(name).pages]
+        pages = []
+        for pg in pdf(name).pages:
+            try:
+                pages.append({"page": pg.page_number, "w": float(pg.width), "h": float(pg.height)})
+            except Exception:  # noqa: BLE001 — a bad page still gets a slot (default dims)
+                pages.append({"page": pg.page_number, "w": 612.0, "h": 792.0})
+        _meta[name] = pages
     return jsonify({"pages": _meta[name]})
 
 
-@app.get("/api/regions/<name>/<int:n>")
-def api_regions(name, n):
-    """Detect table regions on one page on demand (find_tables is slow per page)."""
-    key = (name, n)
-    if key not in _regions:
-        pg = pdf(name).pages[n-1]
-        regs = []
-        for ti, t in enumerate(pg.find_tables()):
-            x0, top, x1, bottom = t.bbox
-            regs.append({"id": f"p{n}t{ti}", "page": n, "bbox": [x0, top, x1, bottom],
-                         "box": {"left": 100*x0/pg.width, "top": 100*top/pg.height,
-                                 "width": 100*(x1-x0)/pg.width, "height": 100*(bottom-top)/pg.height}})
-        _regions[key] = regs
-    return jsonify(_regions[key])
+
+
+def crop_table(name, page, bbox):
+    """Region-scoped cheap extraction: build a grid from the text inside the
+    region's bbox (text strategy first, ruled-line fallback). This makes the
+    `Region —(cheap)→ table` edge honest — it parses the region, rather than
+    matching against a separate whole-page detection."""
+    pg = pdf(name).pages[page-1]
+    x0, y0, x1, y1 = bbox
+    crop = pg.crop((max(0, x0), max(0, y0), min(pg.width, x1), min(pg.height, y1)))
+    for settings in ({"vertical_strategy": "text", "horizontal_strategy": "text",
+                      "min_words_vertical": 2, "min_words_horizontal": 1, "intersection_tolerance": 12}, {}):
+        try:
+            grid = crop.extract_table(settings)
+        except Exception:  # noqa: BLE001
+            grid = None
+        if grid:
+            return [[(c or "").strip() for c in row] for row in grid]
+    return None
+
+
+def _placeholder_png(w, h, msg):
+    from PIL import Image, ImageDraw
+    img = Image.new("RGB", (max(2, int(w)), max(2, int(h))), (244, 245, 244))
+    d = ImageDraw.Draw(img)
+    d.text((24, 24), msg, fill=(150, 80, 80))
+    buf = io.BytesIO(); img.save(buf, format="PNG"); return buf.getvalue()
+
+
+# Normalize every detector's label vocabulary to one canonical set, so the
+# "Table" filter and the color map work regardless of model.
+_NORM = {"text": "Text", "plain text": "Text", "paragraph": "Text", "title": "Title",
+         "section-header": "Section-header", "section_header": "Section-header",
+         "table": "Table", "table_caption": "Caption", "table_footnote": "Footnote",
+         "picture": "Picture", "figure": "Picture", "figure_caption": "Caption", "caption": "Caption",
+         "list-item": "List-item", "list_item": "List-item", "list": "List-item",
+         "formula": "Formula", "isolate_formula": "Formula", "formula_caption": "Caption",
+         "page-header": "Page-header", "page_header": "Page-header",
+         "page-footer": "Page-footer", "page_footer": "Page-footer",
+         "footnote": "Footnote", "abandon": "Page-footer"}
+
+
+def norm_label(lbl):
+    return _NORM.get(str(lbl).strip().lower(), str(lbl).replace("_", " ").title())
+
+
+@app.get("/api/layout/<name>/<int:n>")
+@locked
+def api_layout(name, n):
+    """Learned layout detection: every document element (Table, Picture, Title,
+    Text/paragraph, Section-header, …) on one page, as PDF-coordinate boxes.
+    ?model = yolo26 (default) | doclayout (DocLayout-YOLO) | docling (Docling's own
+    layout model). Lazy: model loads/downloads on first call; degrades gracefully."""
+    model = request.args.get("model", "yolo26")
+    key = (name, n, model)
+    if key not in _layout:
+        try:
+            pg = pdf(name).pages[n-1]
+            t0 = time.monotonic()
+            if model == "find_tables":
+                # Geometric detection (ruled + text-aligned) — just another model.
+                raw = [{"label": "Table", "conf": 1.0, "bbox": list(b)}
+                       for b, _nc, _src in detect_regions(pg)]
+                secs = time.monotonic()-t0
+            elif model == "docling":
+                # Docling's layout comes from the full conversion, so its cost IS
+                # the conversion time (reused/cached by docling_page).
+                dl = docling_page(name, n); raw = dl["layout"]; secs = dl["secs"]
+            else:
+                res = 150
+                im = pdf(name).pages[n-1].to_image(resolution=res).original
+                import yolo_layout as yl
+                raw = yl.detect(im, res, key=model); secs = time.monotonic()-t0
+            els = []
+            for i, el in enumerate(raw):
+                x0, y0, x1, y1 = el["bbox"]
+                els.append({"label": norm_label(el["label"]), "conf": el.get("conf", 1.0),
+                            "id": f"{model}_p{n}_{i}", "bbox": el["bbox"],
+                            "box": {"left": 100*x0/pg.width, "top": 100*y0/pg.height,
+                                    "width": 100*(x1-x0)/pg.width, "height": 100*(y1-y0)/pg.height}})
+            _layout[key] = {"elements": els, "seconds": round(secs, 3)}
+        except Exception as e:  # noqa: BLE001
+            print(f"[layout:{model}] {name} p{n}: {str(e)[:160]}", flush=True)
+            return jsonify({"error": str(e)[:200], "elements": []})
+    return jsonify({**_layout[key], "model": model})
 
 
 @app.get("/api/page/<name>/<int:n>")
+@locked
 def api_page(name, n):
-    """Render one page on demand (lazy-loaded by the scrollable viewer)."""
+    """Render one page on demand (lazy-loaded by the scrollable viewer). A page
+    pdfium can't load (corrupt/encrypted) returns a placeholder instead of 500,
+    so one bad page doesn't break the rest of the document."""
     key = (name, n)
     if key not in _pageimg:
-        pg = pdf(name).pages[n-1]
-        im = pg.to_image(resolution=150); buf = io.BytesIO(); im.save(buf, format="PNG")
-        _pageimg[key] = buf.getvalue()
+        try:
+            pg = pdf(name).pages[n-1]
+            im = pg.to_image(resolution=150); buf = io.BytesIO(); im.save(buf, format="PNG")
+            _pageimg[key] = buf.getvalue()
+        except Exception as e:  # noqa: BLE001
+            print(f"[page] {name} p{n}: {str(e)[:120]}", flush=True)
+            try:
+                pg = pdf(name).pages[n-1]; w, h = float(pg.width)*2, float(pg.height)*2
+            except Exception:  # noqa: BLE001
+                w, h = 1200, 1600
+            # Don't cache the placeholder — allow a later retry to succeed.
+            return Response(_placeholder_png(w, h, f"page {n} failed to render"),
+                            mimetype="image/png")
     return Response(_pageimg[key], mimetype="image/png")
 
 
+# ---- the artifact / operation scheme ----------------------------------------
+# One invariant, two op shapes:
+#   * extract / transform PRODUCE a new artifact (a new representation of content)
+#   * validate ANNOTATES an artifact's evidence — it produces nothing new
+# So validation is not an artifact; it enriches the table it judges (status +
+# signals). That keeps every validator (reconcile, figure-guard, recon, vision)
+# uniform — vision is no longer a special "verdict" node.
+
+class ArtifactKind(str, Enum):
+    PAGE = "page"        # the source page
+    REGION = "region"    # a located area on the page (a layout detection)
+    TABLE = "table"      # a parsed HtmlTable (+ its evidence)
+    TYPED = "typed"      # a materialized, math-ready TypedTable
+
+
+class OpKind(str, Enum):
+    LAYOUT = "layout"        # Page    -> Region(s)        (segmentation; one op, many regions)
+    EXTRACT = "extract"      # Region  -> Table            (reparse a source repr, scoped to the region)
+    TRANSFORM = "transform"  # Table   -> Table / Typed    (consume the artifact's own content)
+    VALIDATE = "validate"    # Table   -> (no new artifact; attaches evidence to it)
+
+
+# An evidence verdict — we can't prove correctness without ground truth, only
+# gather signals; `status` is the strongest summary of them.
+Status = Literal["confirmed", "ok", "suspect", "figure", "missing", "verified", "typed", "located", "idle"]
+
+
+@dataclass(frozen=True)
+class Operation:
+    """One edge in the artifact graph. `produces` is None for VALIDATE ops — they
+    make no new artifact, they annotate the one they judge. `reads` names the
+    source representation an EXTRACT reparses (the path-dependence that's the point
+    of the project), or the image a VALIDATE looks at."""
+    name: str
+    kind: OpKind
+    consumes: ArtifactKind
+    produces: Optional[ArtifactKind] = None
+    reads: Optional[str] = None
+    label: str = ""
+
+    @property
+    def input(self) -> str:               # human label shown in the UI
+        return self.reads or self.label
+
+
+_PG, _RG, _TB, _TY = (ArtifactKind.PAGE, ArtifactKind.REGION, ArtifactKind.TABLE, ArtifactKind.TYPED)
+OPS: dict[str, Operation] = {o.name: o for o in [
+    # layout: Page -> Region(s)
+    Operation("find_tables", OpKind.LAYOUT, _PG, _RG, label="geometric (ruled + text-aligned)"),
+    Operation("yolo26",      OpKind.LAYOUT, _PG, _RG, label="YOLO26 learned layout"),
+    Operation("doclayout",   OpKind.LAYOUT, _PG, _RG, label="DocLayout-YOLO"),
+    Operation("docling",     OpKind.LAYOUT, _PG, _RG, label="Docling layout model"),
+    # extract: Region -> Table  (reparse one source representation, scoped to the region)
+    Operation("cheap",       OpKind.EXTRACT, _RG, _TB, reads="PDF text-layer (glyph boxes)"),
+    Operation("text-table",  OpKind.EXTRACT, _RG, _TB, reads="LiteParse space-aligned text"),
+    Operation("Docling",     OpKind.EXTRACT, _RG, _TB, reads="PDF (direct, per page)"),
+    # transform: Table -> Table / Typed  (consume the artifact's own content)
+    Operation("markdown",    OpKind.TRANSFORM, _TB, _TB, label="grid → markdown → table"),
+    Operation("sign-fix",    OpKind.TRANSFORM, _TB, _TB, label="reinterpret signs (parens / CR / DR → signed)"),
+    Operation("materialize", OpKind.TRANSFORM, _TB, _TY, label="HtmlTable → typed columns"),
+    # validate: Table -> (no artifact; attaches a verdict to the table's evidence)
+    Operation("vision",      OpKind.VALIDATE, _TB, None, reads="rendered region image"),
+]}
+
+
+@dataclass
+class OpResult:
+    """The artifact an operation produces — the invariant payload every /api/parse
+    response carries. `kind` is the producing op's OpKind; the evidence lives here
+    on the artifact (status/signals/recon), uniformly (validation is not a node)."""
+    method: str
+    kind: str                                   # OpKind value of the producing op
+    input: str                                  # what it read / how it derived
+    status: Status
+    seconds: float = 0.0
+    dollars: float = 0.0
+    impression: Optional[str] = None
+    signals: list[dict] = field(default_factory=list)
+    html: Optional[str] = None
+    recon: Optional[float] = None               # reconstruction error (evidence)
+    detail: Optional[str] = None                # recon diff image (base64)
+    markdown: Optional[str] = None
+    note: Optional[str] = None
+    next: list[dict] = field(default_factory=list)
+
+
+def _artifact(op: Operation, ev: dict, html: str, secs: float,
+              recon: Optional[float] = None, detail: Optional[str] = None,
+              markdown: Optional[str] = None, note: Optional[str] = None) -> OpResult:
+    """Build a produced TABLE artifact from a validator's evidence."""
+    return OpResult(method=op.name, kind=op.kind.value, input=op.input,
+                    status=status_of(ev), impression=ev.get("impression"),
+                    signals=ev.get("signals", []), html=html, recon=recon, detail=detail,
+                    markdown=markdown, note=note, seconds=round(secs, 3))
+
+
+def _missing(op: Operation, secs: float, note: Optional[str]) -> OpResult:
+    return OpResult(method=op.name, kind=op.kind.value, input=op.input,
+                    status="missing", seconds=round(secs, 3), note=note)
+
+
+def grid_from_html(html):
+    grid, _ = rv.parse_html_grid(html or "")
+    return [[c for c in row] for row in grid] if grid else None
+
+
+def sign_fix_grid(grid):
+    """Transform: rewrite accounting sign conventions to signed numbers."""
+    changed, out = 0, []
+    for row in grid:
+        r = []
+        for c in row:
+            t = c.strip(); new = c
+            if t.startswith("(") and t.endswith(")") and any(ch.isdigit() for ch in t):
+                new = "-" + t[1:-1].strip()
+            elif t[-2:].lower() == "cr" and any(ch.isdigit() for ch in t):
+                new = "-" + t[:-2].strip()
+            elif t[-2:].lower() == "dr" and any(ch.isdigit() for ch in t):
+                new = t[:-2].strip()
+            elif t.endswith("-") and any(ch.isdigit() for ch in t[:-1]):
+                new = "-" + t[:-1].strip()
+            if new != c:
+                changed += 1
+            r.append(new)
+        out.append(r)
+    return out, changed
+
+
+def route(r: OpResult, tried: list[str]) -> list[dict]:
+    """Diagnostic-driven next operations: ops whose precondition matches the
+    failure, in priority order (a cheap targeted transform before a costly
+    re-parse). This policy replaces the linear ladder — escalation is best-first
+    over the artifact graph. `tried` is the ancestor op lineage (no repeats)."""
+    sigs = " ".join(s.get("detail", "") for s in r.signals)
+    status, html, method = r.status, (r.html or ""), r.method
+    cands: list[dict] = []
+
+    def add(op: str, reason: str) -> None:
+        if op != method and op not in tried and all(c["op"] != op for c in cands):
+            cands.append({"op": op, "reason": reason, "kind": OPS[op].kind.value})
+
+    if status in ("ok", "confirmed", "verified"):
+        add("materialize", "validated — materialize to typed, math-ready columns")
+        return cands
+    if "figure" in sigs:
+        add("vision", "looks like a chart/figure — confirm with vision")
+    if "no column reconciles" in sigs or "rows sum to" in sigs:
+        if "CR" in html or "DR" in html:
+            add("sign-fix", "totals fail and CR/DR markers present — reinterpret signs")
+        add("Docling", "totals don't reconcile — re-parse structure from the PDF")
+    if "no column headers" in sigs:
+        add("Docling", "header row looks like data — re-parse from the PDF")
+    if "non-numeric" in sigs:
+        add("Docling", "stray text in a numeric column — re-parse from the PDF")
+    if status == "missing":
+        for op in ("text-table", "markdown", "Docling"):
+            add(op, "not found by this method — try " + OPS[op].input)
+    # generic fallbacks — always leave a way forward, cheapest last-resort first
+    add("Docling", "escalate to a structure-aware parser")
+    add("vision", "escalate to vision verification")
+    add("markdown", "re-express the grid as markdown and re-detect")
+    return cands[:4]
+
+
 @app.post("/api/parse")
+@locked
 def api_parse():
+    """Apply one operation to a Region/Table, returning the produced artifact.
+    Every branch builds the same typed OpResult (the scheme's invariant)."""
     d = request.get_json()
     name, page, bbox, method = d["name"], d["page"], tuple(d["bbox"]), d["method"]
-    res = {"method": method, "input": INPUTS.get(method, method)}
+    parent_html = d.get("parent_html")
+    op = OPS[method]
 
-    if method == "cheap":
-        c = ensure_cheap(name)
-        cands = [t for t in c["tables"] if t["page"] == page]
-        t = max(cands, key=lambda t: iou(bbox, t["bbox"]), default=None)
-        secs = c["secs"] / max(1, c["n_pages"])
-        res.update(_table_result(name, page, bbox, t, secs, 0.0))
-
-    elif method == "text-table":
-        lp = ensure_lite(name)
-        c = ensure_cheap(name)
-        ref = max((t for t in c["tables"] if t["page"] == page), key=lambda t: iou(bbox, t["bbox"]), default=None)
-        ref_tok = tokens(re.sub("<[^>]+>", " ", ref["html"])) if ref else set()
-        best, bestov = None, 0.0
-        for g in tt.detect_tables(lp["text"].get(page, "")):
-            ov = len(ref_tok & tokens(" ".join(c2 for row in g for c2 in row))) / (len(ref_tok)+1e-9)
-            if ov > bestov:
-                best, bestov = g, ov
-        secs = lp["secs"] / max(1, lp["n_pages"])
-        if best and bestov > 0.3:
-            ev = explain_grid(best, page)
-            res.update({"status": status_of(ev), "impression": ev.get("impression"),
-                        "signals": ev.get("signals", []), "html": tt.to_html(best),
-                        "seconds": round(secs, 3), "dollars": 0.0, "recon": None, "detail": None})
+    if method == "cheap":  # EXTRACT: parse a grid from the text inside the region's bbox
+        t0 = time.monotonic()
+        grid = crop_table(name, page, bbox)
+        if grid and len(grid) >= 2:
+            html = tt.to_html(grid)
+            err, png = recon_for(name, page, bbox, html)
+            r = _artifact(op, explain_grid(grid, page), html, time.monotonic()-t0, recon=err, detail=png)
         else:
-            res.update({"status": "missing", "seconds": round(secs, 3), "dollars": 0.0})
+            r = _missing(op, time.monotonic()-t0, "no table grid found in this region")
 
-    elif method == "Docling":
+    elif method == "text-table":  # EXTRACT: a grid from LiteParse text, scoped to the region
+        best, secs, _, why = lite_best_grid(name, page, bbox)
+        r = (_artifact(op, explain_grid(best, page), tt.to_html(best), secs) if best
+             else _missing(op, secs, why))
+
+    elif method == "markdown":  # TRANSFORM: parent grid -> markdown -> re-parse -> validate
+        t0 = time.monotonic()
+        src = grid_from_html(parent_html) if parent_html else lite_best_grid(name, page, bbox)[0]
+        if src:
+            md = tt.to_markdown(src)
+            reparsed = tt.detect_tables(md)
+            grid = reparsed[0] if reparsed else src
+            r = _artifact(op, explain_grid(grid, page), tt.to_html(grid), time.monotonic()-t0, markdown=md)
+        else:
+            r = _missing(op, time.monotonic()-t0, "no parent grid to re-express as markdown")
+
+    elif method == "sign-fix":  # TRANSFORM: rewrite the parent grid's accounting signs
+        t0 = time.monotonic()
+        src = grid_from_html(parent_html)
+        if src:
+            grid, changed = sign_fix_grid(src)
+            r = _artifact(op, explain_grid(grid, page), tt.to_html(grid), time.monotonic()-t0,
+                          note=f"rewrote {changed} parenthesised/CR/DR value(s) to signed numbers")
+        else:
+            r = _missing(op, time.monotonic()-t0, "no parent grid to reinterpret")
+
+    elif method == "Docling":  # EXTRACT: match the region to Docling's per-page tables
         dl = docling_page(name, page)
         t = max((t for t in dl["tables"] if t["page"] == page), key=lambda t: iou(bbox, t["bbox"]), default=None)
-        res.update(_table_result(name, page, bbox, t, dl["secs"], 0.0))
+        if t is None:
+            r = _missing(op, dl["secs"], "Docling found no table at this region")
+        else:
+            err, png = recon_for(name, page, bbox, t["html"])
+            r = _artifact(op, t["ev"], t["html"], dl["secs"], recon=err, detail=png)
 
-    elif method == "vision":
-        res.update({"status": "verified", "seconds": VISION_TIME, "dollars": VISION_RATE,
-                    "note": "LLM vision-verifies the parse / confirms it is a figure (modeled)"})
-    return jsonify(res)
+    elif method == "vision":  # VALIDATE: an evidence patch merged onto the table (no new artifact)
+        r = OpResult(method=op.name, kind=op.kind.value, input=op.input, status="verified",
+                     seconds=VISION_TIME, dollars=VISION_RATE,
+                     signals=[{"positive": True, "detail": "vision-verified the parse (modeled)"}],
+                     note="LLM vision-verifies the parse / confirms it is a figure (modeled)")
+
+    else:
+        return jsonify({"error": f"unknown operation {method!r}"}), 400
+
+    r.next = route(r, d.get("tried", []))
+    return jsonify(asdict(r))
 
 
-@app.post("/api/parse_page")
-def api_parse_page():
-    """Run a method on the WHOLE page and return every table it finds — so tables
-    that find_tables (ruled lines) missed (e.g. borderless academic tables) get
-    discovered. Docling finds these; cheap/text usually don't."""
+
+
+_SQL = {"int": "BIGINT", "float": "DOUBLE", "percent": "DOUBLE",
+        "currency": "DOUBLE", "label": "VARCHAR"}
+
+
+@app.post("/api/materialize")
+def api_materialize():
+    """The non-reversible HtmlTable -> TypedTable step: materialize the parsed
+    HTML into typed, math-ready columns (negatives, scale, %, currency resolved)
+    with per-cell provenance. Returns a typed preview + the DuckDB DDL it implies."""
+    from collections import Counter
     d = request.get_json()
-    name, page, method = d["name"], d["page"], d["method"]
-    pg = pdf(name).pages[page-1]
-    tables, secs = [], 0.0
-    if method == "Docling":
-        dl = docling_page(name, page); secs = dl["secs"]
-        tables = [t for t in dl["tables"] if t["page"] == page]
-    elif method == "cheap":
-        c = ensure_cheap(name); secs = c["secs"]/max(1, c["n_pages"])
-        tables = [t for t in c["tables"] if t["page"] == page]
-    out = []
-    for i, t in enumerate(tables):
-        x0, y0, x1, y1 = t["bbox"]
-        err, png = recon_for(name, page, t["bbox"], t["html"])
-        out.append({"id": f"{method}_p{page}_{i}", "bbox": list(t["bbox"]),
-                    "box": {"left": 100*x0/pg.width, "top": 100*y0/pg.height,
-                            "width": 100*(x1-x0)/pg.width, "height": 100*(y1-y0)/pg.height},
-                    "method": method, "input": INPUTS.get(method, method),
-                    "status": status_of(t["ev"]), "impression": t["ev"].get("impression"),
-                    "signals": t["ev"].get("signals", []), "html": t["html"],
-                    "seconds": round(secs, 3), "dollars": 0.0, "recon": err, "detail": png})
-    return jsonify({"method": method, "count": len(out), "tables": out})
+    html = d.get("html") or ""
+    try:
+        t = typ.from_html(html)
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": str(e)})
+    cols = []
+    for c in t.columns:
+        tf = Counter(x for cell in c.cells for x in cell.transforms)
+        cols.append({"name": c.name, "dtype": c.dtype, "sql": _SQL[c.dtype],
+                     "nulls": sum(1 for v in c.values if v is None),
+                     "transforms": dict(tf)})
+    rows = [[(c.values[r] if r < len(c.values) else None) for c in t.columns]
+            for r in range(min(t.n_rows, 60))]
+    ddl = ("CREATE TABLE t (\n  "
+           + ",\n  ".join(f'"{c["name"]}" {c["sql"]}' for c in cols) + "\n);")
+    return jsonify({"columns": cols, "rows": rows, "violations": t.violations,
+                    "n_rows": t.n_rows, "ddl": ddl})
 
 
-def _table_result(name, page, bbox, t, secs, dollars):
-    if t is None:
-        return {"status": "missing", "seconds": round(secs, 3), "dollars": dollars}
-    err, png = recon_for(name, page, bbox, t["html"])
-    return {"status": status_of(t["ev"]), "impression": t["ev"].get("impression"),
-            "signals": t["ev"].get("signals", []), "html": t["html"],
-            "seconds": round(secs, 3), "dollars": dollars, "recon": err, "detail": png}
+STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
 
 @app.get("/")
 def index():
-    return HTML
+    return Response(open(os.path.join(STATIC, "app.html"), encoding="utf-8").read(), mimetype="text/html")
 
-
-HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
-<title>Parsing trajectory</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>
-:root{
- --g950:#030a07;--g900:#0b1f17;--g800:#0f2e22;--g700:#14412f;--g600:#1a5a40;--g500:#22805a;--g400:#4a9d76;--g300:#7fb89a;--g200:#bdd4c7;--g100:#dfe9e3;--g50:#f4f5f4;
- --paper:#faf9f7;--ink:#171717;--muted:#6b6b6b;--line:#e7e5e4;
- --confirmed:#1a5a40;--ok:#3f7a8c;--suspect:#b4453a;--figure:#7a4fa3;--missing:#b07515;--verified:#1a8a6a;--idle:#9aa39e;
-}
-*{box-sizing:border-box}
-body{margin:0;background:var(--paper);color:var(--ink);font-family:Geist,-apple-system,system-ui,sans-serif;font-size:14px;-webkit-font-smoothing:antialiased}
-.mono{font-family:'Geist Mono',ui-monospace,monospace}
-header{position:sticky;top:0;z-index:10;background:rgba(250,249,247,.85);backdrop-filter:blur(8px);border-bottom:1px solid var(--line);padding:12px 22px;display:flex;align-items:center;gap:18px}
-.brand{display:flex;align-items:center;gap:9px;font-weight:600;font-size:15px;letter-spacing:-.01em}
-.logo{width:22px;height:22px;border-radius:6px;background:linear-gradient(135deg,var(--g500),var(--g700));display:grid;place-items:center;color:#fff;font-size:13px;font-weight:700}
-select{font-family:inherit;font-size:13px;padding:5px 9px;border:1px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);cursor:pointer}
-select:focus{outline:none;border-color:var(--g400)}
-.spacer{flex:1}
-.pageind{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px}
-.pageind input{width:46px;font-family:'Geist Mono',monospace;font-size:12px;padding:3px 6px;border:1px solid var(--line);border-radius:6px;text-align:center}
-.sub{font-size:12px;color:var(--muted);padding:0 22px 10px;margin-top:-2px}
-main{display:grid;grid-template-columns:1fr 2fr;gap:0;height:calc(100vh - 84px)}
-.viewer{overflow-y:auto;padding:18px 18px 40px;scroll-behavior:smooth}
-.pageslot{position:relative;width:100%;max-width:780px;margin:0 auto 18px;background:#fff;border:1px solid var(--line);border-radius:8px;box-shadow:0 1px 2px rgba(20,20,20,.04),0 4px 14px rgba(20,20,20,.05);overflow:hidden}
-.pagenum{position:absolute;left:10px;top:10px;z-index:3;font-family:'Geist Mono',monospace;font-size:10px;color:var(--muted);background:rgba(255,255,255,.8);border:1px solid var(--line);border-radius:5px;padding:1px 6px}
-.pageimg{width:100%;display:block;min-height:240px;background:repeating-linear-gradient(45deg,#f6f6f5,#f6f6f5 10px,#f1f1ef 10px,#f1f1ef 20px)}
-.overlays{position:absolute;inset:0}
-.ov{position:absolute;box-sizing:border-box;border:2px solid var(--idle);border-radius:4px;cursor:pointer;transition:box-shadow .12s,border-color .12s;background:transparent}
-.ov:hover{border-color:var(--g500);box-shadow:0 0 0 3px rgba(34,128,90,.15)}
-.ov.sel{border-color:var(--g600);box-shadow:0 0 0 3px #fde68a}
-.ov .tag{position:absolute;left:-1px;top:-17px;font-size:9px;font-weight:600;color:#fff;padding:1px 5px;border-radius:4px;white-space:nowrap;text-transform:uppercase;letter-spacing:.03em}
-.panel{border-left:1px solid var(--line);background:#fff;overflow-y:auto;padding:20px}
-.pp{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:14px}
-.btn{font-family:inherit;font-size:12px;font-weight:500;padding:5px 11px;border-radius:7px;border:1px solid var(--g600);background:var(--g600);color:#fff;cursor:pointer;transition:background .12s}
-.btn:hover{background:var(--g700)}
-.btn.ghost{background:#fff;color:var(--g700);border-color:var(--g300)}
-.btn.ghost:hover{background:var(--g50)}
-.btn:disabled{opacity:.5;cursor:default}
-.graph{display:flex;align-items:center;flex-wrap:wrap;gap:0;margin-bottom:8px}
-.node{border:1.5px solid var(--idle);border-radius:10px;padding:9px 12px;min-width:122px;background:#fff;cursor:pointer;transition:box-shadow .12s,transform .12s}
-.node:hover{transform:translateY(-1px)}
-.node.sel{box-shadow:0 0 0 3px #fde68a}
-.node.next{border-style:dashed;border-color:var(--g300);background:var(--g50);cursor:default;display:flex;flex-direction:column;justify-content:center;gap:5px}
-.node.next:hover{transform:none}
-.node.next .btn{width:100%;text-align:center}
-.node .m{font-weight:600;font-size:13px}
-.node .i{font-size:10px;color:var(--muted);margin-top:1px}
-.node .c{font-family:'Geist Mono',monospace;font-size:10px;color:var(--g600);margin-top:4px}
-.arrow{color:var(--g300);font-size:18px;padding:0 7px}
-.badge{display:inline-flex;align-items:center;font-size:10px;font-weight:600;color:#fff;padding:2px 8px;border-radius:20px;text-transform:uppercase;letter-spacing:.03em;margin-top:5px}
-.esc{margin:8px 0 16px;min-height:30px}
-.esc .ok{color:var(--g600);font-size:13px;font-weight:500}
-.spin{color:var(--g500);font-size:13px;display:inline-flex;align-items:center;gap:7px}
-.spin::before{content:"";width:13px;height:13px;border:2px solid var(--g200);border-top-color:var(--g500);border-radius:50%;display:inline-block;animation:sp .7s linear infinite}
-@keyframes sp{to{transform:rotate(360deg)}}
-.card{border:1px solid var(--line);border-radius:10px;padding:14px;background:#fff}
-.card h4{margin:0 0 8px;font-size:13px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.tbl{margin:10px 0;overflow-x:auto;border:1px solid var(--line);border-radius:8px}
-table{border-collapse:collapse;font-size:12px;width:100%}
-td,th{border-bottom:1px solid var(--g50);border-right:1px solid var(--g50);padding:4px 9px;white-space:nowrap;text-align:left}
-th{background:var(--g50);font-weight:600;color:var(--g800)}
-tr:last-child td{border-bottom:none}
-.sig{font-size:12px;margin-top:3px;display:flex;gap:6px}
-.sig.pos{color:var(--g600)}.sig.neg{color:var(--suspect)}
-.dim{color:var(--muted);font-size:12px}
-details{margin-top:10px}summary{cursor:pointer;font-size:12px;color:var(--g600)}
-details img{max-width:100%;border:1px solid var(--line);border-radius:8px;margin-top:8px}
-.hint{color:var(--muted);font-size:13px;padding:30px 10px;text-align:center;border:1px dashed var(--line);border-radius:10px}
-.costline{font-family:'Geist Mono',monospace;font-size:11px;color:var(--g600);margin-top:6px}
-</style></head><body>
-<header>
- <div class="brand"><span class="logo">Q</span> Parsing trajectory</div>
- <select id="docsel"></select>
- <div class="spacer"></div>
- <div class="pageind">page <input id="pagejump" type="number" min="1" value="1"> / <span id="npages">–</span></div>
-</header>
-<div class="sub">Click a table in the PDF to parse it on demand. If it's flagged, <b>Escalate</b> runs the next method live (LiteParse → Docling per-page → vision). Borderless or no region? <b>Parse the whole page.</b> Every time is measured; nothing is hardcoded.</div>
-<main>
- <div class="viewer" id="viewer"></div>
- <div class="panel" id="panel"></div>
-</main>
-<script>
-const STATUS={confirmed:'#1a5a40',ok:'#3f7a8c',suspect:'#b4453a',figure:'#7a4fa3',missing:'#b07515',verified:'#1a8a6a',idle:'#9aa39e'};
-const LABEL={confirmed:'reconciles',ok:'no issues',suspect:'suspect',figure:'figure',missing:'no table',verified:'verified',idle:'table'};
-const LADDER=['cheap','text-table','Docling','vision'];
-const enc=encodeURIComponent;
-let docName=null,doc=null,regionsByPage={},discovered={},sel=null,traj=[],selNode=0,curPage=1;
-async function J(u,o){return (await fetch(u,o)).json();}
-function regionsOn(p){return regionsByPage[p]||[];}
-function discOn(p){return discovered[p]||[];}
-
-async function init(){const ds=await J('/api/docs');const s=document.getElementById('docsel');
- s.innerHTML=ds.map(d=>'<option>'+d+'</option>').join('');s.onchange=()=>selectDoc(s.value);
- document.getElementById('pagejump').onchange=e=>scrollToPage(+e.target.value);
- selectDoc(ds[0]);}
-async function selectDoc(n){docName=n;doc=await J('/api/doc/'+enc(n));regionsByPage={};discovered={};sel=null;traj=[];
- document.getElementById('npages').textContent=doc.pages.length;curPage=doc.pages[0].page;buildViewer();renderPanel();}
-
-function buildViewer(){const v=document.getElementById('viewer');v.innerHTML='';
- doc.pages.forEach(p=>{const slot=document.createElement('div');slot.className='pageslot';slot.dataset.page=p.page;
-   slot.style.aspectRatio=p.w+' / '+p.h;
-   slot.innerHTML='<div class="pagenum">p.'+p.page+'</div><img class="pageimg" data-src="/api/page/'+enc(docName)+'/'+p.page+'"><div class="overlays"></div>';
-   v.appendChild(slot);});
- lazyObserve();}
-async function loadRegions(p){if(regionsByPage[p])return;regionsByPage[p]=await J('/api/regions/'+enc(docName)+'/'+p);drawOverlays(p);}
-function lazyObserve(){const io=new IntersectionObserver((es)=>{es.forEach(e=>{
-   const slot=e.target;if(e.isIntersecting){const img=slot.querySelector('img');if(img.dataset.src){img.src=img.dataset.src;delete img.dataset.src;}
-     const pn=+slot.dataset.page;curPage=pn;document.getElementById('pagejump').value=pn;loadRegions(pn);}});},
-   {root:document.getElementById('viewer'),rootMargin:'200px',threshold:.05});
- document.querySelectorAll('.pageslot').forEach(s=>io.observe(s));}
-function scrollToPage(n){const s=document.querySelector('.pageslot[data-page="'+n+'"]');if(s)s.scrollIntoView({behavior:'smooth'});}
-function drawOverlays(p){const slot=document.querySelector('.pageslot[data-page="'+p+'"]');if(!slot)return;
- const ov=slot.querySelector('.overlays');let h='';
- regionsOn(p).forEach(r=>{const st=(sel===r.id&&traj.length)?traj[traj.length-1].status:'idle';
-   h+='<div class="ov'+(sel===r.id?' sel':'')+'" style="left:'+r.box.left+'%;top:'+r.box.top+'%;width:'+r.box.width+'%;height:'+r.box.height+'%;border-color:'+STATUS[st]+'" onclick="pick(\''+r.id+'\')"><span class="tag" style="background:'+STATUS[st]+'">'+LABEL[st]+'</span></div>';});
- discOn(p).forEach(t=>{h+='<div class="ov'+(sel===t.id?' sel':'')+'" style="left:'+t.box.left+'%;top:'+t.box.top+'%;width:'+t.box.width+'%;height:'+t.box.height+'%;border-color:'+STATUS[t.status]+';border-style:dashed" onclick="pickDisc(\''+t.id+'\')"><span class="tag" style="background:'+STATUS[t.status]+'">'+t.method+'</span></div>';});
- ov.innerHTML=h;}
-
-function allRegions(){return Object.values(regionsByPage).flat();}
-async function pick(id){sel=id;traj=[];selNode=0;const r=allRegions().find(x=>x.id===id);drawOverlays(r.page);renderPanel();await step('cheap');}
-function pickDisc(id){const t=Object.values(discovered).flat().find(x=>x.id===id);sel=id;traj=[t];selNode=0;drawOverlays(t.page);renderPanel();}
-function regionById(id){return allRegions().find(x=>x.id===id)||Object.values(discovered).flat().find(x=>x.id===id);}
-async function step(method){const r=regionById(sel);
- document.getElementById('esc').innerHTML='<span class="spin">parsing with '+method+' …</span>';
- const res=await J('/api/parse',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:docName,page:r.page,bbox:r.bbox,method})});
- traj.push(res);selNode=traj.length-1;drawOverlays(r.page);renderPanel();return res;}
-const GOOD=s=>['ok','confirmed','verified'].includes(s);
-const FLAGGED=s=>['suspect','figure','missing'].includes(s);
-let auto=false;
-async function autoEscalate(){auto=true;renderTraj();
- while(true){const last=traj[traj.length-1],ni=LADDER.indexOf(last.method)+1;
-   if(!FLAGGED(last.status)||ni>=LADDER.length)break;
-   await step(LADDER[ni]);}
- auto=false;renderTraj();}
-async function parsePage(method){const m=document.getElementById('ppmsg');m.innerHTML='<span class="spin">parsing page '+curPage+' with '+method+' …</span>';
- const res=await J('/api/parse_page',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:docName,page:curPage,method})});
- const exist=regionsOn(curPage);
- const novel=res.tables.filter(t=>!exist.some(r=>Math.abs(r.box.top-t.box.top)<3&&Math.abs(r.box.left-t.box.left)<3));
- discovered[curPage]=(discovered[curPage]||[]).filter(t=>t.method!==method).concat(novel.map(t=>({...t,disc:true})));
- m.textContent=method+' found '+res.count+' table(s)'+(novel.length?' ('+novel.length+' new) in '+(res.tables[0]?res.tables[0].seconds:'?')+'s — click them':' (already detected)');
- drawOverlays(curPage);}
-
-function badge(s){return '<span class="badge" style="background:'+STATUS[s]+'">'+LABEL[s]+'</span>';}
-function renderPanel(){const p=document.getElementById('panel');
- p.innerHTML='<div class="pp">No region, or it\'s borderless? Parse the whole page (p.'+curPage+'): '+
-   '<button class="btn ghost" onclick="parsePage(\'cheap\')">cheap</button>'+
-   '<button class="btn ghost" onclick="parsePage(\'Docling\')">Docling</button><span id="ppmsg"></span></div>'+
-   '<div id="graph" class="graph"></div><div id="esc" class="esc"></div><div id="det"></div>';
- renderTraj();}
-function renderTraj(){const g=document.getElementById('graph'),e=document.getElementById('esc'),d=document.getElementById('det');
- if(!sel||!traj.length){g.innerHTML='';e.innerHTML='';d.innerHTML='<div class="hint">Click a table in the PDF to parse it on demand →</div>';return;}
- let gh=traj.map((n,i)=>{
-   return '<div class="node'+(i===selNode?' sel':'')+'" style="border-color:'+STATUS[n.status]+'" onclick="selNode='+i+';renderTraj()">'+
-     '<div class="m">'+n.method+'</div><div class="i">on '+n.input+'</div>'+badge(n.status)+
-     '<div class="c">⏱ '+n.seconds+'s · $'+(n.dollars||0).toFixed(2)+'</div></div><span class="arrow">→</span>';}).join('');
- const last=traj[traj.length-1],nextIdx=LADDER.indexOf(last.method)+1;
- if(FLAGGED(last.status)&&nextIdx<LADDER.length){
-   gh+='<div class="node next">'+(auto?'<span class="spin">escalating…</span>':
-     '<button class="btn" onclick="step(\''+LADDER[nextIdx]+'\')">Escalate → '+LADDER[nextIdx]+'</button>'+
-     '<button class="btn ghost" onclick="autoEscalate()">⚡ Auto until valid</button>')+'</div>';
- }else{gh=gh.replace(/<span class="arrow">→<\/span>$/,'');
-   if(GOOD(last.status))gh+='<span class="ok" style="margin-left:6px">✓ validated at '+last.method+'</span>';
-   else gh+='<span class="dim" style="margin-left:6px">✗ exhausted ladder — still '+(LABEL[last.status]||last.status)+'</span>';}
- g.innerHTML=gh;e.innerHTML='';
- const n=traj[selNode];let h='<div class="card"><h4><b>'+n.method+'</b> <span class="dim">on '+n.input+'</span> '+badge(n.status)+'</h4>';
- h+='<div class="costline">⏱ '+n.seconds+'s · $'+(n.dollars||0).toFixed(2)+(n.recon!=null?' · reconstruction error '+n.recon:'')+'</div>';
- if(n.note)h+='<div class="dim" style="margin-top:6px">'+n.note+'</div>';
- if(n.html)h+='<div class="tbl">'+n.html+'</div>';
- (n.signals||[]).forEach(s=>h+='<div class="sig '+(s.positive?'pos':'neg')+'">'+(s.positive?'✓':'✗')+' <span>'+s.detail+'</span></div>');
- if(n.detail)h+='<details><summary>reconstruction diff — green matched · orange misplaced · red missing</summary><img src="data:image/png;base64,'+n.detail+'"></details>';
- if(!n.html&&n.status==='missing')h+='<div class="dim">no table detected by this method here</div>';
- h+='</div>';d.innerHTML=h;}
-init();
-</script></body></html>"""
 
 
 def warmup():
     """Load the Docling model at startup so the first escalation is fast. We
     convert one page and DISCARD it (don't cache), so real on-demand clicks still
     measure the per-page time with the model already warm."""
+    refresh_docs()
+    if not DOCS:
+        print("  no PDFs found under input/ — drop some in and reload.", flush=True)
+        return
     print("Loading Docling model (one-time)...", flush=True)
     t = time.monotonic()
     try:
@@ -504,10 +775,31 @@ def warmup():
         print(f"  Docling ready in {time.monotonic()-t:.0f}s.", flush=True)
     except Exception as e:  # noqa: BLE001
         print(f"  Docling warmup skipped: {str(e)[:80]}", flush=True)
+    # Pre-download/load the YOLO layout models so a first-use download doesn't
+    # stall the (now-serialized) request pipeline.
+    try:
+        import yolo_layout as yl
+        for key in ("yolo26", "doclayout"):
+            t = time.monotonic(); yl._load(key)
+            print(f"  layout '{key}' ready in {time.monotonic()-t:.0f}s.", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"  YOLO layout warmup skipped: {str(e)[:80]}", flush=True)
 
 
 if __name__ == "__main__":
+    import socket
     port = int(os.environ.get("PORT", 5050))  # avoid 5000 (macOS AirPlay -> 403)
+    # Fail loudly if the port is already taken — a stale old server still bound to
+    # it is exactly how you end up hitting outdated code after a "restart".
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if probe.connect_ex(("127.0.0.1", port)) == 0:
+        probe.close()
+        print(f"\n*** PORT {port} IS ALREADY IN USE ***", flush=True)
+        print(f"An old trajectory_server is probably still running and serving STALE code.", flush=True)
+        print(f"Kill it first:  pkill -f trajectory_server   (or use a different PORT=…)\n", flush=True)
+        sys.exit(1)
+    probe.close()
+    print(f"trajectory_server build={BUILD}", flush=True)
     warmup()
-    print(f"open http://127.0.0.1:{port}", flush=True)
+    print(f"open http://127.0.0.1:{port}   (build {BUILD})", flush=True)
     app.run(host="127.0.0.1", port=port, debug=False)
