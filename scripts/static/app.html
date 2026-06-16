@@ -100,8 +100,9 @@ const LAYOUT_OPS=[
  {op:'find_tables',kind:'layout',reason:'geometric: ruled lines + text-aligned columns'},
  {op:'yolo26',kind:'layout',reason:'YOLO26 learned layout (DocLayNet)'},
  {op:'doclayout',kind:'layout',reason:'DocLayout-YOLO (DocStructBench)'},
- {op:'docling',kind:'layout',reason:'Docling layout model'}];
-const LAYOUT_NAME={find_tables:'find_tables',yolo26:'YOLO26 layout',doclayout:'DocLayout-YOLO',docling:'Docling layout'};
+ {op:'docling',kind:'layout',reason:'Docling layout model'},
+ {op:'surya',kind:'layout',reason:'Surya — VLM layout + reading order (sidecar; slow on CPU)'}];
+const LAYOUT_NAME={find_tables:'find_tables',yolo26:'YOLO26 layout',doclayout:'DocLayout-YOLO',docling:'Docling layout',surya:'Surya layout'};
 const enc=encodeURIComponent;
 const GOOD=s=>['ok','confirmed','verified','typed'].includes(s);
 async function J(u,o){return (await fetch(u,o)).json();}

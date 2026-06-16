@@ -56,7 +56,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 QUARRY = os.path.join(REPO, "target", "debug", "quarry")
 DH = "0" * 64
 VISION_RATE, VISION_TIME = 0.02, 1.2
-BUILD = "evidence-21"  # bump on server changes; shown in the UI header to verify what's running
+BUILD = "surya-22"  # bump on server changes; shown in the UI header to verify what's running
 
 INPUT_DIR = os.path.join(REPO, "input")
 # Friendlier display names for known files; any other PDF shows as its path under input/.
@@ -415,7 +415,12 @@ _NORM = {"text": "Text", "plain text": "Text", "paragraph": "Text", "title": "Ti
          "formula": "Formula", "isolate_formula": "Formula", "formula_caption": "Caption",
          "page-header": "Page-header", "page_header": "Page-header",
          "page-footer": "Page-footer", "page_footer": "Page-footer",
-         "footnote": "Footnote", "abandon": "Page-footer"}
+         "footnote": "Footnote", "abandon": "Page-footer",
+         # Surya's camelCase vocabulary
+         "sectionheader": "Section-header", "pageheader": "Page-header", "pagefooter": "Page-footer",
+         "listgroup": "List-item", "equation": "Formula", "figure": "Picture",
+         "tableofcontents": "List-item", "bibliography": "Text", "form": "Text",
+         "code": "Formula", "blankpage": "Page-footer", "chemicalblock": "Picture", "diagram": "Picture"}
 
 
 def norm_label(lbl):
@@ -439,6 +444,20 @@ def api_layout(name, n):
                 # Geometric detection (ruled + text-aligned) — just another model.
                 raw = [{"label": "Table", "conf": 1.0, "bbox": list(b)}
                        for b, _nc, _src in detect_regions(pg)]
+                secs = time.monotonic()-t0
+            elif model == "surya":
+                # Sidecar: heavy VLM detector run in an isolated env (first call
+                # downloads the model; failures degrade to "layout unavailable").
+                rr = 150
+                tmp = os.path.join(_wd, f"surya_{abs(hash(name))}_{n}.png")
+                pdf(name).pages[n-1].to_image(resolution=rr).save(tmp)
+                script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "surya_layout.py")
+                proc = subprocess.run(["uv", "run", script, tmp], capture_output=True, text=True, timeout=900)
+                if proc.returncode != 0 or not proc.stdout.strip():
+                    raise RuntimeError((proc.stderr or "surya produced no output")[-200:].strip())
+                scale = 72.0 / rr
+                raw = [{"label": b["label"], "conf": b.get("conf", 1.0),
+                        "bbox": [v*scale for v in b["bbox"]]} for b in json.loads(proc.stdout)]
                 secs = time.monotonic()-t0
             elif model == "docling":
                 # Docling's layout comes from the full conversion, so its cost IS
@@ -539,6 +558,7 @@ OPS: dict[str, Operation] = {o.name: o for o in [
     Operation("yolo26",      OpKind.LAYOUT, _PG, _RG, label="YOLO26 learned layout"),
     Operation("doclayout",   OpKind.LAYOUT, _PG, _RG, label="DocLayout-YOLO"),
     Operation("docling",     OpKind.LAYOUT, _PG, _RG, label="Docling layout model"),
+    Operation("surya",       OpKind.LAYOUT, _PG, _RG, label="Surya (VLM layout + reading order)"),
     # extract: Region -> Table  (reparse one source representation, scoped to the region)
     Operation("cheap",       OpKind.EXTRACT, _RG, _TB, reads="PDF text-layer (glyph boxes)"),
     Operation("text-table",  OpKind.EXTRACT, _RG, _TB, reads="LiteParse space-aligned text"),
