@@ -27,3 +27,6 @@ __pycache__/
 
 # macOS
 .DS_Store
+
+# OCR language data (downloaded by tesseract/liteparse)
+*.traineddata
