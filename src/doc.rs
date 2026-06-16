@@ -41,6 +41,11 @@ pub struct TableRegion {
     pub bbox: [f32; 4],
     #[serde(default)]
     pub note: Option<String>,
+    /// Fraction of the region covered by dark/saturated filled rectangles — a
+    /// chart/infographic signature (computed by the bridge). 0 for born-digital
+    /// tables; ~0.2 for bar charts and infographics.
+    #[serde(default)]
+    pub figure_score: f32,
 }
 
 impl TableRegion {

@@ -328,7 +328,8 @@ fn reconstruct_table(
     let n_rows = rows.len() as u32;
 
     // --- Risk markers from the reconstruction.
-    let risk = grid_risk(&spans, &cells_per_row, n_cols, n_rows);
+    let mut risk = grid_risk(&spans, &cells_per_row, n_cols, n_rows);
+    risk.figure_score = region.figure_score;
     let html = render_html(&cells, n_rows, n_cols);
     let content = DocHash::of(html.as_bytes());
     let anchor = SourceAnchor::Pdf {
@@ -409,6 +410,7 @@ fn grid_risk(
         merged_cell_rows: merged,
         empty_cells: empty,
         rotated_text: rotated,
+        figure_score: 0.0, // set by the caller from the region
         notes,
     }
 }

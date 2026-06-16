@@ -61,6 +61,40 @@ def words_to_spans(page) -> list[dict]:
     return spans
 
 
+def _lightness(c) -> float:
+    """Approximate lightness in [0,1] (1=white). Handles gray, RGB, and CMYK —
+    these financial PDFs use CMYK, so the 4-tuple branch is essential."""
+    if c is None:
+        return 1.0
+    if isinstance(c, (int, float)):
+        return float(c)
+    if len(c) == 3:
+        return 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]
+    if len(c) == 4:  # CMYK
+        return 1.0 - min(1.0, c[3] + (c[0] + c[1] + c[2]) / 3)
+    return 1.0
+
+
+def figure_score(page, bbox) -> float:
+    """Fraction of a region covered by DARK/saturated filled rectangles — the
+    signature of a chart's bars or an infographic's colored boxes. Real tables
+    have at most a small dark header band (~7%); bar charts / infographics run
+    17–21%. Pale table row-shading is light, so it doesn't count. This is the
+    vector signal that tells a chart (full of numbers) from a table."""
+    x0, y0, x1, y1 = bbox
+    area = (x1 - x0) * (y1 - y0)
+    if area <= 0:
+        return 0.0
+    dark = 0.0
+    for r in page.rects:
+        cx, cy = (r["x0"] + r["x1"]) / 2, (r["top"] + r["bottom"]) / 2
+        if not (x0 <= cx <= x1 and y0 <= cy <= y1):
+            continue
+        if r.get("fill") and _lightness(r.get("non_stroking_color")) < 0.55:
+            dark += (r["x1"] - r["x0"]) * (r["bottom"] - r["top"])
+    return round(min(1.0, dark / area), 3)
+
+
 def detect_regions(page) -> list[dict]:
     regions = []
     for t in page.find_tables():
@@ -69,6 +103,7 @@ def detect_regions(page) -> list[dict]:
             {
                 "bbox": [round(x0, 2), round(top, 2), round(x1, 2), round(bottom, 2)],
                 "note": "auto-detected (pdfplumber ruled lines)",
+                "figure_score": figure_score(page, (x0, top, x1, bottom)),
             }
         )
     return regions

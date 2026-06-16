@@ -181,6 +181,7 @@ fn risk_from(cells: &[Cell], n_rows: u32, n_cols: u32) -> RiskMarkers {
         merged_cell_rows: merged,
         empty_cells: empty,
         rotated_text: false,
+        figure_score: 0.0, // Docling emits structured tables, not figures
         notes: vec![],
     }
 }

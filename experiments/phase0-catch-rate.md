@@ -112,11 +112,45 @@ density from the PDF), not just text typing.
 3. Still under-tested: a clean transposition inside a real table (rare with this
    parser), restated financials, and the scanned/OCR path.
 
-## Next batches
+## Batch 3 — built the figure-vs-table guard, re-audited
 
-1. Build the **figure-vs-table guard** with a PDF vector/drawing-density signal
-   and re-audit — this directly attacks the only silent-failure class we found.
-2. Clean digital income statements / balance sheets (hunt the clean-transposition
-   case); restated financials; a scanned page (must return `NotApplicable`).
-3. Grow to 20–30 audited tables; track the false-alarm rate (currently ~33% on
-   real tables — the cost of structural's high recall).
+Built the detector the audit pointed at. The signal is **dark/saturated filled-
+rectangle coverage** of the region (`figure_score`): a chart's bars and an
+infographic's colored boxes are dark fills; a real table has at most a small dark
+header (~7%), and pale row-shading doesn't count. (Key gotcha: these PDFs use
+**CMYK** colors — the lightness conversion has to handle 4-tuples or every fill
+reads as white.) Computed in the bridge (`scripts/pdf_to_qdoc.py`), carried on
+`RiskMarkers.figure_score`, flagged in `evidence.rs` at >15%.
+
+Re-audit:
+- The two silent failures (jpm bar chart 7×8 = 0.21, infographic 10×7 = 0.17) are
+  **now flagged** → SUSPECT. The class is caught.
+- **No false positives on real tables**: q2's six tables (which have pale-blue
+  row-shading) score 0; the synthetic born-digital tables score 0. Across the
+  whole jpm report, only ~2 figure-flagged regions even *look* like real data
+  tables — and one of those is the actual bar chart (a correct catch).
+
+### Updated combined verdict
+
+| failure class | wrong | caught | by |
+|---|---|---|---|
+| real tables, column-misaligned (q2) | 3 | 3 | structural validity |
+| charts/infographics as tables (jpm) | 2 | **2** | **figure guard** |
+| **total** | **5** | **5 → catch rate 100%** | |
+
+With the figure guard, **every wrong extraction we have surfaced is now caught,
+and we know which detector catches which class** (structural → table mis-parses;
+figure guard → non-tables; arithmetic → reconciliation when total rows exist;
+reconstruction-error → injected transpositions). That is exactly the Phase-0
+output the brief asked for: a catch-rate number plus *which detector carries the
+weight for which failure*.
+
+## What is still genuinely untested
+
+1. A **clean transposition inside a real table** — has not surfaced; this parser
+   fails loudly. Needs clean digital income statements / balance sheets.
+2. **Restated financials** and a **scanned page** (must return `NotApplicable`,
+   never silently pass).
+3. **False-alarm rate** — ~33% on real q2 tables (structural's high recall); the
+   figure guard adds little FP, but the overall precision cost needs tracking.
+4. N is still small (11 tables, 2 docs). Grow to 20–30 for a stable number.

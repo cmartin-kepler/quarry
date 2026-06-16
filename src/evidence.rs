@@ -178,6 +178,19 @@ pub fn assess(t: &HtmlTable) -> TableEvidence {
 
     // --- Parse-time risk markers ---
     let rk = t.risk();
+    // Figure guard: a region thick with dark/saturated filled boxes is a chart or
+    // infographic misdetected as a table — the silent-failure class the Phase-0
+    // audit surfaced (a bar chart / infographic reconstructed into a plausible but
+    // meaningless grid that nothing else flags).
+    if rk.figure_score > 0.15 {
+        signals.push(Signal {
+            positive: false,
+            detail: format!(
+                "likely a figure/chart, not a table ({:.0}% dark colored fill — bars/boxes)",
+                rk.figure_score * 100.0
+            ),
+        });
+    }
     if rk.rotated_text {
         signals.push(Signal { positive: false, detail: "rotated text in region".into() });
     }

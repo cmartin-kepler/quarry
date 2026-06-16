@@ -249,6 +249,10 @@ pub struct RiskMarkers {
     pub empty_cells: u32,
     /// Any span flagged as rotated in the source.
     pub rotated_text: bool,
+    /// Fraction of the region that is dark/saturated filled rectangles — high
+    /// means the "table" region is really a chart/infographic (see §2 figure guard).
+    #[serde(default)]
+    pub figure_score: f32,
     /// Free-form notes accumulated during extraction.
     pub notes: Vec<String>,
 }
