@@ -276,6 +276,34 @@ pub fn type_violations(model: &TableModel) -> Vec<(usize, usize, String)> {
     out
 }
 
+/// A 4-digit year (1900–2100) — a legitimate period header, not a data value.
+fn is_year(s: &str) -> bool {
+    let t = s.trim();
+    t.len() == 4 && t.chars().all(|c| c.is_ascii_digit())
+        && (1900..=2100).contains(&t.parse::<i32>().unwrap_or(0))
+}
+
+/// True if the header row looks like a DATA row — its numeric-column cells are
+/// themselves numbers (not labels, years, or dates). That means the table has no
+/// real column headers: the first row is a line item and the period/label header
+/// was dropped or misread. (Years and month-name dates do NOT trigger this; an
+/// agent can't tell columns apart only when the header is data-like numbers.)
+pub fn header_missing(model: &TableModel) -> bool {
+    let nums = model.numeric_cols();
+    if model.header_rows == 0 || nums.is_empty() {
+        return false;
+    }
+    let hr = model.header_rows - 1; // the header row adjacent to the data
+    let data_like = nums
+        .iter()
+        .filter(|&&c| {
+            let cell = model.grid.get(hr).and_then(|r| r.get(c)).map(String::as_str).unwrap_or("").trim();
+            parse_num(cell).is_some() && !is_year(cell)
+        })
+        .count();
+    data_like * 2 >= nums.len()
+}
+
 /// A "no value" marker that's legitimate in a numeric column (not a mis-parse):
 /// dashes, n/a, nm, etc.
 pub fn is_placeholder(s: &str) -> bool {

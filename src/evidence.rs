@@ -124,6 +124,14 @@ pub fn assess(t: &HtmlTable) -> TableEvidence {
         }
     }
 
+    // --- Header coherence ---
+    if header_missing(&model) {
+        signals.push(Signal {
+            positive: false,
+            detail: "no column headers — the header row is data-like numbers (the period/label header was dropped or misread)".into(),
+        });
+    }
+
     // --- Type consistency ---
     if !numeric_cols.is_empty() {
         if tv.is_empty() {
@@ -319,6 +327,31 @@ mod tests {
         let ev = assess(&t);
         assert_eq!(ev.impression, Impression::Suspect);
         assert!(ev.negatives().any(|s| s.detail.contains("Total assets")));
+    }
+
+    #[test]
+    fn header_row_of_data_numbers_is_flagged() {
+        // No header row: the first row is a line item; period headers dropped.
+        let t = tbl(
+            &[
+                &["Cash provided by operations", "6,914", "6,753"],
+                &["Cash used in investing", "(2,732)", "(1,898)"],
+                &["Cash used in financing", "(4,146)", "(4,556)"],
+            ],
+            1,
+        );
+        let ev = assess(&t);
+        assert!(ev.negatives().any(|s| s.detail.contains("no column headers")));
+    }
+
+    #[test]
+    fn year_headers_are_not_flagged_as_missing() {
+        let t = tbl(
+            &[&["Item", "2024", "2023"], &["Cash", "100", "90"], &["Debt", "200", "180"]],
+            1,
+        );
+        let ev = assess(&t);
+        assert!(!ev.negatives().any(|s| s.detail.contains("no column headers")));
     }
 
     #[test]
