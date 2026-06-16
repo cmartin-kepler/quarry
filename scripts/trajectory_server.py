@@ -254,6 +254,35 @@ def api_parse():
     return jsonify(res)
 
 
+@app.post("/api/parse_page")
+def api_parse_page():
+    """Run a method on the WHOLE page and return every table it finds — so tables
+    that find_tables (ruled lines) missed (e.g. borderless academic tables) get
+    discovered. Docling finds these; cheap/text usually don't."""
+    d = request.get_json()
+    name, page, method = d["name"], d["page"], d["method"]
+    pg = pdf(name).pages[page-1]
+    tables, secs = [], 0.0
+    if method == "Docling":
+        dl = docling_page(name, page); secs = dl["secs"]
+        tables = [t for t in dl["tables"] if t["page"] == page]
+    elif method == "cheap":
+        c = ensure_cheap(name); secs = c["secs"]/max(1, c["n_pages"])
+        tables = [t for t in c["tables"] if t["page"] == page]
+    out = []
+    for i, t in enumerate(tables):
+        x0, y0, x1, y1 = t["bbox"]
+        err, png = recon_for(name, page, t["bbox"], t["html"])
+        out.append({"id": f"{method}_p{page}_{i}", "bbox": list(t["bbox"]),
+                    "box": {"left": 100*x0/pg.width, "top": 100*y0/pg.height,
+                            "width": 100*(x1-x0)/pg.width, "height": 100*(y1-y0)/pg.height},
+                    "method": method, "input": INPUTS.get(method, method),
+                    "status": status_of(t["ev"]), "impression": t["ev"].get("impression"),
+                    "signals": t["ev"].get("signals", []), "html": t["html"],
+                    "seconds": round(secs, 3), "dollars": 0.0, "recon": err, "detail": png})
+    return jsonify({"method": method, "count": len(out), "tables": out})
+
+
 def _table_result(name, page, bbox, t, secs, dollars):
     if t is None:
         return {"status": "missing", "seconds": round(secs, 3), "dollars": dollars}
@@ -294,13 +323,18 @@ details img{max-width:480px;border:1px solid #ccc;margin-top:5px}.hint{color:#88
 <div class="lg"><b>Click a table</b> in the PDF → it parses live (cheap). If flagged, <b>Escalate</b> runs the next method on demand (LiteParse → Docling per-page → vision). Every time is measured live; nothing is hardcoded.</div>
 <div class="tabs" id="tabs"></div></header>
 <main>
- <div class="left"><div class="pagewrap" id="pagewrap"><img id="pageimg"><div id="overlays"></div></div></div>
+ <div class="left">
+   <div id="pagebar" style="margin-bottom:6px;font-size:12px">No clickable table here, or it's borderless? Parse the whole page:
+     <button onclick="parsePage('cheap')">cheap</button>
+     <button onclick="parsePage('Docling')">Docling</button>
+     <span id="ppmsg" style="color:#0a66c2"></span></div>
+   <div class="pagewrap" id="pagewrap"><img id="pageimg"><div id="overlays"></div></div></div>
  <div class="right"><div id="graph" class="graph"></div><div id="esc" class="esc"></div><div id="det" class="det"></div></div>
 </main>
 <script>
 const LADDER=["cheap","text-table","Docling","vision"];
 const COLOR={confirmed:"#0a7",ok:"#3b82c4",suspect:"#d33",figure:"#8b3fc4",missing:"#e8820e",verified:"#0c8"};
-let docName=null, doc=null, page=null, sel=null, traj=[], selNode=0;
+let docName=null, doc=null, page=null, sel=null, traj=[], selNode=0, discovered={};
 async function j(u,o){const r=await fetch(u,o);return r.json();}
 async function loadDocs(){const ds=await j("/api/docs");const s=document.getElementById("docsel");
  s.innerHTML=ds.map(d=>'<option>'+d+'</option>').join("");s.onchange=()=>selectDoc(s.value);selectDoc(ds[0]);}
@@ -308,16 +342,29 @@ async function selectDoc(n){docName=n;doc=await j("/api/doc/"+encodeURIComponent
 function renderTabs(){document.getElementById("tabs").innerHTML=doc.pages.map(p=>'<button class="'+(p.page===page?"on":"")+'" onclick="setPage('+p.page+')">page '+p.page+'</button>').join("");}
 function setPage(p){page=p;sel=null;traj=[];renderTabs();renderPage();renderRight();}
 function regionsOn(p){return doc.regions.filter(r=>r.page===p);}
+function discOn(p){return discovered[p]||[];}
+async function parsePage(method){
+ document.getElementById("ppmsg").textContent="parsing page "+page+" with "+method+" …";
+ const res=await j("/api/parse_page",{method:"POST",headers:{"Content-Type":"application/json"},
+   body:JSON.stringify({name:docName,page,method})});
+ // keep only ones not already covered by a find_tables region
+ const exist=regionsOn(page);
+ const novel=res.tables.filter(t=>!exist.some(r=>Math.abs(r.box.top-t.box.top)<3&&Math.abs(r.box.left-t.box.left)<3));
+ discovered[page]=(discovered[page]||[]).filter(t=>t.method!==method).concat(novel.map(t=>({...t,disc:true})));
+ document.getElementById("ppmsg").textContent=method+" found "+res.count+" table(s) ("+novel.length+" new) in "+(res.tables[0]?res.tables[0].seconds:"?")+"s";
+ renderPage();renderRight();}
 function renderPage(){const pg=doc.pages.find(x=>x.page===page);
  document.getElementById("pageimg").src="data:image/png;base64,"+pg.img;
- document.getElementById("overlays").innerHTML=regionsOn(page).map(r=>{
-   const last=sel===r.id&&traj.length?traj[traj.length-1].status:null;
-   const col=last?COLOR[last]:"#888";
+ let h=regionsOn(page).map(r=>{
+   const last=sel===r.id&&traj.length?traj[traj.length-1].status:null;const col=last?COLOR[last]:"#888";
    return '<div class="ov'+(sel===r.id?" sel":"")+'" style="left:'+r.box.left+'%;top:'+r.box.top+'%;width:'+r.box.width+'%;height:'+r.box.height+'%;border-color:'+col+'" onclick="pick(\''+r.id+'\')"></div>';
- }).join("");}
+ }).join("");
+ h+=discOn(page).map(t=>'<div class="ov'+(sel===t.id?" sel":"")+'" style="left:'+t.box.left+'%;top:'+t.box.top+'%;width:'+t.box.width+'%;height:'+t.box.height+'%;border-color:'+COLOR[t.status]+';border-style:dashed" onclick="pickDisc(\''+t.id+'\')"><span class="tag" style="color:'+COLOR[t.status]+'">'+t.method+'</span></div>').join("");
+ document.getElementById("overlays").innerHTML=h;}
 async function pick(id){sel=id;traj=[];selNode=0;renderPage();renderRight();await step("cheap");}
+function pickDisc(id){const t=discOn(page).find(x=>x.id===id);sel=id;traj=[t];selNode=0;renderPage();renderRight();}
 async function step(method){
- const r=doc.regions.find(x=>x.id===sel);
+ const r=doc.regions.find(x=>x.id===sel)||(discovered[page]||[]).find(x=>x.id===sel);
  document.getElementById("esc").innerHTML='<span class="spin">parsing with '+method+' …</span>';
  const res=await j("/api/parse",{method:"POST",headers:{"Content-Type":"application/json"},
    body:JSON.stringify({name:docName,page:r.page,bbox:r.bbox,method})});
