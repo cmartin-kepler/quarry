@@ -355,6 +355,31 @@ mod tests {
     }
 
     #[test]
+    fn company_name_containing_sum_is_not_a_total_row() {
+        // "Sumitomo" contains "sum"; it must NOT be treated as the total row.
+        // The real total reconciles (Cost Basis 4248+4165+3490+1572+1907 = 15,382).
+        let t = tbl(
+            &[
+                &["Company", "% Owned", "Cost Basis", "Market Value", "2025 Dividends"],
+                &["Mitsubishi Corporation", "10.8%", "$ 4,248", "$ 9,207", "$ 273"],
+                &["ITOCHU Corporation", "10.1%", "4,165", "8,886", "181"],
+                &["Mitsui & Co., Ltd.", "10.4%", "3,490", "8,785", "201"],
+                &["Marubeni Corporation", "9.8%", "1,572", "4,468", "105"],
+                &["Sumitomo Corporation", "9.7%", "1,907", "4,022", "102"],
+                &["Total", "$", "15,382", "$ 35,368", "$ 862"],
+            ],
+            1,
+        );
+        let ev = assess(&t);
+        assert!(
+            !ev.negatives().any(|s| s.detail.contains("Sumitomo")),
+            "Sumitomo must not be flagged as a mis-parsed total: {:?}",
+            ev.signals
+        );
+        assert_eq!(ev.impression, Impression::Confirmed, "signals: {:?}", ev.signals);
+    }
+
+    #[test]
     fn clean_table_without_totals_is_no_issues() {
         let t = tbl(
             &[&["Mode", "Value"], &["A", "10"], &["B", "20"]],

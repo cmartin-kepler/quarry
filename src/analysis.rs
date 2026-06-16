@@ -38,15 +38,16 @@ pub struct TableModel {
     pub row_kinds: Vec<RowKind>,
 }
 
-const TOTAL_KEYWORDS: [&str; 7] = [
-    "total",
-    "net ",
-    "sum",
+/// Multi-word total/subtotal labels — safe to match as substrings.
+const TOTAL_PHRASES: [&str; 4] = [
     "excluding certain items",
-    "subtotal",
     "grand total",
     "gross profit",
+    "subtotal",
 ];
+/// Single keywords matched as WHOLE WORDS anywhere in the label. Substring
+/// matching here was the classic bug ("sum" matching "Sumitomo").
+const TOTAL_WORDS: [&str; 2] = ["total", "sum"];
 
 impl TableModel {
     pub fn from_table(t: &HtmlTable) -> TableModel {
@@ -155,7 +156,21 @@ fn classify_rows(
 }
 
 fn is_total_label(label: &str) -> bool {
-    TOTAL_KEYWORDS.iter().any(|k| label.contains(k))
+    let l = label.to_lowercase();
+    if TOTAL_PHRASES.iter().any(|k| l.contains(k)) {
+        return true;
+    }
+    let words: Vec<&str> = l
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    // "total"/"sum" as a whole word anywhere (so "Sumitomo" is safe).
+    if words.iter().any(|w| TOTAL_WORDS.contains(w)) {
+        return true;
+    }
+    // "net" only as a LEADING word ("Net income"), never as a trailing qualifier
+    // ("Interest expense, net" is a data row, not a total).
+    words.first() == Some(&"net")
 }
 
 // ---- Section-aware reconciliation ----------------------------------------
