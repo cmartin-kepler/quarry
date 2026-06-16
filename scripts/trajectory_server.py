@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["flask>=3", "docling", "pdfplumber>=0.11"]
+# ///
 """
 trajectory_server.py - Interactive, ON-DEMAND parsing-trajectory UI.
 
@@ -13,8 +17,8 @@ Methods are path-dependent (different representations):
   cheap geometric (PDF text-layer) · text-table (LiteParse text) ·
   Docling (PDF, per-page) · vision verify (image)
 
-Run:
-  uv run --with flask --with docling scripts/trajectory_server.py
+Run (deps declared inline via PEP 723, so plain uv run works):
+  uv run scripts/trajectory_server.py
   open http://127.0.0.1:5000
 """
 from __future__ import annotations
