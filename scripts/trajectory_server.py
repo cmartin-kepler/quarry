@@ -34,7 +34,7 @@ import tempfile
 import time
 
 import pdfplumber
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -55,7 +55,8 @@ INPUTS = {"cheap": "PDF text-layer (glyph boxes)", "text-table": "LiteParse text
           "Docling": "PDF (direct, per page)", "vision": "rendered region image"}
 
 app = Flask(__name__)
-_pdf, _pages, _regions, _cheap, _lite, _docling, _wd = {}, {}, {}, {}, {}, {}, tempfile.mkdtemp()
+_pdf, _meta, _regions, _pageimg = {}, {}, {}, {}
+_cheap, _lite, _docling, _wd = {}, {}, {}, tempfile.mkdtemp()
 
 
 def pdf(name):
@@ -194,21 +195,39 @@ def api_docs():
 
 @app.get("/api/doc/<name>")
 def api_doc(name):
-    if name not in _pages:
-        pdf_ = pdf(name)
-        pages, regions = [], []
-        for pg in pdf_.pages:
-            im = pg.to_image(resolution=150); buf = io.BytesIO(); im.save(buf, format="PNG")
-            pages.append({"page": pg.page_number, "w": float(pg.width), "h": float(pg.height),
-                          "img": base64.b64encode(buf.getvalue()).decode()})
-            for ti, t in enumerate(pg.find_tables()):
-                x0, top, x1, bottom = t.bbox
-                regions.append({"id": f"p{pg.page_number}t{ti}", "page": pg.page_number,
-                                "bbox": [x0, top, x1, bottom],
-                                "box": {"left": 100*x0/pg.width, "top": 100*top/pg.height,
-                                        "width": 100*(x1-x0)/pg.width, "height": 100*(bottom-top)/pg.height}})
-        _pages[name] = pages; _regions[name] = regions
-    return jsonify({"pages": _pages[name], "regions": _regions[name]})
+    """Just page dimensions — instant for any doc size. Images and regions load
+    lazily per page as the viewer scrolls."""
+    if name not in _meta:
+        _meta[name] = [{"page": pg.page_number, "w": float(pg.width), "h": float(pg.height)}
+                       for pg in pdf(name).pages]
+    return jsonify({"pages": _meta[name]})
+
+
+@app.get("/api/regions/<name>/<int:n>")
+def api_regions(name, n):
+    """Detect table regions on one page on demand (find_tables is slow per page)."""
+    key = (name, n)
+    if key not in _regions:
+        pg = pdf(name).pages[n-1]
+        regs = []
+        for ti, t in enumerate(pg.find_tables()):
+            x0, top, x1, bottom = t.bbox
+            regs.append({"id": f"p{n}t{ti}", "page": n, "bbox": [x0, top, x1, bottom],
+                         "box": {"left": 100*x0/pg.width, "top": 100*top/pg.height,
+                                 "width": 100*(x1-x0)/pg.width, "height": 100*(bottom-top)/pg.height}})
+        _regions[key] = regs
+    return jsonify(_regions[key])
+
+
+@app.get("/api/page/<name>/<int:n>")
+def api_page(name, n):
+    """Render one page on demand (lazy-loaded by the scrollable viewer)."""
+    key = (name, n)
+    if key not in _pageimg:
+        pg = pdf(name).pages[n-1]
+        im = pg.to_image(resolution=150); buf = io.BytesIO(); im.save(buf, format="PNG")
+        _pageimg[key] = buf.getvalue()
+    return Response(_pageimg[key], mimetype="image/png")
 
 
 @app.post("/api/parse")
@@ -297,100 +316,180 @@ def index():
     return HTML
 
 
-HTML = r"""<!doctype html><html><head><meta charset="utf-8"><title>Parsing trajectory</title><style>
-body{font-family:-apple-system,system-ui,sans-serif;margin:0;background:#f4f4f6;color:#222}
-header{background:#fff;border-bottom:1px solid #ddd;padding:12px 16px;position:sticky;top:0;z-index:5}
-h1{font-size:15px;margin:0}select{font-size:13px;padding:3px}.lg{font-size:12px;color:#666;margin-top:5px}
-.tabs{margin-top:8px}.tabs button{margin-right:4px;font-size:12px;padding:3px 9px;cursor:pointer}.tabs button.on{background:#0a66c2;color:#fff;border-color:#0a66c2}
-main{display:flex;gap:18px;padding:14px;align-items:flex-start}
-.left{flex:0 0 780px;position:sticky;top:100px}.pagewrap{position:relative;width:780px;border:1px solid #ccc;background:#fff}.pagewrap img{width:100%;display:block}
-.ov{position:absolute;box-sizing:border-box;border:2.5px solid #888;cursor:pointer}.ov:hover{border-color:#0a66c2}.ov.sel{box-shadow:0 0 0 3px #ffd54a;border-color:#0a66c2;z-index:2}
-.ov .tag{position:absolute;left:0;top:-15px;font-size:10px;background:#fff;padding:0 3px;border:1px solid #ccc;white-space:nowrap}
-.right{flex:1;min-width:440px}
-.graph{display:flex;align-items:stretch;flex-wrap:wrap;margin-bottom:12px}
-.node{border:2px solid;border-radius:8px;padding:7px 10px;min-width:120px;background:#fff;cursor:pointer}
-.node .m{font-weight:700;font-size:13px}.node .i{font-size:10px;color:#666}.node .s{font-size:11px;margin-top:3px}.node .c{font-size:11px;color:#0a66c2;margin-top:2px}.node.sel{box-shadow:0 0 0 3px #ffd54a}
-.arrow{display:flex;align-items:center;font-size:22px;color:#999;padding:0 5px}
-.esc{margin:6px 0 12px}.esc button{font-size:13px;padding:6px 12px;cursor:pointer;background:#0a66c2;color:#fff;border:none;border-radius:6px}.esc button:disabled{background:#bbb}
-.badge{display:inline-block;padding:0 7px;border-radius:9px;color:#fff;font-weight:600;font-size:11px}
-.b-confirmed{background:#0a7}.b-ok{background:#3b82c4}.b-suspect{background:#d33}.b-figure{background:#8b3fc4}.b-missing{background:#e8820e}.b-verified{background:#0c8}
-.det{background:#fff;border:1px solid #ddd;border-radius:8px;padding:12px}
-table{border-collapse:collapse;font-size:12px}td,th{border:1px solid #bbb;padding:2px 6px;white-space:nowrap}th{background:#eef}
-.sig-pos{color:#0a7;font-size:12px}.sig-neg{color:#c00;font-size:12px}.tbl{margin:8px 0;overflow-x:auto}
-details img{max-width:480px;border:1px solid #ccc;margin-top:5px}.hint{color:#888;padding:16px}.spin{color:#0a66c2}
+HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<title>Parsing trajectory</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+ --g950:#030a07;--g900:#0b1f17;--g800:#0f2e22;--g700:#14412f;--g600:#1a5a40;--g500:#22805a;--g400:#4a9d76;--g300:#7fb89a;--g200:#bdd4c7;--g100:#dfe9e3;--g50:#f4f5f4;
+ --paper:#faf9f7;--ink:#171717;--muted:#6b6b6b;--line:#e7e5e4;
+ --confirmed:#1a5a40;--ok:#3f7a8c;--suspect:#b4453a;--figure:#7a4fa3;--missing:#b07515;--verified:#1a8a6a;--idle:#9aa39e;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--paper);color:var(--ink);font-family:Geist,-apple-system,system-ui,sans-serif;font-size:14px;-webkit-font-smoothing:antialiased}
+.mono{font-family:'Geist Mono',ui-monospace,monospace}
+header{position:sticky;top:0;z-index:10;background:rgba(250,249,247,.85);backdrop-filter:blur(8px);border-bottom:1px solid var(--line);padding:12px 22px;display:flex;align-items:center;gap:18px}
+.brand{display:flex;align-items:center;gap:9px;font-weight:600;font-size:15px;letter-spacing:-.01em}
+.logo{width:22px;height:22px;border-radius:6px;background:linear-gradient(135deg,var(--g500),var(--g700));display:grid;place-items:center;color:#fff;font-size:13px;font-weight:700}
+select{font-family:inherit;font-size:13px;padding:5px 9px;border:1px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);cursor:pointer}
+select:focus{outline:none;border-color:var(--g400)}
+.spacer{flex:1}
+.pageind{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px}
+.pageind input{width:46px;font-family:'Geist Mono',monospace;font-size:12px;padding:3px 6px;border:1px solid var(--line);border-radius:6px;text-align:center}
+.sub{font-size:12px;color:var(--muted);padding:0 22px 10px;margin-top:-2px}
+main{display:grid;grid-template-columns:1fr 2fr;gap:0;height:calc(100vh - 84px)}
+.viewer{overflow-y:auto;padding:18px 18px 40px;scroll-behavior:smooth}
+.pageslot{position:relative;width:100%;max-width:780px;margin:0 auto 18px;background:#fff;border:1px solid var(--line);border-radius:8px;box-shadow:0 1px 2px rgba(20,20,20,.04),0 4px 14px rgba(20,20,20,.05);overflow:hidden}
+.pagenum{position:absolute;left:10px;top:10px;z-index:3;font-family:'Geist Mono',monospace;font-size:10px;color:var(--muted);background:rgba(255,255,255,.8);border:1px solid var(--line);border-radius:5px;padding:1px 6px}
+.pageimg{width:100%;display:block;min-height:240px;background:repeating-linear-gradient(45deg,#f6f6f5,#f6f6f5 10px,#f1f1ef 10px,#f1f1ef 20px)}
+.overlays{position:absolute;inset:0}
+.ov{position:absolute;box-sizing:border-box;border:2px solid var(--idle);border-radius:4px;cursor:pointer;transition:box-shadow .12s,border-color .12s;background:transparent}
+.ov:hover{border-color:var(--g500);box-shadow:0 0 0 3px rgba(34,128,90,.15)}
+.ov.sel{border-color:var(--g600);box-shadow:0 0 0 3px #fde68a}
+.ov .tag{position:absolute;left:-1px;top:-17px;font-size:9px;font-weight:600;color:#fff;padding:1px 5px;border-radius:4px;white-space:nowrap;text-transform:uppercase;letter-spacing:.03em}
+.panel{border-left:1px solid var(--line);background:#fff;overflow-y:auto;padding:20px}
+.pp{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+.btn{font-family:inherit;font-size:12px;font-weight:500;padding:5px 11px;border-radius:7px;border:1px solid var(--g600);background:var(--g600);color:#fff;cursor:pointer;transition:background .12s}
+.btn:hover{background:var(--g700)}
+.btn.ghost{background:#fff;color:var(--g700);border-color:var(--g300)}
+.btn.ghost:hover{background:var(--g50)}
+.btn:disabled{opacity:.5;cursor:default}
+.graph{display:flex;align-items:center;flex-wrap:wrap;gap:0;margin-bottom:8px}
+.node{border:1.5px solid var(--idle);border-radius:10px;padding:9px 12px;min-width:122px;background:#fff;cursor:pointer;transition:box-shadow .12s,transform .12s}
+.node:hover{transform:translateY(-1px)}
+.node.sel{box-shadow:0 0 0 3px #fde68a}
+.node.next{border-style:dashed;border-color:var(--g300);background:var(--g50);cursor:default;display:flex;flex-direction:column;justify-content:center;gap:5px}
+.node.next:hover{transform:none}
+.node.next .btn{width:100%;text-align:center}
+.node .m{font-weight:600;font-size:13px}
+.node .i{font-size:10px;color:var(--muted);margin-top:1px}
+.node .c{font-family:'Geist Mono',monospace;font-size:10px;color:var(--g600);margin-top:4px}
+.arrow{color:var(--g300);font-size:18px;padding:0 7px}
+.badge{display:inline-flex;align-items:center;font-size:10px;font-weight:600;color:#fff;padding:2px 8px;border-radius:20px;text-transform:uppercase;letter-spacing:.03em;margin-top:5px}
+.esc{margin:8px 0 16px;min-height:30px}
+.esc .ok{color:var(--g600);font-size:13px;font-weight:500}
+.spin{color:var(--g500);font-size:13px;display:inline-flex;align-items:center;gap:7px}
+.spin::before{content:"";width:13px;height:13px;border:2px solid var(--g200);border-top-color:var(--g500);border-radius:50%;display:inline-block;animation:sp .7s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+.card{border:1px solid var(--line);border-radius:10px;padding:14px;background:#fff}
+.card h4{margin:0 0 8px;font-size:13px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.tbl{margin:10px 0;overflow-x:auto;border:1px solid var(--line);border-radius:8px}
+table{border-collapse:collapse;font-size:12px;width:100%}
+td,th{border-bottom:1px solid var(--g50);border-right:1px solid var(--g50);padding:4px 9px;white-space:nowrap;text-align:left}
+th{background:var(--g50);font-weight:600;color:var(--g800)}
+tr:last-child td{border-bottom:none}
+.sig{font-size:12px;margin-top:3px;display:flex;gap:6px}
+.sig.pos{color:var(--g600)}.sig.neg{color:var(--suspect)}
+.dim{color:var(--muted);font-size:12px}
+details{margin-top:10px}summary{cursor:pointer;font-size:12px;color:var(--g600)}
+details img{max-width:100%;border:1px solid var(--line);border-radius:8px;margin-top:8px}
+.hint{color:var(--muted);font-size:13px;padding:30px 10px;text-align:center;border:1px dashed var(--line);border-radius:10px}
+.costline{font-family:'Geist Mono',monospace;font-size:11px;color:var(--g600);margin-top:6px}
 </style></head><body>
-<header><h1>Parsing trajectory &nbsp;<select id="docsel"></select></h1>
-<div class="lg"><b>Click a table</b> in the PDF → it parses live (cheap). If flagged, <b>Escalate</b> runs the next method on demand (LiteParse → Docling per-page → vision). Every time is measured live; nothing is hardcoded.</div>
-<div class="tabs" id="tabs"></div></header>
+<header>
+ <div class="brand"><span class="logo">Q</span> Parsing trajectory</div>
+ <select id="docsel"></select>
+ <div class="spacer"></div>
+ <div class="pageind">page <input id="pagejump" type="number" min="1" value="1"> / <span id="npages">–</span></div>
+</header>
+<div class="sub">Click a table in the PDF to parse it on demand. If it's flagged, <b>Escalate</b> runs the next method live (LiteParse → Docling per-page → vision). Borderless or no region? <b>Parse the whole page.</b> Every time is measured; nothing is hardcoded.</div>
 <main>
- <div class="left">
-   <div id="pagebar" style="margin-bottom:6px;font-size:12px">No clickable table here, or it's borderless? Parse the whole page:
-     <button onclick="parsePage('cheap')">cheap</button>
-     <button onclick="parsePage('Docling')">Docling</button>
-     <span id="ppmsg" style="color:#0a66c2"></span></div>
-   <div class="pagewrap" id="pagewrap"><img id="pageimg"><div id="overlays"></div></div></div>
- <div class="right"><div id="graph" class="graph"></div><div id="esc" class="esc"></div><div id="det" class="det"></div></div>
+ <div class="viewer" id="viewer"></div>
+ <div class="panel" id="panel"></div>
 </main>
 <script>
-const LADDER=["cheap","text-table","Docling","vision"];
-const COLOR={confirmed:"#0a7",ok:"#3b82c4",suspect:"#d33",figure:"#8b3fc4",missing:"#e8820e",verified:"#0c8"};
-let docName=null, doc=null, page=null, sel=null, traj=[], selNode=0, discovered={};
-async function j(u,o){const r=await fetch(u,o);return r.json();}
-async function loadDocs(){const ds=await j("/api/docs");const s=document.getElementById("docsel");
- s.innerHTML=ds.map(d=>'<option>'+d+'</option>').join("");s.onchange=()=>selectDoc(s.value);selectDoc(ds[0]);}
-async function selectDoc(n){docName=n;doc=await j("/api/doc/"+encodeURIComponent(n));page=doc.pages[0].page;sel=null;traj=[];renderTabs();renderPage();renderRight();}
-function renderTabs(){document.getElementById("tabs").innerHTML=doc.pages.map(p=>'<button class="'+(p.page===page?"on":"")+'" onclick="setPage('+p.page+')">page '+p.page+'</button>').join("");}
-function setPage(p){page=p;sel=null;traj=[];renderTabs();renderPage();renderRight();}
-function regionsOn(p){return doc.regions.filter(r=>r.page===p);}
+const STATUS={confirmed:'#1a5a40',ok:'#3f7a8c',suspect:'#b4453a',figure:'#7a4fa3',missing:'#b07515',verified:'#1a8a6a',idle:'#9aa39e'};
+const LABEL={confirmed:'reconciles',ok:'no issues',suspect:'suspect',figure:'figure',missing:'no table',verified:'verified',idle:'table'};
+const LADDER=['cheap','text-table','Docling','vision'];
+const enc=encodeURIComponent;
+let docName=null,doc=null,regionsByPage={},discovered={},sel=null,traj=[],selNode=0,curPage=1;
+async function J(u,o){return (await fetch(u,o)).json();}
+function regionsOn(p){return regionsByPage[p]||[];}
 function discOn(p){return discovered[p]||[];}
-async function parsePage(method){
- document.getElementById("ppmsg").textContent="parsing page "+page+" with "+method+" …";
- const res=await j("/api/parse_page",{method:"POST",headers:{"Content-Type":"application/json"},
-   body:JSON.stringify({name:docName,page,method})});
- // keep only ones not already covered by a find_tables region
- const exist=regionsOn(page);
+
+async function init(){const ds=await J('/api/docs');const s=document.getElementById('docsel');
+ s.innerHTML=ds.map(d=>'<option>'+d+'</option>').join('');s.onchange=()=>selectDoc(s.value);
+ document.getElementById('pagejump').onchange=e=>scrollToPage(+e.target.value);
+ selectDoc(ds[0]);}
+async function selectDoc(n){docName=n;doc=await J('/api/doc/'+enc(n));regionsByPage={};discovered={};sel=null;traj=[];
+ document.getElementById('npages').textContent=doc.pages.length;curPage=doc.pages[0].page;buildViewer();renderPanel();}
+
+function buildViewer(){const v=document.getElementById('viewer');v.innerHTML='';
+ doc.pages.forEach(p=>{const slot=document.createElement('div');slot.className='pageslot';slot.dataset.page=p.page;
+   slot.style.aspectRatio=p.w+' / '+p.h;
+   slot.innerHTML='<div class="pagenum">p.'+p.page+'</div><img class="pageimg" data-src="/api/page/'+enc(docName)+'/'+p.page+'"><div class="overlays"></div>';
+   v.appendChild(slot);});
+ lazyObserve();}
+async function loadRegions(p){if(regionsByPage[p])return;regionsByPage[p]=await J('/api/regions/'+enc(docName)+'/'+p);drawOverlays(p);}
+function lazyObserve(){const io=new IntersectionObserver((es)=>{es.forEach(e=>{
+   const slot=e.target;if(e.isIntersecting){const img=slot.querySelector('img');if(img.dataset.src){img.src=img.dataset.src;delete img.dataset.src;}
+     const pn=+slot.dataset.page;curPage=pn;document.getElementById('pagejump').value=pn;loadRegions(pn);}});},
+   {root:document.getElementById('viewer'),rootMargin:'200px',threshold:.05});
+ document.querySelectorAll('.pageslot').forEach(s=>io.observe(s));}
+function scrollToPage(n){const s=document.querySelector('.pageslot[data-page="'+n+'"]');if(s)s.scrollIntoView({behavior:'smooth'});}
+function drawOverlays(p){const slot=document.querySelector('.pageslot[data-page="'+p+'"]');if(!slot)return;
+ const ov=slot.querySelector('.overlays');let h='';
+ regionsOn(p).forEach(r=>{const st=(sel===r.id&&traj.length)?traj[traj.length-1].status:'idle';
+   h+='<div class="ov'+(sel===r.id?' sel':'')+'" style="left:'+r.box.left+'%;top:'+r.box.top+'%;width:'+r.box.width+'%;height:'+r.box.height+'%;border-color:'+STATUS[st]+'" onclick="pick(\''+r.id+'\')"><span class="tag" style="background:'+STATUS[st]+'">'+LABEL[st]+'</span></div>';});
+ discOn(p).forEach(t=>{h+='<div class="ov'+(sel===t.id?' sel':'')+'" style="left:'+t.box.left+'%;top:'+t.box.top+'%;width:'+t.box.width+'%;height:'+t.box.height+'%;border-color:'+STATUS[t.status]+';border-style:dashed" onclick="pickDisc(\''+t.id+'\')"><span class="tag" style="background:'+STATUS[t.status]+'">'+t.method+'</span></div>';});
+ ov.innerHTML=h;}
+
+function allRegions(){return Object.values(regionsByPage).flat();}
+async function pick(id){sel=id;traj=[];selNode=0;const r=allRegions().find(x=>x.id===id);drawOverlays(r.page);renderPanel();await step('cheap');}
+function pickDisc(id){const t=Object.values(discovered).flat().find(x=>x.id===id);sel=id;traj=[t];selNode=0;drawOverlays(t.page);renderPanel();}
+function regionById(id){return allRegions().find(x=>x.id===id)||Object.values(discovered).flat().find(x=>x.id===id);}
+async function step(method){const r=regionById(sel);
+ document.getElementById('esc').innerHTML='<span class="spin">parsing with '+method+' …</span>';
+ const res=await J('/api/parse',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:docName,page:r.page,bbox:r.bbox,method})});
+ traj.push(res);selNode=traj.length-1;drawOverlays(r.page);renderPanel();return res;}
+const GOOD=s=>['ok','confirmed','verified'].includes(s);
+const FLAGGED=s=>['suspect','figure','missing'].includes(s);
+let auto=false;
+async function autoEscalate(){auto=true;renderTraj();
+ while(true){const last=traj[traj.length-1],ni=LADDER.indexOf(last.method)+1;
+   if(!FLAGGED(last.status)||ni>=LADDER.length)break;
+   await step(LADDER[ni]);}
+ auto=false;renderTraj();}
+async function parsePage(method){const m=document.getElementById('ppmsg');m.innerHTML='<span class="spin">parsing page '+curPage+' with '+method+' …</span>';
+ const res=await J('/api/parse_page',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:docName,page:curPage,method})});
+ const exist=regionsOn(curPage);
  const novel=res.tables.filter(t=>!exist.some(r=>Math.abs(r.box.top-t.box.top)<3&&Math.abs(r.box.left-t.box.left)<3));
- discovered[page]=(discovered[page]||[]).filter(t=>t.method!==method).concat(novel.map(t=>({...t,disc:true})));
- document.getElementById("ppmsg").textContent=method+" found "+res.count+" table(s) ("+novel.length+" new) in "+(res.tables[0]?res.tables[0].seconds:"?")+"s";
- renderPage();renderRight();}
-function renderPage(){const pg=doc.pages.find(x=>x.page===page);
- document.getElementById("pageimg").src="data:image/png;base64,"+pg.img;
- let h=regionsOn(page).map(r=>{
-   const last=sel===r.id&&traj.length?traj[traj.length-1].status:null;const col=last?COLOR[last]:"#888";
-   return '<div class="ov'+(sel===r.id?" sel":"")+'" style="left:'+r.box.left+'%;top:'+r.box.top+'%;width:'+r.box.width+'%;height:'+r.box.height+'%;border-color:'+col+'" onclick="pick(\''+r.id+'\')"></div>';
- }).join("");
- h+=discOn(page).map(t=>'<div class="ov'+(sel===t.id?" sel":"")+'" style="left:'+t.box.left+'%;top:'+t.box.top+'%;width:'+t.box.width+'%;height:'+t.box.height+'%;border-color:'+COLOR[t.status]+';border-style:dashed" onclick="pickDisc(\''+t.id+'\')"><span class="tag" style="color:'+COLOR[t.status]+'">'+t.method+'</span></div>').join("");
- document.getElementById("overlays").innerHTML=h;}
-async function pick(id){sel=id;traj=[];selNode=0;renderPage();renderRight();await step("cheap");}
-function pickDisc(id){const t=discOn(page).find(x=>x.id===id);sel=id;traj=[t];selNode=0;renderPage();renderRight();}
-async function step(method){
- const r=doc.regions.find(x=>x.id===sel)||(discovered[page]||[]).find(x=>x.id===sel);
- document.getElementById("esc").innerHTML='<span class="spin">parsing with '+method+' …</span>';
- const res=await j("/api/parse",{method:"POST",headers:{"Content-Type":"application/json"},
-   body:JSON.stringify({name:docName,page:r.page,bbox:r.bbox,method})});
- traj.push(res);selNode=traj.length-1;renderPage();renderRight();}
-function badge(s){return '<span class="badge b-'+s+'">'+({confirmed:"reconciles",ok:"no issues",suspect:"SUSPECT",figure:"FIGURE",missing:"no table",verified:"verified"}[s]||s)+'</span>';}
-function renderRight(){
- const g=document.getElementById("graph"),e=document.getElementById("esc"),d=document.getElementById("det");
- if(!sel){g.innerHTML='<div class="hint">← click a table in the PDF to parse it on demand</div>';e.innerHTML="";d.innerHTML="";return;}
- g.innerHTML=traj.map((n,i)=>{const arrow=i<traj.length-1?'<div class="arrow">→</div>':'';
-   return '<div class="node'+(i===selNode?" sel":"")+'" style="border-color:'+COLOR[n.status]+'" onclick="selNode='+i+';renderRight()">'+
-    '<div class="m">'+n.method+'</div><div class="i">on '+n.input+'</div><div class="s">'+badge(n.status)+'</div>'+
-    '<div class="c">⏱ '+n.seconds+'s · $'+(n.dollars||0).toFixed(2)+'</div></div>'+arrow;}).join("");
- const last=traj.length?traj[traj.length-1]:null, nextIdx=last?LADDER.indexOf(last.method)+1:0;
- const flagged=last&&(last.status==="suspect"||last.status==="figure"||last.status==="missing");
- if(flagged&&nextIdx<LADDER.length){e.innerHTML='<button onclick="step(\''+LADDER[nextIdx]+'\')">Escalate → '+LADDER[nextIdx]+' (parse on demand)</button>';}
- else if(last&&(last.status==="ok"||last.status==="confirmed")){e.innerHTML='<span style="color:#0a7;font-size:13px">✓ validated at '+last.method+' — escalation stops (lazy)</span>';}
- else e.innerHTML="";
- const n=traj[selNode];
- if(!n){d.innerHTML="";return;}
- let h='<div><b>'+n.method+'</b> on '+n.input+' &nbsp;'+badge(n.status)+' &nbsp;<span class="c">⏱ '+n.seconds+'s · $'+(n.dollars||0).toFixed(2)+'</span></div>';
- if(n.note)h+='<div class="i" style="margin-top:6px">'+n.note+'</div>';
- if(n.recon!=null)h+='<div class="i" style="margin-top:4px">reconstruction error '+n.recon+'</div>';
- if(n.html)h+='<div class="tbl">'+n.html+'</div>'+(n.signals||[]).map(s=>'<div class="'+(s.positive?"sig-pos":"sig-neg")+'">'+(s.positive?"✓ ":"✗ ")+s.detail+'</div>').join("");
- if(n.detail)h+='<details><summary>reconstruction diff (green=matched, orange=misplaced, red=missing)</summary><img src="data:image/png;base64,'+n.detail+'"></details>';
- d.innerHTML=h;}
-loadDocs();
+ discovered[curPage]=(discovered[curPage]||[]).filter(t=>t.method!==method).concat(novel.map(t=>({...t,disc:true})));
+ m.textContent=method+' found '+res.count+' table(s)'+(novel.length?' ('+novel.length+' new) in '+(res.tables[0]?res.tables[0].seconds:'?')+'s — click them':' (already detected)');
+ drawOverlays(curPage);}
+
+function badge(s){return '<span class="badge" style="background:'+STATUS[s]+'">'+LABEL[s]+'</span>';}
+function renderPanel(){const p=document.getElementById('panel');
+ p.innerHTML='<div class="pp">No region, or it\'s borderless? Parse the whole page (p.'+curPage+'): '+
+   '<button class="btn ghost" onclick="parsePage(\'cheap\')">cheap</button>'+
+   '<button class="btn ghost" onclick="parsePage(\'Docling\')">Docling</button><span id="ppmsg"></span></div>'+
+   '<div id="graph" class="graph"></div><div id="esc" class="esc"></div><div id="det"></div>';
+ renderTraj();}
+function renderTraj(){const g=document.getElementById('graph'),e=document.getElementById('esc'),d=document.getElementById('det');
+ if(!sel||!traj.length){g.innerHTML='';e.innerHTML='';d.innerHTML='<div class="hint">Click a table in the PDF to parse it on demand →</div>';return;}
+ let gh=traj.map((n,i)=>{
+   return '<div class="node'+(i===selNode?' sel':'')+'" style="border-color:'+STATUS[n.status]+'" onclick="selNode='+i+';renderTraj()">'+
+     '<div class="m">'+n.method+'</div><div class="i">on '+n.input+'</div>'+badge(n.status)+
+     '<div class="c">⏱ '+n.seconds+'s · $'+(n.dollars||0).toFixed(2)+'</div></div><span class="arrow">→</span>';}).join('');
+ const last=traj[traj.length-1],nextIdx=LADDER.indexOf(last.method)+1;
+ if(FLAGGED(last.status)&&nextIdx<LADDER.length){
+   gh+='<div class="node next">'+(auto?'<span class="spin">escalating…</span>':
+     '<button class="btn" onclick="step(\''+LADDER[nextIdx]+'\')">Escalate → '+LADDER[nextIdx]+'</button>'+
+     '<button class="btn ghost" onclick="autoEscalate()">⚡ Auto until valid</button>')+'</div>';
+ }else{gh=gh.replace(/<span class="arrow">→<\/span>$/,'');
+   if(GOOD(last.status))gh+='<span class="ok" style="margin-left:6px">✓ validated at '+last.method+'</span>';
+   else gh+='<span class="dim" style="margin-left:6px">✗ exhausted ladder — still '+(LABEL[last.status]||last.status)+'</span>';}
+ g.innerHTML=gh;e.innerHTML='';
+ const n=traj[selNode];let h='<div class="card"><h4><b>'+n.method+'</b> <span class="dim">on '+n.input+'</span> '+badge(n.status)+'</h4>';
+ h+='<div class="costline">⏱ '+n.seconds+'s · $'+(n.dollars||0).toFixed(2)+(n.recon!=null?' · reconstruction error '+n.recon:'')+'</div>';
+ if(n.note)h+='<div class="dim" style="margin-top:6px">'+n.note+'</div>';
+ if(n.html)h+='<div class="tbl">'+n.html+'</div>';
+ (n.signals||[]).forEach(s=>h+='<div class="sig '+(s.positive?'pos':'neg')+'">'+(s.positive?'✓':'✗')+' <span>'+s.detail+'</span></div>');
+ if(n.detail)h+='<details><summary>reconstruction diff — green matched · orange misplaced · red missing</summary><img src="data:image/png;base64,'+n.detail+'"></details>';
+ if(!n.html&&n.status==='missing')h+='<div class="dim">no table detected by this method here</div>';
+ h+='</div>';d.innerHTML=h;}
+init();
 </script></body></html>"""
 
 
