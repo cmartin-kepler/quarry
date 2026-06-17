@@ -109,6 +109,56 @@ def detect_tables(text: str) -> list[list[list[str]]]:
     return _spacealigned_tables(text)
 
 
+def structure_words(words, row_tol: float = 3, col_gap: float = 6):
+    """Cluster a region's words (pdfplumber dicts with text/x0/x1/top) into a table
+    grid by GEOMETRY: rows by vertical position, columns by gaps in the horizontal
+    word projection. Geometry-based so it never splits a word (words are atomic) and
+    column boundaries come from real whitespace gaps — the structuring step that
+    turns a raw text grid into columns. Returns a list-of-rows string grid."""
+    if not words:
+        return []
+    ws = sorted(words, key=lambda w: (w["top"], w["x0"]))
+    rows, cur, y0 = [], [], None
+    for w in ws:
+        if y0 is None or w["top"] - y0 <= row_tol:
+            cur.append(w)
+            y0 = w["top"] if y0 is None else y0
+        else:
+            rows.append(cur); cur = [w]; y0 = w["top"]
+    if cur:
+        rows.append(cur)
+
+    # column intervals: merge word x-spans that are within col_gap of each other;
+    # the holes between intervals are the column separators.
+    occ = []
+    for w in sorted(words, key=lambda w: w["x0"]):
+        if occ and w["x0"] <= occ[-1][1] + col_gap:
+            occ[-1][1] = max(occ[-1][1], w["x1"])
+        else:
+            occ.append([w["x0"], w["x1"]])
+
+    def colof(w):
+        cx = (w["x0"] + w["x1"]) / 2
+        best, bd = 0, 1e9
+        for i, (a, b) in enumerate(occ):
+            if a - col_gap <= cx <= b + col_gap:
+                return i
+            d = min(abs(cx - a), abs(cx - b))
+            if d < bd:
+                bd, best = d, i
+        return best
+
+    grid = []
+    for r in rows:
+        cells = [""] * len(occ)
+        for w in sorted(r, key=lambda w: w["x0"]):
+            i = colof(w)
+            cells[i] = (cells[i] + " " + w["text"]).strip()
+        grid.append(cells)
+    keep = [c for c in range(len(occ)) if any(row[c] for row in grid)]
+    return [[row[c] for c in keep] for row in grid]
+
+
 def to_markdown(grid: list[list[str]]) -> str:
     """Render a grid as a GitHub-flavored markdown pipe table (the '=> md' step).
     Re-parsing this with _markdown_tables recovers the grid ('md to table')."""

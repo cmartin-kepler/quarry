@@ -91,10 +91,10 @@ details img{max-width:100%;border:1px solid var(--line);border-radius:8px;margin
 const STATUS={confirmed:'#1a5a40',ok:'#3f7a8c',suspect:'#b4453a',figure:'#7a4fa3',missing:'#b07515',verified:'#1a8a6a',typed:'#1a5a40',located:'#0a8',idle:'#9aa39e'};
 const LABEL={confirmed:'reconciles',ok:'no issues',suspect:'suspect',figure:'figure',missing:'no table',verified:'verified',typed:'typed',located:'region',idle:'table'};
 const LAYCOLOR={Text:'#9aa39e',Title:'#1a5a40','Section-header':'#3f7a8c',Table:'#0a7',Picture:'#7a4fa3',Caption:'#b07515','List-item':'#7fb89a',Formula:'#b4453a','Page-header':'#c4c4c4','Page-footer':'#c4c4c4',Footnote:'#c4c4c4'};
-const OPKIND={cheap:'extract','text-table':'extract',Docling:'extract',reducto:'extract',llamaparse:'extract',markdown:'transform','sign-fix':'transform',materialize:'transform',vision:'validate'};
-const TABLEART={cheap:'HTML table',Docling:'HTML table','text-table':'text grid',reducto:'table (Reducto)',llamaparse:'table (LlamaParse)',markdown:'markdown table','sign-fix':'signed table'};
+const OPKIND={cheap:'extract','text-table':'extract',Docling:'extract',reducto:'extract',llamaparse:'extract',structure:'transform',markdown:'transform','sign-fix':'transform',materialize:'transform',vision:'validate'};
+const TABLEART={cheap:'HTML table',Docling:'HTML table','text-table':'text grid',structure:'HTML table',reducto:'table (Reducto)',llamaparse:'table (LlamaParse)',markdown:'markdown table','sign-fix':'signed table'};
 const EXTRACTORS=[{op:'cheap',kind:'extract',reason:'parse the PDF text layer in this region (cheapest)'},
-                  {op:'text-table',kind:'extract',reason:'parse LiteParse space-aligned text'},
+                  {op:'text-table',kind:'extract',reason:'extract the region text as a raw text grid (then structure it into columns)'},
                   {op:'Docling',kind:'extract',reason:'parse table structure from the PDF'}];
 const LAYOUT_OPS=[
  {op:'find_tables',kind:'layout',reason:'geometric: ruled lines + text-aligned columns'},
@@ -131,10 +131,11 @@ function graphPage(){const pg=nodes.find(n=>n.result.atype==='page');return pg?p
 function curStatus(){const n=node(cur);return n?n.result.status:'idle';}
 function regionAncestor(id){let n=node(id);while(n){if(n.result.atype==='region')return n;n=(n.parent!=null)?node(n.parent):null;}return null;}
 function regionTried(id){const reg=regionAncestor(id);if(!reg)return new Set();
- return new Set(nodes.filter(x=>['table','typed'].includes(x.result.atype)&&(regionAncestor(x.id)||{}).id===reg.id).map(x=>x.result.method));}
+ return new Set(nodes.filter(x=>['table','typed','text-grid'].includes(x.result.atype)&&(regionAncestor(x.id)||{}).id===reg.id).map(x=>x.result.method));}
 function artifactLabel(r){
  if(r.atype==='page')return r.input||'Page';
  if(r.atype==='region')return 'Region: '+(r.label||'Table');
+ if(r.atype==='text-grid')return 'text grid';
  if(r.atype==='typed')return 'typed table';
  return TABLEART[r.method]||'HTML table';}
 
@@ -263,7 +264,7 @@ async function runOp(op,fromId){const reg=regionAncestor(fromId);if(!reg)return 
    t.result.checks=(t.result.checks||[]).concat([{op,status:res.status,seconds:res.seconds,dollars:res.dollars}]);
    t.result.next=res.next;
    cur=t.id;drawOverlays(page);renderPanel();return t;}
- res.atype='table';res.opkind=res.kind||kind;
+ res.atype=res.produces||'table';res.opkind=res.kind||kind;
  const nd={id:seq++,parent:parentId,result:res};nodes.push(nd);cur=nd.id;drawOverlays(page);renderPanel();return nd;}
 
 // Ops applicable to an artifact: layout models for a Page; extractors for a
@@ -271,8 +272,8 @@ async function runOp(op,fromId){const reg=regionAncestor(fromId);if(!reg)return 
 function nextOps(n){const r=n.result;
  if(r.atype==='page')return LAYOUT_OPS;
  const tried=regionTried(n.id);
- const nx=(r.atype==='region')?EXTRACTORS:(r.atype==='table'?(r.next||[]):[]);
- return nx.filter(c=>['materialize','vision'].includes(c.op)||!tried.has(c.op));}
+ const nx=(r.atype==='region')?EXTRACTORS:(['table','text-grid'].includes(r.atype)?(r.next||[]):[]);
+ return nx.filter(c=>['materialize','vision','structure'].includes(c.op)||!tried.has(c.op));}
 
 // Auto = best-first search: a Region extracts first, then the table escalates.
 async function autoFrom(id){auto=true;renderPanel();let curId=id,steps=0;
@@ -311,13 +312,14 @@ function mergeRegionNodes(ns){const page=ns[0].result.page;
    method:'merge ('+models.join(' + ')+')',status:'located',label:'Table',bbox,box,page,
    conf:1,agreed:models,agreedN:models.length}};
  nodes.push(reg);cur=reg.id;picked=new Set();drawOverlays(page);renderPanel();}
-function nodeRow(n,depth){const r=n.result,isPage=r.atype==='page',isReg=r.atype==='region';let h='';
+function nodeRow(n,depth){const r=n.result,isPage=r.atype==='page',isReg=r.atype==='region',isTG=r.atype==='text-grid';let h='';
  if(!isPage)h+='<div class="edge k-'+(r.opkind||'extract')+'" style="margin-left:'+(depth*16+8)+'px">└─('+r.method+')→</div>';
  const mergeable=r.atype==='region';
  h+='<div class="tn'+(n.id===cur?' sel':'')+(isPage?' tn-src':'')+(isReg?' tn-region':'')+'" style="margin-left:'+(depth*16)+'px" onclick="cur='+n.id+';renderPanel()">'+
    (mergeable?'<input type="checkbox" title="select to merge regions" '+(picked.has(n.id)?'checked':'')+' onclick="event.stopPropagation();togglePick('+n.id+')" style="margin:0 2px 0 0;cursor:pointer">':'')+
-   (isPage?'📄 ':(isReg?'▭ ':''))+'<b>'+artifactLabel(r)+'</b>'+
+   (isPage?'📄 ':(isReg?'▭ ':(isTG?'▦ ':'')))+'<b>'+artifactLabel(r)+'</b>'+
    (isPage?'':(isReg?(r.agreed?' <span class="dim" style="color:#2563eb">⋈ '+r.agreed.length+'/'+r.agreedN+'</span>':(r.conf?' <span class="dim">'+Math.round(r.conf*100)+'%</span>':''))
+     :isTG?' <span class="dim">text grid · needs structure</span>'
      :' '+badge(r.status)+'<span class="dim" style="margin-left:auto">⏱'+(r.seconds||0)+'s · $'+(r.dollars||0).toFixed(2)+'</span>'))+'</div>';
  children(n.id).forEach(c=>h+=nodeRow(c,depth+1));
  return h;}
@@ -338,6 +340,12 @@ function renderDetail(){const d=document.getElementById('det');if(!d)return;
      (r.agreed?' <span class="badge" style="background:#2563eb">⋈ '+r.agreed.length+'/'+r.agreedN+' models agree</span>':(r.conf?' <span class="dim">'+Math.round(r.conf*100)+'% conf</span>':''))+'</h4>'+
      '<div class="costline">'+(parent?artifactLabel(parent.result)+' —('+(r.opkind==='merge'?'layout ⋈':r.method)+')→ ':'')+'Region · bbox ['+r.bbox.map(v=>Math.round(v)).join(', ')+']</div>'+
      '<div class="dim" style="margin-top:3px">'+(r.agreed?'merged box from <b>'+r.agreed.join('</b>, <b>')+'</b> (per-edge median of their boxes) — extract a table from it:':'located by <b>'+r.method+'</b> (layout) — extract a table from it:')+'</div></div>'+renderNext(me);return;}
+ if(r.atype==='text-grid'){const parent=(me.parent!=null)?node(me.parent):null;
+   d.innerHTML='<div class="card"><h4>▦ <b>text grid</b></h4>'+
+     '<div class="costline">'+(parent?artifactLabel(parent.result)+' —('+r.method+')→ ':'')+'raw region text · ⏱ '+(r.seconds||0)+'s · columns not yet committed</div>'+
+     '<div class="dim" style="margin-top:3px">layout-preserving text from the region — the structure op clusters its words into columns:</div>'+
+     '<pre class="mono" style="font-size:11px;white-space:pre;overflow-x:auto;background:var(--g50);padding:8px;border-radius:6px;margin:8px 0 0">'+(r.text||'').replace(/</g,'&lt;')+'</pre>'+
+     '</div>'+renderNext(me);return;}
  const parent=(me.parent!=null)?node(me.parent):null;
  let h='<div class="card"><h4><b>'+artifactLabel(r)+'</b> '+badge(r.status)+'</h4>';
  h+='<div class="costline">'+(parent?artifactLabel(parent.result)+' —('+r.method+')→ '+artifactLabel(r)+' · ':'')+'⏱ '+(r.seconds||0)+'s · $'+(r.dollars||0).toFixed(2)+(r.recon!=null?' · reconstruction error '+r.recon:'')+'</div>';
@@ -355,8 +363,8 @@ function renderDetail(){const d=document.getElementById('det');if(!d)return;
 function renderNext(n){const r=n.result,nx=nextOps(n),isPage=r.atype==='page';
  if(auto)return '<div class="esc"><span class="spin">escalating…</span></div>';
  if(!nx.length)return GOOD(r.status)?'<div class="esc"><span class="ok">✓ '+(r.status==='typed'?'materialized':'validated')+'</span></div>'
-   :(['region','page'].includes(r.atype)?'':'<div class="esc"><span class="dim">no further operations apply</span></div>');
- let h='<div class="esc"><div class="dim" style="margin-bottom:6px">'+(isPage?'detect layout — pick a model (each produces Region artifacts):':r.atype==='region'?'extract a table from this region — or reconcile several methods:':GOOD(r.status)?'✓ validated — you can:':'flagged — apply an operation (produces a new artifact):')+'</div>';
+   :(['region','page','text-grid'].includes(r.atype)?'':'<div class="esc"><span class="dim">no further operations apply</span></div>');
+ let h='<div class="esc"><div class="dim" style="margin-bottom:6px">'+(isPage?'detect layout — pick a model (each produces Region artifacts):':r.atype==='region'?'extract a table from this region:':r.atype==='text-grid'?'structure the text grid into columns:':GOOD(r.status)?'✓ validated — you can:':'flagged — apply an operation (produces a new artifact):')+'</div>';
  nx.forEach((c,i)=>{const sym=c.kind==='layout'?' ▦':c.kind==='transform'?' ✎':c.kind==='validate'?' ◉':' ⤢';
    const fn=isPage?'runLayout':'runOp';
    h+='<button class="'+(i===0&&!isPage?'btn':'btn ghost')+'" style="margin:0 6px 6px 0" title="'+c.reason.replace(/"/g,'&quot;')+'" onclick="'+fn+'(\''+c.op+'\','+n.id+')">('+c.op+')→'+sym+'</button>';});

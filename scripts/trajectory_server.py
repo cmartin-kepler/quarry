@@ -14,8 +14,9 @@ via page_range, then vision) — each timed live. The lineage graph builds up no
 by node as you escalate.
 
 Methods are path-dependent (different representations):
-  cheap geometric (PDF text-layer) · text-table (LiteParse text) ·
-  Docling (PDF, per-page) · vision verify (image)
+  cheap geometric (PDF text-layer) · text-table (region text → a text-grid you
+  then `structure` into columns by word geometry) · Docling (PDF, per-page) ·
+  vision verify (image)
 
 Run (deps declared inline via PEP 723, so plain uv run works):
   uv run scripts/trajectory_server.py            # -> http://127.0.0.1:5050
@@ -70,7 +71,7 @@ def _load_env():
 _load_env()
 DH = "0" * 64
 VISION_RATE, VISION_TIME = 0.02, 1.2
-BUILD = "no-canon-33"  # bump on server changes; shown in the UI header to verify what's running
+BUILD = "textgrid-34"  # bump on server changes; shown in the UI header to verify what's running
 
 INPUT_DIR = os.path.join(REPO, "input")
 # Friendlier display names for known files; any other PDF shows as its path under input/.
@@ -752,6 +753,7 @@ def api_page(name, n):
 class ArtifactKind(str, Enum):
     PAGE = "page"          # the source page
     REGION = "region"      # a located area on the page (a layout detection)
+    TEXTGRID = "text-grid"  # raw region text, columns not yet committed
     TABLE = "table"        # a parsed HtmlTable (+ its evidence)
     TYPED = "typed"        # a materialized, math-ready TypedTable
 
@@ -767,7 +769,7 @@ class OpKind(str, Enum):
 # An evidence verdict — we can't prove correctness without ground truth, only
 # gather signals; `status` is the strongest summary of them.
 Status = Literal["confirmed", "ok", "suspect", "figure", "missing", "verified",
-                 "typed", "located", "idle"]
+                 "typed", "located", "idle", "grid"]
 
 
 @dataclass(frozen=True)
@@ -798,8 +800,11 @@ OPS: dict[str, Operation] = {o.name: o for o in [
     Operation("surya",       OpKind.LAYOUT, _PG, _RG, label="Surya (VLM layout + reading order)"),
     # extract: Region -> Table  (reparse one source representation, scoped to the region)
     Operation("cheap",       OpKind.EXTRACT, _RG, _TB, reads="PDF text-layer (glyph boxes)"),
-    Operation("text-table",  OpKind.EXTRACT, _RG, _TB, reads="LiteParse space-aligned text"),
     Operation("Docling",     OpKind.EXTRACT, _RG, _TB, reads="PDF (direct, per page)"),
+    # extract: Region -> TextGrid  (the raw region text; columns are committed later)
+    Operation("text-table",  OpKind.EXTRACT, _RG, ArtifactKind.TEXTGRID, reads="region text (layout-preserving)"),
+    # structure: TextGrid -> Table  (cluster the region's words into columns)
+    Operation("structure",   OpKind.TRANSFORM, ArtifactKind.TEXTGRID, _TB, label="cluster words into columns → table"),
     # transform: Table -> Table / Typed  (consume the artifact's own content)
     Operation("markdown",    OpKind.TRANSFORM, _TB, _TB, label="grid → markdown → table"),
     Operation("sign-fix",    OpKind.TRANSFORM, _TB, _TB, label="reinterpret signs (parens / CR / DR → signed)"),
@@ -827,6 +832,8 @@ class OpResult:
     recon: Optional[float] = None               # reconstruction error (evidence)
     detail: Optional[str] = None                # recon diff image (base64)
     markdown: Optional[str] = None
+    text: Optional[str] = None                   # raw text-grid content (layout-preserving)
+    produces: Optional[str] = None              # ArtifactKind this op made (table/text-grid/typed)
     note: Optional[str] = None
     next: list[dict] = field(default_factory=list)
 
@@ -838,7 +845,8 @@ def _artifact(op: Operation, ev: dict, html: str, secs: float,
     return OpResult(method=op.name, kind=op.kind.value, input=op.input,
                     status=status_of(ev), impression=ev.get("impression"),
                     signals=ev.get("signals", []), html=html, recon=recon, detail=detail,
-                    markdown=markdown, note=note, seconds=round(secs, 3))
+                    markdown=markdown, note=note, seconds=round(secs, 3),
+                    produces=op.produces.value if op.produces else "table")
 
 
 def _missing(op: Operation, secs: float, note: Optional[str]) -> OpResult:
@@ -969,10 +977,29 @@ def api_parse():
         else:
             r = _missing(op, time.monotonic()-t0, "no table grid found in this region")
 
-    elif method == "text-table":  # EXTRACT: a grid from LiteParse text, scoped to the region
-        best, secs, _, why = lite_best_grid(name, page, bbox)
-        r = (_artifact(op, explain_grid(best, page), tt.to_html(best), secs) if best
-             else _missing(op, secs, why))
+    elif method == "text-table":  # EXTRACT: the region's raw text as a text-grid (no columns yet)
+        t0 = time.monotonic()
+        pg = pdf(name).pages[page-1]
+        x0, top, x1, bottom = bbox
+        cr = pg.crop((max(0, x0), max(0, top), min(pg.width, x1), min(pg.height, bottom)))
+        text = cr.extract_text(layout=True) or ""
+        if text.strip():
+            r = OpResult(method=op.name, kind=op.kind.value, input=op.input, produces="text-grid",
+                         status="grid", text=text, seconds=round(time.monotonic()-t0, 3))
+        else:
+            r = _missing(op, time.monotonic()-t0, "no text found in this region")
+
+    elif method == "structure":  # TRANSFORM: cluster the text-grid's words into columns -> table
+        t0 = time.monotonic()
+        pg = pdf(name).pages[page-1]
+        x0, top, x1, bottom = bbox
+        cr = pg.crop((max(0, x0), max(0, top), min(pg.width, x1), min(pg.height, bottom)))
+        grid = tt.structure_words(cr.extract_words())
+        if grid and len(grid) >= 2:
+            err, png = recon_for(name, page, bbox, tt.to_html(grid))
+            r = _artifact(op, explain_grid(grid, page), tt.to_html(grid), time.monotonic()-t0, recon=err, detail=png)
+        else:
+            r = _missing(op, time.monotonic()-t0, "could not cluster the text grid into columns")
 
     elif method == "markdown":  # TRANSFORM: parent grid -> markdown -> re-parse -> validate
         t0 = time.monotonic()
@@ -1019,7 +1046,10 @@ def api_parse():
     else:
         return jsonify({"error": f"unknown operation {method!r}"}), 400
 
-    r.next = route(r, d.get("tried", []))
+    if r.status == "grid":  # a text-grid's only next step is to commit columns
+        r.next = [{"op": "structure", "reason": OPS["structure"].label, "kind": "transform"}]
+    else:
+        r.next = route(r, d.get("tried", []))
     return jsonify(asdict(r))
 
 
