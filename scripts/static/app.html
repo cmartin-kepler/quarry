@@ -66,14 +66,26 @@ details img{max-width:100%;border:1px solid var(--line);border-radius:8px;margin
 .tn:hover{border-color:var(--g300)}
 .tn.sel{box-shadow:0 0 0 2px #fde68a;border-color:var(--g400)}
 .tk{font-family:'Geist Mono',monospace;font-size:9px;text-transform:uppercase;letter-spacing:.04em;padding:1px 5px;border-radius:4px;color:#fff}
-.tk-extract{background:#3f7a8c}.tk-transform{background:#7a4fa3}.tk-validate{background:#b07515}
+.tk-extract{background:#3f7a8c}.tk-transform{background:#7a4fa3}
 .edge{font-family:'Geist Mono',monospace;font-size:11px;margin:5px 0 1px;letter-spacing:.02em}
-.edge.k-extract{color:#3f7a8c}.edge.k-transform{color:#7a4fa3}.edge.k-validate{color:#b07515}.edge.k-layout{color:#0a8}.edge.k-merge{color:#2563eb}
+.edge.k-extract{color:#3f7a8c}.edge.k-transform{color:#7a4fa3}.edge.k-layout{color:#0a8}.edge.k-merge{color:#2563eb}
 .tn-src{background:var(--g50);border-style:dashed}
 .tn-region{border-style:dashed;border-color:#0a8}
 .lcard{display:flex;align-items:center;gap:8px;border:1px solid var(--line);border-radius:8px;padding:7px 11px;margin:5px 0;cursor:pointer;font-size:13px}
 .lcard:hover{border-color:var(--g300);background:var(--g50)}
 .lcard.active{border-color:#0a8;box-shadow:0 0 0 1px #0a8;background:rgba(0,168,136,.05)}
+.film{display:flex;align-items:stretch;gap:0;overflow-x:auto;padding:4px 0 12px}
+.frame{display:flex;flex-direction:column;gap:1px;border:1px solid var(--line);border-radius:8px;padding:6px 10px;cursor:pointer;background:#fff;white-space:nowrap;flex:none}
+.frame:hover{border-color:var(--g300)}
+.frame.sel{border-color:var(--g600);box-shadow:0 0 0 2px #fde68a}
+.frame .fop{font-size:12px;font-weight:600;display:flex;align-items:center;gap:5px}
+.frame .fst{font-size:9px;text-transform:uppercase;letter-spacing:.03em}
+.farrow{align-self:center;color:var(--muted);padding:0 6px;flex:none}
+.cellchg{background:rgba(26,90,64,.16)!important;box-shadow:inset 0 0 0 1px rgba(26,90,64,.3)}
+.issues{border-top:1px solid var(--line);margin-top:12px;padding-top:10px}
+.issues b{font-size:12px}
+.passed{font-size:11px;color:var(--g600);margin-top:2px}
+.delta{font-family:'Geist Mono',monospace;font-size:11px;color:var(--g700);background:var(--g50);border-radius:6px;padding:5px 9px;margin:8px 0}
 </style></head><body>
 <header>
  <div class="brand"><span class="logo">Q</span> Parsing trajectory</div>
@@ -88,14 +100,14 @@ details img{max-width:100%;border:1px solid var(--line);border-radius:8px;margin
  <div class="panel" id="panel"></div>
 </main>
 <script>
-const STATUS={confirmed:'#1a5a40',ok:'#3f7a8c',suspect:'#b4453a',figure:'#7a4fa3',missing:'#b07515',verified:'#1a8a6a',typed:'#1a5a40',located:'#0a8',idle:'#9aa39e'};
-const LABEL={confirmed:'reconciles',ok:'no issues',suspect:'suspect',figure:'figure',missing:'no table',verified:'verified',typed:'typed',located:'region',idle:'table'};
+const STATUS={confirmed:'#1a5a40',ok:'#3f7a8c',suspect:'#b4453a',figure:'#7a4fa3',missing:'#b07515',typed:'#1a5a40',located:'#0a8',idle:'#9aa39e'};
+const LABEL={confirmed:'reconciles',ok:'no issues',suspect:'suspect',figure:'figure',missing:'no table',typed:'typed',located:'region',idle:'table'};
 const LAYCOLOR={Text:'#9aa39e',Title:'#1a5a40','Section-header':'#3f7a8c',Table:'#0a7',Picture:'#7a4fa3',Caption:'#b07515','List-item':'#7fb89a',Formula:'#b4453a','Page-header':'#c4c4c4','Page-footer':'#c4c4c4',Footnote:'#c4c4c4'};
-const OPKIND={cheap:'extract','text-table':'extract',Docling:'extract',reducto:'extract',llamaparse:'extract',structure:'transform',markdown:'transform','sign-fix':'transform',materialize:'transform',vision:'validate'};
-const TABLEART={cheap:'HTML table',Docling:'HTML table','text-table':'text grid',structure:'HTML table',reducto:'table (Reducto)',llamaparse:'table (LlamaParse)',markdown:'markdown table','sign-fix':'signed table'};
-const EXTRACTORS=[{op:'cheap',kind:'extract',reason:'parse the PDF text layer in this region (cheapest)'},
-                  {op:'text-table',kind:'extract',reason:'LiteParse → text grid (faithful ASCII + word boxes; then structure into columns)'},
-                  {op:'Docling',kind:'extract',reason:'parse table structure from the PDF'}];
+const OPKIND={'pdf-text':'extract','text-table':'extract','text-page':'extract',Docling:'extract',reducto:'extract',llamaparse:'extract',structure:'transform',markdown:'transform','sign-fix':'transform',materialize:'transform'};
+const TABLEART={'pdf-text':'HTML table',Docling:'HTML table','text-table':'text grid','text-page':'text grid',structure:'HTML table',reducto:'table (Reducto)',llamaparse:'table (LlamaParse)',markdown:'markdown table','sign-fix':'signed table'};
+const EXTRACTORS=[{op:'pdf-text',kind:'extract',reason:'pdfplumber detects the table from the PDF text layer (ruled lines + aligned columns) — fast, no ML or LiteParse'},
+                  {op:'text-table',kind:'extract',reason:'LiteParse the region → a faithful text grid (ASCII + word boxes); then structure into columns'},
+                  {op:'Docling',kind:'extract',reason:'Docling ML model parses the table structure from the page'}];
 const LAYOUT_OPS=[
  {op:'find_tables',kind:'layout',reason:'geometric: ruled lines + text-aligned columns'},
  {op:'yolo26',kind:'layout',reason:'YOLO26 learned layout (DocLayNet)'},
@@ -106,7 +118,7 @@ const LAYOUT_OPS=[
  {op:'llamaparse',kind:'layout',reason:'LlamaParse cloud page parse (~$0.0013/page; tables come parsed)'}];
 const LAYOUT_NAME={find_tables:'find_tables',yolo26:'YOLO26 layout',doclayout:'DocLayout-YOLO',docling:'Docling layout',surya:'Surya layout',reducto:'Reducto parse',llamaparse:'LlamaParse parse'};
 const enc=encodeURIComponent;
-const GOOD=s=>['ok','confirmed','verified','typed'].includes(s);
+const GOOD=s=>['ok','confirmed','typed'].includes(s);
 async function J(u,o){return (await fetch(u,o)).json();}
 
 // State. Detections live in layoutData[page][model] = {model, tables, others, secs};
@@ -119,6 +131,8 @@ let clusterRegions={};
 let picked=new Set();
 // Per typed-node: show the tidy/melted shape instead of wide.
 let tidyOn={};
+// Per table-node: which evolution view — 'diff' (changed cells), 'after', 'before'.
+let viewMode={};
 const med=xs=>{const s=[...xs].sort((a,b)=>a-b),m=s.length>>1;return s.length%2?s[m]:(s[m-1]+s[m])/2;};
 
 function active(p){const m=layoutData[p];return m?m[activeLayout[p]]:null;}
@@ -144,7 +158,7 @@ async function init(){try{const h=await J('/api/health');document.getElementById
  s.innerHTML=ds.map(d=>'<option>'+d+'</option>').join('');s.onchange=()=>selectDoc(s.value);
  document.getElementById('pagejump').onchange=e=>scrollToPage(+e.target.value);
  selectDoc(ds[0]);}
-async function selectDoc(n){docName=n;doc=await J('/api/doc/'+enc(n));layoutData={};activeLayout={};clusterRegions={};picked=new Set();tidyOn={};sel=null;nodes=[];cur=null;seq=0;
+async function selectDoc(n){docName=n;doc=await J('/api/doc/'+enc(n));layoutData={};activeLayout={};clusterRegions={};picked=new Set();tidyOn={};viewMode={};sel=null;nodes=[];cur=null;seq=0;
  document.getElementById('npages').textContent=doc.pages.length;curPage=doc.pages[0].page;buildViewer();renderPanel();}
 
 function buildViewer(){const v=document.getElementById('viewer');v.innerHTML='';
@@ -195,6 +209,17 @@ async function runLayout(op,pageId){const p=node(pageId).result.page;
 
 // Show one model's detection on the page (cards in the Page detail switch models).
 function activateLayout(p,op){if(!(layoutData[p]||{})[op])return;activeLayout[p]=op;drawOverlays(p);renderPanel();}
+
+// Whole-page LiteParse: extract the ENTIRE page as a text-grid (vs text-table,
+// which scopes to one region). Same parser, full-page bbox.
+async function runPageText(pageId){const pn=node(pageId),p=pn.result.page;
+ const pd=doc.pages.find(x=>x.page===p)||{w:612,h:792};
+ const det=document.getElementById('det');if(det)det.insertAdjacentHTML('afterbegin','<div class="card"><span class="spin">LiteParse whole page p.'+p+' …</span></div>');
+ const res=await J('/api/parse',{method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({name:docName,page:p,bbox:[0,0,pd.w,pd.h],method:'text-page',tried:[]})});
+ if(res.error){const m=document.getElementById('det');if(m)m.insertAdjacentHTML('afterbegin','<div class="card dim">unavailable: '+res.error+'</div>');return;}
+ res.atype=res.produces||'text-grid';res.opkind=res.kind||'extract';
+ const nd={id:seq++,parent:pageId,result:res};nodes.push(nd);cur=nd.id;renderPanel();}
 
 // MERGE at the layout level: cluster the Table boxes the run models detected by
 // overlap (IoU). A box ≥2 models agree on is a high-confidence consensus region;
@@ -259,13 +284,6 @@ async function runOp(op,fromId){const reg=regionAncestor(fromId);if(!reg)return 
  const parent_words=(op==='structure'&&fromArt)?fromArt.result.words:null;
  const res=await J('/api/parse',{method:'POST',headers:{'Content-Type':'application/json'},
    body:JSON.stringify({name:docName,page,bbox,method:op,parent_html,parent_text,parent_words,tried})});
- if(kind==='validate'){  // VALIDATE annotates the judged table's evidence — no new artifact
-   const t=node(fromId);
-   t.result.status=res.status;
-   t.result.signals=(t.result.signals||[]).concat(res.signals||[]);
-   t.result.checks=(t.result.checks||[]).concat([{op,status:res.status,seconds:res.seconds,dollars:res.dollars}]);
-   t.result.next=res.next;
-   cur=t.id;drawOverlays(page);renderPanel();return t;}
  res.atype=res.produces||'table';res.opkind=res.kind||kind;
  const nd={id:seq++,parent:parentId,result:res};nodes.push(nd);cur=nd.id;drawOverlays(page);renderPanel();return nd;}
 
@@ -275,7 +293,7 @@ function nextOps(n){const r=n.result;
  if(r.atype==='page')return LAYOUT_OPS;
  const tried=regionTried(n.id);
  const nx=(r.atype==='region')?EXTRACTORS:(['table','text-grid'].includes(r.atype)?(r.next||[]):[]);
- return nx.filter(c=>['materialize','vision','structure'].includes(c.op)||!tried.has(c.op));}
+ return nx.filter(c=>['materialize','structure'].includes(c.op)||!tried.has(c.op));}
 
 // Auto = best-first search: a Region extracts first, then the table escalates.
 async function autoFrom(id){auto=true;renderPanel();let curId=id,steps=0;
@@ -326,6 +344,32 @@ function nodeRow(n,depth){const r=n.result,isPage=r.atype==='page',isReg=r.atype
  children(n.id).forEach(c=>h+=nodeRow(c,depth+1));
  return h;}
 
+// --- table evolution: the linear chain of versions, diff between them ---
+const FRAME_ICON={region:'▭','text-grid':'▦',table:'⊞',typed:'⤓'};
+// The lineage chain through `id`: ancestors back to the Region, then forward
+// through descendants — the sequence of versions this table passed through.
+function lineageFrames(id){
+ let n=node(id),back=[];
+ while(n){if(['region','text-grid','table','typed'].includes(n.result.atype))back.unshift(n);n=(n.parent!=null)?node(n.parent):null;}
+ let c=id;
+ while(true){const ch=children(c).filter(x=>['text-grid','table','typed'].includes(x.result.atype));if(!ch.length)break;back.push(ch[0]);c=ch[0].id;}
+ return back;}
+function htmlDataRows(html){if(!html)return [];const doc=new DOMParser().parseFromString(html,'text/html');const out=[];
+ doc.querySelectorAll('tr').forEach(tr=>{if(tr.querySelector('th'))return;out.push([...tr.querySelectorAll('td')].map(td=>td.textContent.trim()));});return out;}
+// Tint cells in curHtml that differ from the previous version's data rows.
+function diffMark(curHtml,prevRows){const doc=new DOMParser().parseFromString(curHtml,'text/html');let di=0,changed=0;
+ doc.querySelectorAll('tr').forEach(tr=>{if(tr.querySelector('th'))return;const prev=prevRows[di++];
+   [...tr.querySelectorAll('td')].forEach((td,c)=>{const now=td.textContent.trim(),was=prev?(prev[c]||''):'';
+     if(prev&&now!==was){td.classList.add('cellchg');changed++;}});});
+ const t=doc.querySelector('table');return {html:t?t.outerHTML:curHtml,changed};}
+function filmstrip(frames,curId){let h='<div class="film">';
+ frames.forEach((f,i)=>{const r=f.result,st=r.status||(r.atype==='text-grid'?'grid':'located');
+   if(i)h+='<span class="farrow">→</span>';
+   h+='<div class="frame'+(f.id===curId?' sel':'')+'" onclick="cur='+f.id+';renderPanel()">'+
+     '<span class="fop">'+(FRAME_ICON[r.atype]||'')+' '+(r.atype==='region'?'region':r.method||r.atype)+'</span>'+
+     '<span class="fst" style="color:'+(STATUS[st]||'#9aa39e')+'">'+(LABEL[st]||st)+'</span></div>';});
+ return h+'</div>';}
+
 function renderDetail(){const d=document.getElementById('det');if(!d)return;
  if(cur==null){d.innerHTML='<div class="hint">Click a page in the viewer to begin →</div>';return;}
  const me=node(cur),r=me.result;
@@ -344,24 +388,43 @@ function renderDetail(){const d=document.getElementById('det');if(!d)return;
      '<div class="dim" style="margin-top:3px">'+(r.agreed?'merged box from <b>'+r.agreed.join('</b>, <b>')+'</b> (per-edge median of their boxes) — extract a table from it:':'located by <b>'+r.method+'</b> (layout) — extract a table from it:')+'</div></div>'+renderNext(me);return;}
  if(r.atype==='text-grid'){const parent=(me.parent!=null)?node(me.parent):null;
    const src=(r.note||'').replace('text grid via ','')||'?';
-   const viaLP=/LiteParse/i.test(src), nwords=(r.words||[]).length;
-   d.innerHTML='<div class="card"><h4>▦ <b>text grid</b> <span class="badge" style="background:'+(viaLP?'#1a5a40':'#b07515')+'">parsed by '+src+'</span></h4>'+
-     '<div class="costline">'+(parent?artifactLabel(parent.result)+' —(text-table)→ ':'')+'raw region text · ⏱ '+(r.seconds||0)+'s · '+nwords+' word boxes · columns not yet committed</div>'+
-     '<div class="dim" style="margin-top:3px">'+(viaLP?'<b>LiteParse</b> ASCII layout of the region (positionally faithful)':'pdfplumber layout text (LiteParse unavailable)')+' — the <b>structure</b> op clusters its '+(nwords?'word boxes':'whitespace')+' into columns:</div>'+
+   const viaLP=/LiteParse/i.test(src), nwords=(r.words||[]).length, scope=(r.method==='text-page')?'whole page':'region';
+   d.innerHTML='<div class="card"><h4>▦ <b>text grid</b> <span class="dim">· '+scope+'</span> <span class="badge" style="background:'+(viaLP?'#1a5a40':'#b07515')+'">parsed by '+src+'</span></h4>'+
+     '<div class="costline">'+(parent?artifactLabel(parent.result)+' —('+r.method+')→ ':'')+'raw '+scope+' text · ⏱ '+(r.seconds||0)+'s · '+nwords+' word boxes · columns not yet committed</div>'+
+     '<div class="dim" style="margin-top:3px">'+(viaLP?'<b>LiteParse</b> ASCII layout of the '+scope+' (positionally faithful)':'pdfplumber layout text (LiteParse unavailable)')+(scope==='region'?' — the <b>structure</b> op clusters its '+(nwords?'word boxes':'whitespace')+' into columns:':' — a full-page view; pick a region to parse a single table:')+'</div>'+
      '<pre class="mono" style="font-size:11px;white-space:pre;overflow-x:auto;background:var(--g50);padding:8px;border-radius:6px;margin:8px 0 0">'+(r.text||'').replace(/</g,'&lt;')+'</pre>'+
      '</div>'+renderNext(me);return;}
- const parent=(me.parent!=null)?node(me.parent):null;
- let h='<div class="card"><h4><b>'+artifactLabel(r)+'</b> '+badge(r.status)+'</h4>';
- h+='<div class="costline">'+(parent?artifactLabel(parent.result)+' —('+r.method+')→ '+artifactLabel(r)+' · ':'')+'⏱ '+(r.seconds||0)+'s · $'+(r.dollars||0).toFixed(2)+(r.recon!=null?' · reconstruction error '+r.recon:'')+'</div>';
- h+='<div class="dim" style="margin-top:3px">op <b>'+r.method+'</b> ('+(r.opkind||'extract')+') · on '+(r.input||'')+'</div>';
- if(r.checks&&r.checks.length)h+='<div class="dim" style="margin-top:3px">✓ validated by '+r.checks.map(c=>'<b>'+c.op+'</b> ('+(+c.seconds).toFixed(2)+'s · $'+(+c.dollars).toFixed(2)+')').join(', ')+'</div>';
- if(r.note)h+='<div class="dim" style="margin-top:6px">'+r.note+'</div>';
- if(r.markdown)h+='<details open style="margin:8px 0"><summary>grid → markdown (re-parsed into the table below)</summary><pre class="mono" style="font-size:11px;white-space:pre;overflow-x:auto;background:var(--g50);padding:8px;border-radius:6px;margin:6px 0 0">'+r.markdown.replace(/</g,"&lt;")+'</pre></details>';
- if(r.typed)h+=typedHtml(r.typed,me.id);
- else if(r.html)h+='<div class="tbl">'+r.html+'</div>';
- (r.signals||[]).forEach(s=>h+='<div class="sig '+(s.positive?'pos':'neg')+'">'+(s.positive?'✓':'✗')+' <span>'+s.detail+'</span></div>');
- if(r.detail)h+='<details><summary>reconstruction diff — green matched · orange misplaced · red missing</summary><img src="data:image/png;base64,'+r.detail+'"></details>';
- h+='</div>'+renderNext(me);
+ // TABLE / TYPED — the evolution view: filmstrip of versions, this one large,
+ // diff vs the previous version, and what still looks wrong.
+ const frames=lineageFrames(me.id);
+ const idx=frames.findIndex(f=>f.id===me.id);
+ let prev=null;for(let i=idx-1;i>=0;i--){if(frames[i].result.html){prev=frames[i];break;}}
+ const par=(me.parent!=null)?node(me.parent):null;
+ let h=filmstrip(frames,me.id);
+ h+='<div class="card"><h4><b>'+artifactLabel(r)+'</b> '+badge(r.status)+
+   '<span class="dim" style="margin-left:auto;font-weight:400">⏱ '+(r.seconds||0)+'s · $'+(r.dollars||0).toFixed(2)+'</span></h4>';
+ h+='<div class="dim" style="margin-top:2px">'+(par?artifactLabel(par.result)+' —(<b>'+r.method+'</b>)→ ':'')+(r.input||'')+(r.recon!=null?' · recon err '+r.recon:'')+'</div>';
+ if(r.note)h+='<div class="delta">Δ '+r.note+'</div>';
+ if(r.typed){h+=typedHtml(r.typed,me.id);h+='</div>'+renderNext(me);d.innerHTML=h;return;}
+ const mode=viewMode[me.id]||'diff';
+ if(prev){
+   h+='<div style="margin:8px 0 4px">'+
+     ['before','after','diff'].map(m=>'<button class="btn'+(mode===m?'':' ghost')+'" style="margin-right:5px" onclick="viewMode['+me.id+']=\''+m+'\';renderPanel()">'+(m==='diff'?'✦ diff':m)+'</button>').join('')+
+     '<span class="dim"> vs <b>'+(prev.result.method||prev.result.atype)+'</b></span></div>';
+ }
+ let tableHtml=r.html||'',chg=0;
+ if(prev&&mode==='before')tableHtml=prev.result.html;
+ else if(prev&&mode==='diff'){const dm=diffMark(r.html||'',htmlDataRows(prev.result.html));tableHtml=dm.html;chg=dm.changed;}
+ if(prev&&mode==='diff')h+='<div class="dim" style="font-size:11px;margin-bottom:3px">'+(chg?chg+' cell(s) changed by <b>'+r.method+'</b> — highlighted':'no cell values changed by '+r.method)+'</div>';
+ if(r.markdown)h+='<details style="margin:6px 0"><summary>grid → markdown</summary><pre class="mono" style="font-size:11px;white-space:pre;overflow-x:auto;background:var(--g50);padding:8px;border-radius:6px;margin:6px 0 0">'+r.markdown.replace(/</g,"&lt;")+'</pre></details>';
+ h+='<div class="tbl">'+tableHtml+'</div>';
+ const neg=(r.signals||[]).filter(s=>!s.positive),pos=(r.signals||[]).filter(s=>s.positive);
+ h+='<div class="issues">';
+ if(neg.length)h+='<b style="color:var(--suspect,#b4453a)">⚠ still looks wrong</b>'+neg.map(s=>'<div class="sig neg">✗ <span>'+s.detail+'</span></div>').join('');
+ else h+='<b style="color:var(--g600)">✓ nothing flagged wrong</b>';
+ if(r.detail)h+='<details'+(neg.length?' open':'')+' style="margin-top:6px"><summary>cell map — green matched · orange misplaced · red missing</summary><img src="data:image/png;base64,'+r.detail+'"></details>';
+ if(pos.length)h+='<details style="margin-top:4px"><summary class="passed">'+pos.length+' check(s) passed</summary>'+pos.map(s=>'<div class="sig pos">✓ <span>'+s.detail+'</span></div>').join('')+'</details>';
+ h+='</div></div>'+renderNext(me);
  d.innerHTML=h;}
 
 function renderNext(n){const r=n.result,nx=nextOps(n),isPage=r.atype==='page';
@@ -369,10 +432,12 @@ function renderNext(n){const r=n.result,nx=nextOps(n),isPage=r.atype==='page';
  if(!nx.length)return GOOD(r.status)?'<div class="esc"><span class="ok">✓ '+(r.status==='typed'?'materialized':'validated')+'</span></div>'
    :(['region','page','text-grid'].includes(r.atype)?'':'<div class="esc"><span class="dim">no further operations apply</span></div>');
  let h='<div class="esc"><div class="dim" style="margin-bottom:6px">'+(isPage?'detect layout — pick a model (each produces Region artifacts):':r.atype==='region'?'extract a table from this region:':r.atype==='text-grid'?'structure the text grid into columns:':GOOD(r.status)?'✓ validated — you can:':'flagged — apply an operation (produces a new artifact):')+'</div>';
- nx.forEach((c,i)=>{const sym=c.kind==='layout'?' ▦':c.kind==='transform'?' ✎':c.kind==='validate'?' ◉':' ⤢';
+ nx.forEach((c,i)=>{const sym=c.kind==='layout'?' ▦':c.kind==='transform'?' ✎':' ⤢';
    const fn=isPage?'runLayout':'runOp';
    h+='<button class="'+(i===0&&!isPage?'btn':'btn ghost')+'" style="margin:0 6px 6px 0" title="'+c.reason.replace(/"/g,'&quot;')+'" onclick="'+fn+'(\''+c.op+'\','+n.id+')">('+c.op+')→'+sym+'</button>';});
- if(isPage){const nm=Object.keys(layoutData[r.page]||{}).length;
+ if(isPage){
+   h+='<button class="btn ghost" style="margin:0 6px 6px 0" title="LiteParse the WHOLE page into a text grid (prose + figures + tables) — vs text-table which scopes to one region" onclick="runPageText('+n.id+')">▦ LiteParse whole page → text grid</button>';
+   const nm=Object.keys(layoutData[r.page]||{}).length;
    if(nm>=2)h+='<button class="btn" style="margin:0 6px 6px 0;background:#2563eb;border-color:#2563eb" title="cluster the table boxes the run models agree on (IoU≥0.5); ≥2 agreeing = one merged region (per-edge median box)" onclick="mergeLayouts('+n.id+')">⋈ merge regions ('+nm+' models run)</button>';}
  if(!isPage&&!GOOD(r.status)&&nx.some(c=>c.op!=='materialize'))h+='<button class="btn ghost" onclick="autoFrom('+n.id+')">⚡ Auto until valid</button>';
  h+='<div class="dim" style="margin-top:4px">'+nx.map(c=>'<b>'+c.op+'</b> — '+c.reason).join('<br>')+'</div></div>';

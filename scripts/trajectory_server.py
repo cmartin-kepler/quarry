@@ -7,16 +7,14 @@
 trajectory_server.py - Interactive, ON-DEMAND parsing-trajectory UI.
 
 A local web app. Nothing is pre-computed or hardcoded: you click a table region in
-the PDF and the server parses it live with the cheap method, validates it, and
-reports the measured time. If it's flagged you click "escalate" and the NEXT
-method runs on demand (LiteParse on its text, then Docling parsing just that page
-via page_range, then vision) — each timed live. The lineage graph builds up node
-by node as you escalate.
+the PDF and the server parses it live, gathers evidence, and reports the measured
+time. If it's flagged you click "escalate" and the NEXT method runs on demand —
+each timed live. The lineage graph builds up node by node as you escalate.
 
-Methods are path-dependent (different representations):
-  cheap geometric (PDF text-layer) · text-table (region text → a text-grid you
-  then `structure` into columns by word geometry) · Docling (PDF, per-page) ·
-  vision verify (image)
+Extractors are path-dependent (different source representations):
+  pdf-text (pdfplumber geometric, PDF text layer) · Docling (ML, per page) ·
+  text-table / text-page (LiteParse a region / whole page → a text grid you then
+  `structure` into columns by word geometry)
 
 Run (deps declared inline via PEP 723, so plain uv run works):
   uv run scripts/trajectory_server.py            # -> http://127.0.0.1:5050
@@ -70,8 +68,7 @@ def _load_env():
 
 _load_env()
 DH = "0" * 64
-VISION_RATE, VISION_TIME = 0.02, 1.2
-BUILD = "litparse-ui-cleanup-38"  # bump on server changes; shown in the UI header to verify what's running
+BUILD = "rename-pdftext-no-vision-43"  # bump on server changes; shown in the UI header to verify what's running
 
 INPUT_DIR = os.path.join(REPO, "input")
 # Friendlier display names for known files; any other PDF shows as its path under input/.
@@ -249,6 +246,41 @@ def ensure_lite(name):
         _lite[name] = {"text": text, "items": items, "secs": time.monotonic()-t,
                        "n_pages": max(1, n_pages), "err": err}
     return _lite[name]
+
+
+_lite_crop: dict = {}
+
+
+def lite_crop(name, page, bbox):
+    """Crop the page to the layout extractor's bbox and run LiteParse on JUST that
+    crop, so LiteParse lays out only the region as faithful ASCII (no page-slice
+    leakage). The bbox (pdfplumber top-left coords) becomes the crop's mediabox+
+    cropbox in PDF bottom-left coords. Returns {text, items} (items in crop coords)."""
+    key = (name, page, tuple(round(v, 1) for v in bbox))
+    if key in _lite_crop:
+        return _lite_crop[key]
+    from pypdf import PdfReader, PdfWriter
+    from pypdf.generic import RectangleObject
+    x0, top, x1, bottom = bbox
+    out = {"text": "", "items": []}
+    try:
+        src = PdfReader(DOCS[name])
+        pg = src.pages[page-1]
+        H = float(pg.mediabox.height)
+        rect = RectangleObject([max(0, x0), max(0, H-bottom), x1, H-top])
+        pg.cropbox = rect; pg.mediabox = rect
+        wr = PdfWriter(); wr.add_page(pg)
+        tmp = os.path.join(_wd, f"crop_{abs(hash(key))}.pdf")
+        with open(tmp, "wb") as f:
+            wr.write(f)
+        js = tmp + ".json"
+        sh(["lit", "parse", tmp, "--format", "json", "-o", js, "-q"])
+        p = json.load(open(js))["pages"][0]
+        out = {"text": p.get("text", ""), "items": p.get("textItems", [])}
+    except Exception as e:  # noqa: BLE001 — lit missing / crop / parse failure
+        print(f"[lite_crop] {name} p{page}: {str(e)[:120]}", flush=True)
+    _lite_crop[key] = out
+    return out
 
 
 _conv = None
@@ -576,9 +608,9 @@ def surya_layout(name, n):
 
 
 def crop_table(name, page, bbox):
-    """Region-scoped cheap extraction: build a grid from the text inside the
+    """Region-scoped pdf-text extraction: build a grid from the text inside the
     region's bbox (text strategy first, ruled-line fallback). This makes the
-    `Region —(cheap)→ table` edge honest — it parses the region, rather than
+    `Region —(pdf-text)→ table` edge honest — it parses the region, rather than
     matching against a separate whole-page detection."""
     pg = pdf(name).pages[page-1]
     x0, y0, x1, y1 = bbox
@@ -709,12 +741,9 @@ def api_page(name, n):
 
 
 # ---- the artifact / operation scheme ----------------------------------------
-# One invariant, two op shapes:
-#   * extract / transform PRODUCE a new artifact (a new representation of content)
-#   * validate ANNOTATES an artifact's evidence — it produces nothing new
-# So validation is not an artifact; it enriches the table it judges (status +
-# signals). That keeps every validator (reconcile, figure-guard, recon, vision)
-# uniform — vision is no longer a special "verdict" node.
+# Every op PRODUCES a new artifact (a new representation of the content). Evidence
+# (reconcile / figure-guard / reconstruction) is gathered when the artifact is
+# produced and attached to it (status + signals) — validation is not its own op.
 
 class ArtifactKind(str, Enum):
     PAGE = "page"          # the source page
@@ -726,24 +755,21 @@ class ArtifactKind(str, Enum):
 
 class OpKind(str, Enum):
     LAYOUT = "layout"        # Page      -> Region(s)        (segmentation; one op fans OUT)
-    EXTRACT = "extract"      # Region    -> Table            (reparse a source repr, scoped to the region)
+    EXTRACT = "extract"      # Region    -> Table/TextGrid   (reparse a source repr, scoped to the region)
     TRANSFORM = "transform"  # Table     -> Table / Typed    (consume the artifact's own content)
     MERGE = "merge"          # [Region…] -> Region          (agree on a bbox; fans IN — the dual of LAYOUT)
-    VALIDATE = "validate"    # Table     -> (no new artifact; attaches evidence to it)
 
 
 # An evidence verdict — we can't prove correctness without ground truth, only
 # gather signals; `status` is the strongest summary of them.
-Status = Literal["confirmed", "ok", "suspect", "figure", "missing", "verified",
+Status = Literal["confirmed", "ok", "suspect", "figure", "missing",
                  "typed", "located", "idle", "grid"]
 
 
 @dataclass(frozen=True)
 class Operation:
-    """One edge in the artifact graph. `produces` is None for VALIDATE ops — they
-    make no new artifact, they annotate the one they judge. `reads` names the
-    source representation an EXTRACT reparses (the path-dependence that's the point
-    of the project), or the image a VALIDATE looks at."""
+    """One edge in the artifact graph. `reads` names the source representation an
+    EXTRACT reparses (the path-dependence that's the point of the project)."""
     name: str
     kind: OpKind
     consumes: ArtifactKind
@@ -765,10 +791,12 @@ OPS: dict[str, Operation] = {o.name: o for o in [
     Operation("docling",     OpKind.LAYOUT, _PG, _RG, label="Docling layout model"),
     Operation("surya",       OpKind.LAYOUT, _PG, _RG, label="Surya (VLM layout + reading order)"),
     # extract: Region -> Table  (reparse one source representation, scoped to the region)
-    Operation("cheap",       OpKind.EXTRACT, _RG, _TB, reads="PDF text-layer (glyph boxes)"),
-    Operation("Docling",     OpKind.EXTRACT, _RG, _TB, reads="PDF (direct, per page)"),
-    # extract: Region -> TextGrid  (the raw region text; columns are committed later)
-    Operation("text-table",  OpKind.EXTRACT, _RG, ArtifactKind.TEXTGRID, reads="region text (layout-preserving)"),
+    Operation("pdf-text",    OpKind.EXTRACT, _RG, _TB, reads="PDF text layer — pdfplumber geometric (ruled lines + aligned columns)"),
+    Operation("Docling",     OpKind.EXTRACT, _RG, _TB, reads="PDF — Docling ML table model"),
+    # extract -> TextGrid  (raw text; columns committed later by `structure`). Two
+    # scopes, same LiteParse: the whole page, or just one region of it.
+    Operation("text-page",   OpKind.EXTRACT, _PG, ArtifactKind.TEXTGRID, reads="whole-page text (LiteParse)"),
+    Operation("text-table",  OpKind.EXTRACT, _RG, ArtifactKind.TEXTGRID, reads="region text (LiteParse)"),
     # structure: TextGrid -> Table  (cluster the region's words into columns)
     Operation("structure",   OpKind.TRANSFORM, ArtifactKind.TEXTGRID, _TB, label="cluster words into columns → table"),
     # transform: Table -> Table / Typed  (consume the artifact's own content)
@@ -776,8 +804,6 @@ OPS: dict[str, Operation] = {o.name: o for o in [
     Operation("sign-fix",    OpKind.TRANSFORM, _TB, _TB, label="reinterpret signs (parens / CR / DR → signed)"),
     Operation("materialize", OpKind.TRANSFORM, _TB, _TY, label="HtmlTable → typed columns"),
     # merge: [Region…] -> Region  (agree on a bbox across layout models; runs client-side)
-    # validate: Table -> (no artifact; attaches a verdict to the table's evidence)
-    Operation("vision",      OpKind.VALIDATE, _TB, None, reads="rendered region image"),
 ]}
 
 
@@ -901,11 +927,9 @@ def route(r: OpResult, tried: list[str]) -> list[dict]:
         if op != method and op not in tried and all(c["op"] != op for c in cands):
             cands.append({"op": op, "reason": reason, "kind": OPS[op].kind.value})
 
-    if status in ("ok", "confirmed", "verified"):
+    if status in ("ok", "confirmed"):
         add("materialize", "validated — materialize to typed, math-ready columns")
         return cands
-    if "figure" in sigs:
-        add("vision", "looks like a chart/figure — confirm with vision")
     if "no column reconciles" in sigs or "rows sum to" in sigs:
         if "CR" in html or "DR" in html:
             add("sign-fix", "totals fail and CR/DR markers present — reinterpret signs")
@@ -917,9 +941,8 @@ def route(r: OpResult, tried: list[str]) -> list[dict]:
     if status == "missing":
         for op in ("text-table", "markdown", "Docling"):
             add(op, "not found by this method — try " + OPS[op].input)
-    # generic fallbacks — always leave a way forward, cheapest last-resort first
+    # generic fallbacks — always leave a way forward
     add("Docling", "escalate to a structure-aware parser")
-    add("vision", "escalate to vision verification")
     add("markdown", "re-express the grid as markdown and re-detect")
     return cands[:4]
 
@@ -932,9 +955,11 @@ def api_parse():
     d = request.get_json()
     name, page, bbox, method = d["name"], d["page"], tuple(d["bbox"]), d["method"]
     parent_html = d.get("parent_html")
+    if method not in OPS:
+        return jsonify({"error": f"unknown operation {method!r}"}), 400
     op = OPS[method]
 
-    if method == "cheap":  # EXTRACT: parse a grid from the text inside the region's bbox
+    if method == "pdf-text":  # EXTRACT: pdfplumber geometric table detection in the region
         t0 = time.monotonic()
         grid = crop_table(name, page, bbox)
         if grid and len(grid) >= 2:
@@ -944,34 +969,29 @@ def api_parse():
         else:
             r = _missing(op, time.monotonic()-t0, "no table grid found in this region")
 
-    elif method == "text-table":  # EXTRACT: the region's text as a text-grid (faithful ASCII +
-        t0 = time.monotonic()       # word geometry; columns are committed later by `structure`)
+    elif method in ("text-table", "text-page"):  # EXTRACT: text as a text-grid (faithful ASCII +
+        t0 = time.monotonic()       # word geometry); text-page = whole page, text-table = one region
         x0, top, x1, bottom = bbox
-        lp = ensure_lite(name)
-        items = lp.get("items", {}).get(page, [])
-
-        def inb(it):
-            return x0 <= it["x"] + it.get("width", 0)/2 <= x1 and top <= it["y"] + it.get("height", 0)/2 <= bottom
-        words = [{"text": it["text"], "x0": it["x"], "x1": it["x"] + it.get("width", 0), "top": it["y"]}
-                 for it in items if inb(it)]
-        if words:  # LiteParse — faithful ASCII art (sliced to the region) + real coordinates
-            lines = lp["text"].get(page, "").split("\n")
-            texts = {it["text"] for it in items if inb(it)}
-            hit = [i for i, l in enumerate(lines) if any(t and t in l for t in texts)]
-            text = "\n".join(lines[min(hit):max(hit)+1]) if hit else ""
+        whole = method == "text-page"
+        # whole page → LiteParse the page; region → LiteParse a PDF cropped to the bbox.
+        lp = ensure_lite(name) if whole else None
+        items = (lp.get("items", {}).get(page, []) if whole else lite_crop(name, page, bbox)["items"])
+        if items:  # LiteParse — its own faithful ASCII + word geometry
             src = "LiteParse"
-        else:  # LiteParse unavailable — pdfplumber layout text + word boxes
+            words = [{"text": it["text"], "x0": it["x"], "x1": it["x"] + it.get("width", 0), "top": it["y"]} for it in items]
+            text = lp["text"].get(page, "") if whole else lite_crop(name, page, bbox)["text"]
+        else:  # LiteParse unavailable — pdfplumber word boxes, ASCII rebuilt from them
+            src = "pdfplumber"
             pg = pdf(name).pages[page-1]
             cr = pg.crop((max(0, x0), max(0, top), min(pg.width, x1), min(pg.height, bottom)))
-            text = cr.extract_text(layout=True) or ""
             words = [{"text": w["text"], "x0": w["x0"], "x1": w["x1"], "top": w["top"]} for w in cr.extract_words()]
-            src = "pdfplumber"
+            text = tt.words_to_ascii(words)
         if words or text.strip():
             r = OpResult(method=op.name, kind=op.kind.value, input=op.input, produces="text-grid",
                          status="grid", text=text, words=words, note=f"text grid via {src}",
                          seconds=round(time.monotonic()-t0, 3))
         else:
-            r = _missing(op, time.monotonic()-t0, "no text found in this region")
+            r = _missing(op, time.monotonic()-t0, "no text found in this " + ("page" if whole else "region"))
 
     elif method == "structure":  # TRANSFORM: commit the text-grid's columns -> table.
         t0 = time.monotonic()       # Prefer word geometry; fall back to whitespace on bare text.
@@ -1027,12 +1047,6 @@ def api_parse():
         else:
             err, png = recon_for(name, page, bbox, t["html"])
             r = _artifact(op, t["ev"], t["html"], dl["secs"], recon=err, detail=png)
-
-    elif method == "vision":  # VALIDATE: an evidence patch merged onto the table (no new artifact)
-        r = OpResult(method=op.name, kind=op.kind.value, input=op.input, status="verified",
-                     seconds=VISION_TIME, dollars=VISION_RATE,
-                     signals=[{"positive": True, "detail": "vision-verified the parse (modeled)"}],
-                     note="LLM vision-verifies the parse / confirms it is a figure (modeled)")
 
     else:
         return jsonify({"error": f"unknown operation {method!r}"}), 400

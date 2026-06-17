@@ -135,6 +135,39 @@ def _merge_symbol_cols(grid, header_rows):
     return grid
 
 
+def words_to_ascii(words, row_tol: float = 3):
+    """Render words back into a faithful monospace ASCII block, scoped to exactly
+    the words given. Used for the text-grid display of a REGION: rebuilding from the
+    region's own words avoids the page-slice problem (a token like 'Loss' matching
+    lines all over the page). Char column = x offset / median per-char width."""
+    if not words:
+        return ""
+    minx = min(w["x0"] for w in words)
+    widths = sorted((w["x1"] - w["x0"]) / max(1, len(w["text"])) for w in words if w.get("text"))
+    cw = widths[len(widths)//2] if widths else 5.0
+    ws = sorted(words, key=lambda w: (w["top"], w["x0"]))
+    rows, cur, y0 = [], [], None
+    for w in ws:
+        if y0 is None or w["top"] - y0 <= row_tol:
+            cur.append(w); y0 = w["top"] if y0 is None else y0
+        else:
+            rows.append(cur); cur = [w]; y0 = w["top"]
+    if cur:
+        rows.append(cur)
+    lines = []
+    for r in rows:
+        line = ""
+        for w in sorted(r, key=lambda w: w["x0"]):
+            col = max(0, round((w["x0"] - minx) / cw))
+            if len(line) < col:
+                line += " " * (col - len(line))
+            elif line and not line.endswith(" "):
+                line += " "
+            line += w["text"]
+        lines.append(line.rstrip())
+    return "\n".join(lines)
+
+
 def structure_words(words, row_tol: float = 3, col_gap: float = 6):
     """Cluster a region's words (pdfplumber dicts with text/x0/x1/top) into a table
     grid by GEOMETRY: rows by vertical position, columns by gaps in the horizontal
