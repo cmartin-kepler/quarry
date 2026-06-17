@@ -70,7 +70,7 @@ def _load_env():
 _load_env()
 DH = "0" * 64
 VISION_RATE, VISION_TIME = 0.02, 1.2
-BUILD = "canon-tidy-31"  # bump on server changes; shown in the UI header to verify what's running
+BUILD = "guarded-transforms-32"  # bump on server changes; shown in the UI header to verify what's running
 
 INPUT_DIR = os.path.join(REPO, "input")
 # Friendlier display names for known files; any other PDF shows as its path under input/.
@@ -874,6 +874,46 @@ def sign_fix_grid(grid):
     return out, changed
 
 
+_RANK = {"confirmed": 3, "no_issues": 2, "suspect": 1, "figure": 0}
+_RANKNAME = {3: "reconciles", 2: "clean", 1: "suspect", 0: "figure"}
+
+
+def _grid_quality(grid, page):
+    """Score a grid's evidence so a transform can prove it helped. Higher is better,
+    compared lexicographically: (reconciliation, negatives captured, numbers parsed,
+    -violations). 'Negatives captured' is the signal that catches the split-paren
+    fix — rejoining '( 902 )' flips a phantom +902 into -902, which is the whole
+    point — and reconciliation catches whether the totals then add up."""
+    ev = explain_grid(grid, page)
+    rank = _RANK.get(ev.get("impression"), 1)
+    negs = ncells = viol = 0
+    try:
+        t = typ.materialize([[(c or "") for c in row] for row in grid], 1)
+        viol = len(t.violations)
+        for col in t.columns:
+            if col.dtype == "label":
+                continue
+            for v in col.values:
+                if v is not None:
+                    ncells += 1
+                    if isinstance(v, (int, float)) and v < 0:
+                        negs += 1
+    except Exception:  # noqa: BLE001
+        viol = 999
+    return (rank, negs, ncells, -viol), ev
+
+
+def _delta_note(base, new):
+    parts = []
+    if new[0] != base[0]:
+        parts.append(f"reconciliation {_RANKNAME[base[0]]}→{_RANKNAME[new[0]]}")
+    if new[1] != base[1]:
+        parts.append(f"{new[1]-base[1]:+d} negative(s) captured")
+    if new[3] != base[3]:
+        parts.append(f"violations {-base[3]}→{-new[3]}")
+    return ", ".join(parts)
+
+
 def route(r: OpResult, tried: list[str]) -> list[dict]:
     """Diagnostic-driven next operations: ops whose precondition matches the
     failure, in priority order (a cheap targeted transform before a costly
@@ -951,20 +991,48 @@ def api_parse():
     elif method == "canonicalize":  # TRANSFORM: clean split-off $/() columns + empties
         t0 = time.monotonic()
         src = grid_from_html(parent_html)
-        if src:
-            grid, changes = tt.canonicalize(src)
-            note = ("; ".join(changes) if changes else "already canonical — nothing to clean")
-            r = _artifact(op, explain_grid(grid, page), tt.to_html(grid), time.monotonic()-t0, note=note)
-        else:
+        if not src:
             r = _missing(op, time.monotonic()-t0, "no parent grid to canonicalize")
+        else:
+            cleaned, changes = tt.canonicalize(src)
+            secs = time.monotonic()-t0
+            if not changes:
+                r = _artifact(op, explain_grid(src, page), tt.to_html(src), secs,
+                              note="already canonical — nothing to rejoin")
+            else:
+                base_q, _ = _grid_quality(src, page)
+                new_q, new_ev = _grid_quality(cleaned, page)
+                delta = _delta_note(base_q, new_q)
+                # Evidence-guided: only KEEP the cleanup if it didn't make the table
+                # worse. A transform that doesn't improve isn't worth applying.
+                if new_q >= base_q:
+                    improved = new_q > base_q
+                    note = "; ".join(changes) + " — " + (
+                        ("improved: " + delta) if improved else "structural only (evidence unchanged)")
+                    ev = dict(new_ev)
+                    ev["signals"] = list(ev.get("signals", [])) + [
+                        {"positive": improved, "detail": "canonicalize " + (delta if improved else "did not change the evidence")}]
+                    r = _artifact(op, ev, tt.to_html(cleaned), secs, note=note)
+                else:
+                    ev = dict(explain_grid(src, page))
+                    ev["signals"] = list(ev.get("signals", [])) + [
+                        {"positive": False, "detail": "canonicalize skipped — would regress (" + delta + ")"}]
+                    r = _artifact(op, ev, tt.to_html(src), secs,
+                                  note="skipped: rejoining columns would reduce quality (" + delta + ") — kept the original")
 
     elif method == "sign-fix":  # TRANSFORM: rewrite the parent grid's accounting signs
         t0 = time.monotonic()
         src = grid_from_html(parent_html)
         if src:
             grid, changed = sign_fix_grid(src)
-            r = _artifact(op, explain_grid(grid, page), tt.to_html(grid), time.monotonic()-t0,
-                          note=f"rewrote {changed} parenthesised/CR/DR value(s) to signed numbers")
+            base_q, _ = _grid_quality(src, page)
+            new_q, ev = _grid_quality(grid, page)
+            delta = _delta_note(base_q, new_q)
+            ev = dict(ev)
+            ev["signals"] = list(ev.get("signals", [])) + [
+                {"positive": new_q > base_q, "detail": "sign-fix " + (delta if delta else "did not change the evidence")}]
+            note = f"rewrote {changed} parenthesised/CR/DR value(s) to signed numbers" + (" — " + delta if delta else "")
+            r = _artifact(op, ev, tt.to_html(grid), time.monotonic()-t0, note=note)
         else:
             r = _missing(op, time.monotonic()-t0, "no parent grid to reinterpret")
 
