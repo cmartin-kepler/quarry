@@ -38,6 +38,18 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Run a CHAIN of ops (comma-separated), feeding each the previous op's
+    /// outputs — e.g. --ops regions,text-grid,structure,sign-fix. Sidecars run on
+    /// `--source` (the original file).
+    Chain {
+        file: PathBuf,
+        #[arg(long)]
+        ops: String,
+        #[arg(long)]
+        source: Option<PathBuf>,
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Run all applicable quality checks over a parsed artifact directory.
     Check { artifact_dir: PathBuf },
     /// THE first deliverable: measure the silent-failure catch rate vs truth.
@@ -81,6 +93,9 @@ fn main() -> Result<()> {
     match cli.cmd {
         Command::Parse { file, op, tier, source, out } => {
             cmd_parse(&file, op.as_deref(), tier, source.as_deref(), &out)
+        }
+        Command::Chain { file, ops, source, out } => {
+            cmd_chain(&file, &ops, source.as_deref(), &out)
         }
         Command::Check { artifact_dir } => cmd_check(&artifact_dir),
         Command::Eval {
@@ -244,6 +259,36 @@ fn adjudicate_and_store(
         .count())
 }
 
+/// A `.qdoc` loads as the native text-layer context; any other file (a real PDF
+/// for a sidecar/chain) gets an empty context + a doc_hash of its bytes.
+fn load_doc(file: &Path) -> Result<(QDoc, quarry::core::DocHash)> {
+    match QDoc::load(file) {
+        Ok(x) => Ok(x),
+        Err(_) => {
+            let bytes = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
+            Ok((QDoc { format: quarry::doc::DocFormat::Pdf, pages: vec![] }, quarry::core::DocHash::of(&bytes)))
+        }
+    }
+}
+
+fn cmd_chain(file: &Path, ops: &str, source: Option<&Path>, out: &Path) -> Result<()> {
+    let (doc, doc_hash) = load_doc(file)?;
+    let source_path = Some(source.unwrap_or(file).to_path_buf());
+    let op_ids: Vec<String> = ops.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    let artifacts = pipeline::run_chain(&doc, doc_hash, source_path, &op_ids)?;
+    let n_tables = adjudicate_and_store(&artifacts, doc_hash, out)?;
+    println!(
+        "ran chain [{}] on {} (doc {}) → {} artifact(s), {} table(s) → {}",
+        op_ids.join(" → "),
+        file.display(),
+        doc_hash.short(),
+        artifacts.len(),
+        n_tables,
+        out.display()
+    );
+    Ok(())
+}
+
 fn cmd_parse(
     file: &Path,
     op: Option<&str>,
@@ -251,15 +296,7 @@ fn cmd_parse(
     source: Option<&Path>,
     out: &Path,
 ) -> Result<()> {
-    // A `.qdoc` loads as the native text-layer context; any other file (a real
-    // PDF for a sidecar) gets an empty context + a doc_hash of its bytes.
-    let (doc, doc_hash) = match QDoc::load(file) {
-        Ok(x) => x,
-        Err(_) => {
-            let bytes = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
-            (QDoc { format: quarry::doc::DocFormat::Pdf, pages: vec![] }, quarry::core::DocHash::of(&bytes))
-        }
-    };
+    let (doc, doc_hash) = load_doc(file)?;
     // sidecars run the tool on `--source`, defaulting to `file` itself.
     let source_path = Some(source.unwrap_or(file).to_path_buf());
 
@@ -268,7 +305,13 @@ fn cmd_parse(
             .ok_or_else(|| anyhow::anyhow!("unknown op `{id}`"))?,
         None => pipeline::extractor_for(doc.format, tier)?,
     };
-    let artifacts = pipeline::run_document_extractor(&doc, doc_hash, source_path, extractor.as_ref())?;
+    let artifacts = pipeline::run_document_extractor(
+        &doc,
+        doc_hash,
+        source_path,
+        quarry::core::Generation(0),
+        extractor.as_ref(),
+    )?;
     let n_tables = adjudicate_and_store(&artifacts, doc_hash, out)?;
     println!(
         "parsed {} with `{}` (doc {}) → {} artifact(s), {} table(s) → {}",

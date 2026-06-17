@@ -210,6 +210,11 @@ lands; add the new artifact kinds to the ground-truth diff.
   - `manifest.json` is kept as a re-derived current-view snapshot for the Python
     tools. `check`/`explain` work unchanged. Cross-generation element matching is
     still deferred (brief §6) — `element_id == artifact id` for now.
-- **Remaining: E** — demand-driven op-chain orchestration (so transforms/merge run
-  as chains, with the route() escalation policy + lazy staleness) and repointing
-  the thin Python UI at the Rust core.
+- **E — started.** `pipeline::run_chain` executes a chain of ops, feeding each the
+  previous op's outputs (Transforms run per artifact, Merge runs N→1), returning
+  every generation so the whole DAG lands in the registry. CLI `quarry chain <file>
+  --ops regions,text-grid,structure,sign-fix` runs the native op graph end to end
+  (verified: 68 artifacts / 51 lineage edges).
+  - **Remaining E:** the `route()` escalation policy (pick the next op when an
+    artifact is flagged — demand-driven, not a fixed chain), lazy staleness (brief
+    §7), and repointing the thin Python test UI at the Rust core.
