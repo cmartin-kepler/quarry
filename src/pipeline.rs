@@ -24,6 +24,7 @@ pub fn cheap_parse(doc: &QDoc, doc_hash: DocHash, tier: u8) -> Result<Vec<Box<dy
     let ctx = ExtractCtx {
         source: doc,
         generation: Generation(0),
+        source_path: None, // native tier-0 needs no external file
     };
 
     let mut artifacts = Vec::new();

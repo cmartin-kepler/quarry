@@ -423,7 +423,7 @@ mod tests {
     }
 
     fn ctx<'a>(doc: &'a QDoc) -> ExtractCtx<'a> {
-        ExtractCtx { source: doc, generation: Generation(0) }
+        ExtractCtx { source: doc, generation: Generation(0), source_path: None }
     }
 
     fn refs(v: &[Box<dyn Artifact>]) -> Vec<&dyn Artifact> {
