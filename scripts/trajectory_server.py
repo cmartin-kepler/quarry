@@ -70,7 +70,7 @@ def _load_env():
 _load_env()
 DH = "0" * 64
 VISION_RATE, VISION_TIME = 0.02, 1.2
-BUILD = "cloud-bbox-28"  # bump on server changes; shown in the UI header to verify what's running
+BUILD = "merge-regions-30"  # bump on server changes; shown in the UI header to verify what's running
 
 INPUT_DIR = os.path.join(REPO, "input")
 # Friendlier display names for known files; any other PDF shows as its path under input/.
@@ -224,7 +224,6 @@ def recon_for(name, page, bbox, html):
 
 
 # ---- on-demand parsing (each runs live, measures real time) ----------------
-
 
 
 def ensure_lite(name):
@@ -527,8 +526,6 @@ def api_doc(name):
     return jsonify({"pages": _meta[name]})
 
 
-
-
 # Persistent Surya sidecar: a long-lived server process (isolated env) that loads
 # the VLM once, so per-call cost is just inference rather than a model reload.
 _surya = {"proc": None, "url": None}
@@ -753,22 +750,24 @@ def api_page(name, n):
 # uniform — vision is no longer a special "verdict" node.
 
 class ArtifactKind(str, Enum):
-    PAGE = "page"        # the source page
-    REGION = "region"    # a located area on the page (a layout detection)
-    TABLE = "table"      # a parsed HtmlTable (+ its evidence)
-    TYPED = "typed"      # a materialized, math-ready TypedTable
+    PAGE = "page"          # the source page
+    REGION = "region"      # a located area on the page (a layout detection)
+    TABLE = "table"        # a parsed HtmlTable (+ its evidence)
+    TYPED = "typed"        # a materialized, math-ready TypedTable
 
 
 class OpKind(str, Enum):
-    LAYOUT = "layout"        # Page    -> Region(s)        (segmentation; one op, many regions)
-    EXTRACT = "extract"      # Region  -> Table            (reparse a source repr, scoped to the region)
-    TRANSFORM = "transform"  # Table   -> Table / Typed    (consume the artifact's own content)
-    VALIDATE = "validate"    # Table   -> (no new artifact; attaches evidence to it)
+    LAYOUT = "layout"        # Page      -> Region(s)        (segmentation; one op fans OUT)
+    EXTRACT = "extract"      # Region    -> Table            (reparse a source repr, scoped to the region)
+    TRANSFORM = "transform"  # Table     -> Table / Typed    (consume the artifact's own content)
+    MERGE = "merge"          # [Region…] -> Region          (agree on a bbox; fans IN — the dual of LAYOUT)
+    VALIDATE = "validate"    # Table     -> (no new artifact; attaches evidence to it)
 
 
 # An evidence verdict — we can't prove correctness without ground truth, only
 # gather signals; `status` is the strongest summary of them.
-Status = Literal["confirmed", "ok", "suspect", "figure", "missing", "verified", "typed", "located", "idle"]
+Status = Literal["confirmed", "ok", "suspect", "figure", "missing", "verified",
+                 "typed", "located", "idle"]
 
 
 @dataclass(frozen=True)
@@ -805,6 +804,7 @@ OPS: dict[str, Operation] = {o.name: o for o in [
     Operation("markdown",    OpKind.TRANSFORM, _TB, _TB, label="grid → markdown → table"),
     Operation("sign-fix",    OpKind.TRANSFORM, _TB, _TB, label="reinterpret signs (parens / CR / DR → signed)"),
     Operation("materialize", OpKind.TRANSFORM, _TB, _TY, label="HtmlTable → typed columns"),
+    # merge: [Region…] -> Region  (agree on a bbox across layout models; runs client-side)
     # validate: Table -> (no artifact; attaches a verdict to the table's evidence)
     Operation("vision",      OpKind.VALIDATE, _TB, None, reads="rendered region image"),
 ]}
@@ -977,8 +977,6 @@ def api_parse():
     return jsonify(asdict(r))
 
 
-
-
 _SQL = {"int": "BIGINT", "float": "DOUBLE", "percent": "DOUBLE",
         "currency": "DOUBLE", "label": "VARCHAR"}
 
@@ -1015,7 +1013,6 @@ STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 @app.get("/")
 def index():
     return Response(open(os.path.join(STATIC, "app.html"), encoding="utf-8").read(), mimetype="text/html")
-
 
 
 def warmup():

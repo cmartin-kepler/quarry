@@ -68,7 +68,7 @@ details img{max-width:100%;border:1px solid var(--line);border-radius:8px;margin
 .tk{font-family:'Geist Mono',monospace;font-size:9px;text-transform:uppercase;letter-spacing:.04em;padding:1px 5px;border-radius:4px;color:#fff}
 .tk-extract{background:#3f7a8c}.tk-transform{background:#7a4fa3}.tk-validate{background:#b07515}
 .edge{font-family:'Geist Mono',monospace;font-size:11px;margin:5px 0 1px;letter-spacing:.02em}
-.edge.k-extract{color:#3f7a8c}.edge.k-transform{color:#7a4fa3}.edge.k-validate{color:#b07515}.edge.k-layout{color:#0a8}
+.edge.k-extract{color:#3f7a8c}.edge.k-transform{color:#7a4fa3}.edge.k-validate{color:#b07515}.edge.k-layout{color:#0a8}.edge.k-merge{color:#2563eb}
 .tn-src{background:var(--g50);border-style:dashed}
 .tn-region{border-style:dashed;border-color:#0a8}
 .lcard{display:flex;align-items:center;gap:8px;border:1px solid var(--line);border-radius:8px;padding:7px 11px;margin:5px 0;cursor:pointer;font-size:13px}
@@ -113,6 +113,11 @@ async function J(u,o){return (await fetch(u,o)).json();}
 // the on-page overlay shows activeLayout[page]. The graph is `nodes` (artifacts
 // with parent pointers); `cur` is the selected node.
 let docName=null,doc=null,layoutData={},activeLayout={},sel=null,nodes=[],cur=null,seq=0,curPage=1,auto=false;
+// Consensus regions per page: clusters where ≥2 layout models agreed on a box.
+let clusterRegions={};
+// Artifacts the user has check-marked in the graph to merge by hand.
+let picked=new Set();
+const med=xs=>{const s=[...xs].sort((a,b)=>a-b),m=s.length>>1;return s.length%2?s[m]:(s[m-1]+s[m])/2;};
 
 function active(p){const m=layoutData[p];return m?m[activeLayout[p]]:null;}
 function tablesOn(p){const a=active(p);return a?a.tables:[];}
@@ -136,7 +141,7 @@ async function init(){try{const h=await J('/api/health');document.getElementById
  s.innerHTML=ds.map(d=>'<option>'+d+'</option>').join('');s.onchange=()=>selectDoc(s.value);
  document.getElementById('pagejump').onchange=e=>scrollToPage(+e.target.value);
  selectDoc(ds[0]);}
-async function selectDoc(n){docName=n;doc=await J('/api/doc/'+enc(n));layoutData={};activeLayout={};sel=null;nodes=[];cur=null;seq=0;
+async function selectDoc(n){docName=n;doc=await J('/api/doc/'+enc(n));layoutData={};activeLayout={};clusterRegions={};picked=new Set();sel=null;nodes=[];cur=null;seq=0;
  document.getElementById('npages').textContent=doc.pages.length;curPage=doc.pages[0].page;buildViewer();renderPanel();}
 
 function buildViewer(){const v=document.getElementById('viewer');v.innerHTML='';
@@ -162,11 +167,14 @@ function drawOverlays(p){const slot=document.querySelector('.pageslot[data-page=
    h+='<div class="ov'+(sel===r.id?' sel':'')+'" style="left:'+r.box.left+'%;top:'+r.box.top+'%;width:'+r.box.width+'%;height:'+r.box.height+'%;border-color:'+STATUS[st]+'" onclick="pick(\''+r.id+'\')"><span class="tag" style="background:'+STATUS[st]+'">'+LABEL[st]+'</span></div>';});
  othersOn(p).forEach(e=>{const col=LAYCOLOR[e.label]||'#888';
    h+='<div class="lay" style="left:'+e.box.left+'%;top:'+e.box.top+'%;width:'+e.box.width+'%;height:'+e.box.height+'%;border-color:'+col+'"><span class="laytag" style="background:'+col+'">'+e.label+' '+Math.round(e.conf*100)+'%</span></div>';});
+ const cn=node(cur);
+ (clusterRegions[p]||[]).forEach((cr,i)=>{const seld=cn&&cn.result.atype==='region'&&Math.abs(cn.result.box.left-cr.box.left)<3&&Math.abs(cn.result.box.top-cr.box.top)<3;
+   h+='<div class="ov'+(seld?' sel':'')+'" style="left:'+cr.box.left+'%;top:'+cr.box.top+'%;width:'+cr.box.width+'%;height:'+cr.box.height+'%;border-color:#2563eb;border-style:solid" onclick="pickCluster('+p+','+i+')"><span class="tag" style="background:#2563eb">⋈ '+cr.k+'/'+cr.n+' models</span></div>';});
  ov.innerHTML=h;}
 
 // --- the operation graph: Page -(layout)-> Region -(extract)-> table -> ... ---
 
-function selectPage(p){curPage=p;sel=null;nodes=[];cur=null;seq=0;
+function selectPage(p){curPage=p;sel=null;nodes=[];cur=null;seq=0;picked=new Set();
  const pg={id:seq++,parent:null,result:{atype:'page',method:'page',status:'idle',input:'Page p.'+p,page:p}};nodes.push(pg);
  cur=pg.id;document.getElementById('pagejump').value=p;drawOverlays(p);renderPanel();}
 
@@ -185,11 +193,42 @@ async function runLayout(op,pageId){const p=node(pageId).result.page;
 // Show one model's detection on the page (cards in the Page detail switch models).
 function activateLayout(p,op){if(!(layoutData[p]||{})[op])return;activeLayout[p]=op;drawOverlays(p);renderPanel();}
 
+// MERGE at the layout level: cluster the Table boxes the run models detected by
+// overlap (IoU). A box ≥2 models agree on is a high-confidence consensus region;
+// boxes only one model found (e.g. a clipped detection) are the minority — dropped.
+function bIoU(a,b){const ix0=Math.max(a[0],b[0]),iy0=Math.max(a[1],b[1]),ix1=Math.min(a[2],b[2]),iy1=Math.min(a[3],b[3]);
+ if(ix1<=ix0||iy1<=iy0)return 0;const inter=(ix1-ix0)*(iy1-iy0);
+ return inter/((a[2]-a[0])*(a[3]-a[1])+(b[2]-b[0])*(b[3]-b[1])-inter);}
+function mergeLayouts(pageId){const p=node(pageId).result.page,runs=layoutData[p]||{},N=Object.keys(runs).length;
+ const items=[];Object.entries(runs).forEach(([op,d])=>d.tables.forEach(t=>items.push({op,bbox:t.bbox,box:t.box})));
+ const clusters=[];
+ items.forEach(it=>{let c=clusters.find(cl=>cl.some(x=>bIoU(x.bbox,it.bbox)>=0.5));if(!c){c=[];clusters.push(c);}c.push(it);});
+ clusterRegions[p]=[];let single=0;
+ clusters.forEach(cl=>{const ops=[...new Set(cl.map(x=>x.op))];if(ops.length<2){single++;return;}
+   // consensus box = per-edge median across agreeing models (majority vote per
+   // coordinate — robust to one clipped or inflated detection).
+   const bb=[0,1,2,3].map(k=>med(cl.map(x=>x.bbox[k])));
+   const box={left:med(cl.map(x=>x.box.left)),top:med(cl.map(x=>x.box.top)),
+     width:med(cl.map(x=>x.box.width)),height:med(cl.map(x=>x.box.height))};
+   clusterRegions[p].push({box,bbox:bb,models:ops.map(o=>LAYOUT_NAME[o]||o),k:ops.length,n:N});});
+ drawOverlays(p);
+ if(clusterRegions[p].length)pickCluster(p,0);else renderPanel();
+ const m=document.getElementById('ppmsg');if(m)m.textContent='merged '+clusterRegions[p].length+' region(s) across '+N+' models'+(single?' · '+single+' box(es) found by only one model — dropped':'');}
+
+// Click a consensus region -> materialize it as a Region artifact (merge-located).
+function pickCluster(p,idx){const cr=(clusterRegions[p]||[])[idx];if(!cr)return;sel=null;
+ let pg=nodes.find(n=>n.result.atype==='page'&&n.result.page===p);
+ if(!pg){nodes=[];seq=0;picked=new Set();pg={id:seq++,parent:null,result:{atype:'page',method:'page',status:'idle',input:'Page p.'+p,page:p}};nodes.push(pg);}
+ let reg=children(pg.id).find(n=>n.result.atype==='region'&&Math.abs(n.result.box.top-cr.box.top)<3&&Math.abs(n.result.box.left-cr.box.left)<3);
+ if(!reg){reg={id:seq++,parent:pg.id,result:{atype:'region',opkind:'merge',method:'merge ('+cr.models.join(' + ')+')',
+   status:'located',label:'Table',bbox:cr.bbox,box:cr.box,page:p,conf:cr.k/cr.n,agreed:cr.models,agreedN:cr.n}};nodes.push(reg);}
+ cur=reg.id;drawOverlays(p);renderPanel();}
+
 // Click a region -> attach to its Page node (create on a cold click), select it.
 // No auto-parse: the Region just offers parse options.
 function pick(id){const r=tableById(id);if(!r)return;sel=id;
  let pg=nodes.find(n=>n.result.atype==='page'&&n.result.page===r.page);
- if(!pg){nodes=[];seq=0;pg={id:seq++,parent:null,result:{atype:'page',method:'page',status:'idle',input:'Page p.'+r.page,page:r.page}};nodes.push(pg);}
+ if(!pg){nodes=[];seq=0;picked=new Set();pg={id:seq++,parent:null,result:{atype:'page',method:'page',status:'idle',input:'Page p.'+r.page,page:r.page}};nodes.push(pg);}
  let reg=children(pg.id).find(n=>n.result.atype==='region'&&Math.abs(n.result.box.top-r.box.top)<3&&Math.abs(n.result.box.left-r.box.left)<3);
  if(!reg){reg={id:seq++,parent:pg.id,result:{atype:'region',opkind:'layout',method:LAYOUT_NAME[r.src]||'layout',status:'located',label:r.label||'Table',bbox:r.bbox,box:r.box,page:r.page,conf:r.conf}};nodes.push(reg);}
  cur=reg.id;
@@ -250,12 +289,33 @@ function renderPanel(){const p=document.getElementById('panel');
 function renderGraph(){const g=document.getElementById('graph');if(!g)return;
  if(!nodes.length){g.innerHTML='';return;}
  const roots=nodes.filter(n=>n.parent==null);
- g.innerHTML='<div class="dim" style="margin-bottom:6px"><b>Page</b> —<span style="color:#0a8">(layout)</span>→ <b>Region</b> —<span style="color:#3f7a8c">(extract)</span>→ <b>table</b> —<span style="color:#7a4fa3">(transform)</span>→ … &nbsp; boxes are artifacts, arrows are operations.</div>'+roots.map(n=>nodeRow(n,0)).join('');}
+ g.innerHTML='<div class="dim" style="margin-bottom:6px"><b>Page</b> —<span style="color:#0a8">(layout)</span>→ <b>Region</b> —<span style="color:#3f7a8c">(extract)</span>→ <b>table</b> —<span style="color:#7a4fa3">(transform)</span>→ … &nbsp; check ☑ two+ <b>regions</b> to <span style="color:#2563eb">⋈ merge</span> their boxes.</div>'+roots.map(n=>nodeRow(n,0)).join('')+mergeBar();}
+
+// Hand-picked region merge: the checked region detections fold into one consensus
+// box (per-edge median) whose parents are exactly those nodes — they stay in the graph.
+function togglePick(id){picked.has(id)?picked.delete(id):picked.add(id);renderPanel();}
+function mergeBar(){if(picked.size<2)return '';
+ return '<div class="esc"><button class="btn" style="background:#2563eb;border-color:#2563eb" onclick="mergePicked()">⋈ merge '+picked.size+' selected regions</button> <button class="btn ghost" onclick="picked=new Set();renderPanel()">clear selection</button></div>';}
+
+function mergePicked(){const ns=[...picked].map(node).filter(Boolean);if(ns.length>=2)mergeRegionNodes(ns);}
+
+function mergeRegionNodes(ns){const page=ns[0].result.page;
+ const box={left:med(ns.map(n=>n.result.box.left)),top:med(ns.map(n=>n.result.box.top)),
+   width:med(ns.map(n=>n.result.box.width)),height:med(ns.map(n=>n.result.box.height))};
+ const bbox=[0,1,2,3].map(k=>med(ns.map(n=>n.result.bbox[k])));
+ const models=ns.map(n=>n.result.method);
+ let pg=nodes.find(n=>n.result.atype==='page'&&n.result.page===page)||node(ns[0].parent);
+ const reg={id:seq++,parent:pg?pg.id:null,parents:[...picked],result:{atype:'region',opkind:'merge',
+   method:'merge ('+models.join(' + ')+')',status:'located',label:'Table',bbox,box,page,
+   conf:1,agreed:models,agreedN:models.length}};
+ nodes.push(reg);cur=reg.id;picked=new Set();drawOverlays(page);renderPanel();}
 function nodeRow(n,depth){const r=n.result,isPage=r.atype==='page',isReg=r.atype==='region';let h='';
  if(!isPage)h+='<div class="edge k-'+(r.opkind||'extract')+'" style="margin-left:'+(depth*16+8)+'px">└─('+r.method+')→</div>';
+ const mergeable=r.atype==='region';
  h+='<div class="tn'+(n.id===cur?' sel':'')+(isPage?' tn-src':'')+(isReg?' tn-region':'')+'" style="margin-left:'+(depth*16)+'px" onclick="cur='+n.id+';renderPanel()">'+
+   (mergeable?'<input type="checkbox" title="select to merge regions" '+(picked.has(n.id)?'checked':'')+' onclick="event.stopPropagation();togglePick('+n.id+')" style="margin:0 2px 0 0;cursor:pointer">':'')+
    (isPage?'📄 ':(isReg?'▭ ':''))+'<b>'+artifactLabel(r)+'</b>'+
-   (isPage?'':(isReg?(r.conf?' <span class="dim">'+Math.round(r.conf*100)+'%</span>':'')
+   (isPage?'':(isReg?(r.agreed?' <span class="dim" style="color:#2563eb">⋈ '+r.agreed.length+'/'+r.agreedN+'</span>':(r.conf?' <span class="dim">'+Math.round(r.conf*100)+'%</span>':''))
      :' '+badge(r.status)+'<span class="dim" style="margin-left:auto">⏱'+(r.seconds||0)+'s · $'+(r.dollars||0).toFixed(2)+'</span>'))+'</div>';
  children(n.id).forEach(c=>h+=nodeRow(c,depth+1));
  return h;}
@@ -272,9 +332,10 @@ function renderDetail(){const d=document.getElementById('det');if(!d)return;
    d.innerHTML='<div class="card"><h4>📄 <b>'+artifactLabel(r)+'</b></h4>'+
    '<div class="dim" style="margin-top:4px">the page artifact — detect its layout with a model below, then click a Region to extract a table</div>'+cards+'</div>'+renderNext(me);return;}
  if(r.atype==='region'){const parent=(me.parent!=null)?node(me.parent):null;
-   d.innerHTML='<div class="card"><h4>▭ <b>'+artifactLabel(r)+'</b>'+(r.conf?' <span class="dim">'+Math.round(r.conf*100)+'% conf</span>':'')+'</h4>'+
-     '<div class="costline">'+(parent?artifactLabel(parent.result)+' —('+r.method+')→ ':'')+'Region · bbox ['+r.bbox.map(v=>Math.round(v)).join(', ')+']</div>'+
-     '<div class="dim" style="margin-top:3px">located by <b>'+r.method+'</b> (layout) — extract a table from it:</div></div>'+renderNext(me);return;}
+   d.innerHTML='<div class="card"><h4>▭ <b>'+artifactLabel(r)+'</b>'+
+     (r.agreed?' <span class="badge" style="background:#2563eb">⋈ '+r.agreed.length+'/'+r.agreedN+' models agree</span>':(r.conf?' <span class="dim">'+Math.round(r.conf*100)+'% conf</span>':''))+'</h4>'+
+     '<div class="costline">'+(parent?artifactLabel(parent.result)+' —('+(r.opkind==='merge'?'layout ⋈':r.method)+')→ ':'')+'Region · bbox ['+r.bbox.map(v=>Math.round(v)).join(', ')+']</div>'+
+     '<div class="dim" style="margin-top:3px">'+(r.agreed?'merged box from <b>'+r.agreed.join('</b>, <b>')+'</b> (per-edge median of their boxes) — extract a table from it:':'located by <b>'+r.method+'</b> (layout) — extract a table from it:')+'</div></div>'+renderNext(me);return;}
  const parent=(me.parent!=null)?node(me.parent):null;
  let h='<div class="card"><h4><b>'+artifactLabel(r)+'</b> '+badge(r.status)+'</h4>';
  h+='<div class="costline">'+(parent?artifactLabel(parent.result)+' —('+r.method+')→ '+artifactLabel(r)+' · ':'')+'⏱ '+(r.seconds||0)+'s · $'+(r.dollars||0).toFixed(2)+(r.recon!=null?' · reconstruction error '+r.recon:'')+'</div>';
@@ -293,10 +354,12 @@ function renderNext(n){const r=n.result,nx=nextOps(n),isPage=r.atype==='page';
  if(auto)return '<div class="esc"><span class="spin">escalating…</span></div>';
  if(!nx.length)return GOOD(r.status)?'<div class="esc"><span class="ok">✓ '+(r.status==='typed'?'materialized':'validated')+'</span></div>'
    :(['region','page'].includes(r.atype)?'':'<div class="esc"><span class="dim">no further operations apply</span></div>');
- const fn=isPage?'runLayout':'runOp';
- let h='<div class="esc"><div class="dim" style="margin-bottom:6px">'+(isPage?'detect layout — pick a model (each produces Region artifacts):':r.atype==='region'?'extract a table from this region:':GOOD(r.status)?'✓ validated — you can:':'flagged — apply an operation (produces a new artifact):')+'</div>';
- nx.forEach((c,i)=>{const sym=c.kind==='layout'?' ▦':c.kind==='transform'?' ✎':(c.kind==='validate'?' ◉':' ⤢');
+ let h='<div class="esc"><div class="dim" style="margin-bottom:6px">'+(isPage?'detect layout — pick a model (each produces Region artifacts):':r.atype==='region'?'extract a table from this region — or reconcile several methods:':GOOD(r.status)?'✓ validated — you can:':'flagged — apply an operation (produces a new artifact):')+'</div>';
+ nx.forEach((c,i)=>{const sym=c.kind==='layout'?' ▦':c.kind==='transform'?' ✎':c.kind==='validate'?' ◉':' ⤢';
+   const fn=isPage?'runLayout':'runOp';
    h+='<button class="'+(i===0&&!isPage?'btn':'btn ghost')+'" style="margin:0 6px 6px 0" title="'+c.reason.replace(/"/g,'&quot;')+'" onclick="'+fn+'(\''+c.op+'\','+n.id+')">('+c.op+')→'+sym+'</button>';});
+ if(isPage){const nm=Object.keys(layoutData[r.page]||{}).length;
+   if(nm>=2)h+='<button class="btn" style="margin:0 6px 6px 0;background:#2563eb;border-color:#2563eb" title="cluster the table boxes the run models agree on (IoU≥0.5); ≥2 agreeing = one merged region (per-edge median box)" onclick="mergeLayouts('+n.id+')">⋈ merge regions ('+nm+' models run)</button>';}
  if(!isPage&&!GOOD(r.status)&&nx.some(c=>c.op!=='materialize'))h+='<button class="btn ghost" onclick="autoFrom('+n.id+')">⚡ Auto until valid</button>';
  h+='<div class="dim" style="margin-top:4px">'+nx.map(c=>'<b>'+c.op+'</b> — '+c.reason).join('<br>')+'</div></div>';
  return h;}
