@@ -70,7 +70,7 @@ def _load_env():
 _load_env()
 DH = "0" * 64
 VISION_RATE, VISION_TIME = 0.02, 1.2
-BUILD = "guarded-transforms-32"  # bump on server changes; shown in the UI header to verify what's running
+BUILD = "no-canon-33"  # bump on server changes; shown in the UI header to verify what's running
 
 INPUT_DIR = os.path.join(REPO, "input")
 # Friendlier display names for known files; any other PDF shows as its path under input/.
@@ -802,7 +802,6 @@ OPS: dict[str, Operation] = {o.name: o for o in [
     Operation("Docling",     OpKind.EXTRACT, _RG, _TB, reads="PDF (direct, per page)"),
     # transform: Table -> Table / Typed  (consume the artifact's own content)
     Operation("markdown",    OpKind.TRANSFORM, _TB, _TB, label="grid → markdown → table"),
-    Operation("canonicalize", OpKind.TRANSFORM, _TB, _TB, label="clean structure (rejoin $/() columns, drop empties)"),
     Operation("sign-fix",    OpKind.TRANSFORM, _TB, _TB, label="reinterpret signs (parens / CR / DR → signed)"),
     Operation("materialize", OpKind.TRANSFORM, _TB, _TY, label="HtmlTable → typed columns"),
     # merge: [Region…] -> Region  (agree on a bbox across layout models; runs client-side)
@@ -935,12 +934,10 @@ def route(r: OpResult, tried: list[str]) -> list[dict]:
     if "no column reconciles" in sigs or "rows sum to" in sigs:
         if "CR" in html or "DR" in html:
             add("sign-fix", "totals fail and CR/DR markers present — reinterpret signs")
-        add("canonicalize", "totals fail — rejoin split $/() columns, then re-check")
         add("Docling", "totals don't reconcile — re-parse structure from the PDF")
     if "no column headers" in sigs:
         add("Docling", "header row looks like data — re-parse from the PDF")
     if "non-numeric" in sigs:
-        add("canonicalize", "stray $/() in a numeric column — rejoin it structurally")
         add("Docling", "stray text in a numeric column — re-parse from the PDF")
     if status == "missing":
         for op in ("text-table", "markdown", "Docling"):
@@ -987,38 +984,6 @@ def api_parse():
             r = _artifact(op, explain_grid(grid, page), tt.to_html(grid), time.monotonic()-t0, markdown=md)
         else:
             r = _missing(op, time.monotonic()-t0, "no parent grid to re-express as markdown")
-
-    elif method == "canonicalize":  # TRANSFORM: clean split-off $/() columns + empties
-        t0 = time.monotonic()
-        src = grid_from_html(parent_html)
-        if not src:
-            r = _missing(op, time.monotonic()-t0, "no parent grid to canonicalize")
-        else:
-            cleaned, changes = tt.canonicalize(src)
-            secs = time.monotonic()-t0
-            if not changes:
-                r = _artifact(op, explain_grid(src, page), tt.to_html(src), secs,
-                              note="already canonical — nothing to rejoin")
-            else:
-                base_q, _ = _grid_quality(src, page)
-                new_q, new_ev = _grid_quality(cleaned, page)
-                delta = _delta_note(base_q, new_q)
-                # Evidence-guided: only KEEP the cleanup if it didn't make the table
-                # worse. A transform that doesn't improve isn't worth applying.
-                if new_q >= base_q:
-                    improved = new_q > base_q
-                    note = "; ".join(changes) + " — " + (
-                        ("improved: " + delta) if improved else "structural only (evidence unchanged)")
-                    ev = dict(new_ev)
-                    ev["signals"] = list(ev.get("signals", [])) + [
-                        {"positive": improved, "detail": "canonicalize " + (delta if improved else "did not change the evidence")}]
-                    r = _artifact(op, ev, tt.to_html(cleaned), secs, note=note)
-                else:
-                    ev = dict(explain_grid(src, page))
-                    ev["signals"] = list(ev.get("signals", [])) + [
-                        {"positive": False, "detail": "canonicalize skipped — would regress (" + delta + ")"}]
-                    r = _artifact(op, ev, tt.to_html(src), secs,
-                                  note="skipped: rejoining columns would reduce quality (" + delta + ") — kept the original")
 
     elif method == "sign-fix":  # TRANSFORM: rewrite the parent grid's accounting signs
         t0 = time.monotonic()
