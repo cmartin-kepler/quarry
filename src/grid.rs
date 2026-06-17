@@ -34,6 +34,33 @@ fn is_symbol_only(s: &str) -> bool {
     !t.is_empty() && t.chars().all(|c| SYMS.contains(c))
 }
 
+/// The **column coalescer**. Project every word onto the x-axis and merge spans
+/// whose horizontal gap is smaller than `col_gap` into one occupied interval; the
+/// holes between intervals are the column separators.
+///
+/// Intent — why this and not "cluster the word x0s":
+/// - A column is defined by a real **whitespace gap**, so two words closer than
+///   `col_gap` (e.g. "Total revenue") stay in ONE cell rather than splitting.
+/// - It works on the words' full x-SPAN, so **right-aligned numbers** of different
+///   widths (a wide "1,234" and a narrow "9" sharing a right edge) land in ONE
+///   column. Clustering left edges (x0) would scatter them — the classic failure
+///   that makes naive table reconstruction shred numeric columns.
+///
+/// Returns the column intervals left-to-right.
+pub fn column_intervals(words: &[Word], col_gap: f32) -> Vec<(f32, f32)> {
+    let mut by_x: Vec<&Word> = words.iter().collect();
+    by_x.sort_by(|a, b| a.bbox.x0.partial_cmp(&b.bbox.x0).unwrap());
+    let mut occ: Vec<(f32, f32)> = Vec::new();
+    for w in by_x {
+        let (x0, x1) = (w.bbox.x0, w.bbox.x1);
+        match occ.last_mut() {
+            Some(last) if x0 <= last.1 + col_gap => last.1 = last.1.max(x1),
+            _ => occ.push((x0, x1)),
+        }
+    }
+    occ
+}
+
 /// Cluster a region's words into a table by GEOMETRY: rows by vertical position,
 /// columns by gaps in the horizontal word projection. Geometry never splits a
 /// word (words are atomic) and column boundaries are real whitespace gaps.
@@ -70,18 +97,8 @@ pub fn structure_words(words: &[Word], row_tol: f32, col_gap: f32) -> Structured
         }
     }
 
-    // --- columns: merge word x-spans within col_gap → occupied intervals; the
-    //     holes between them are the column separators ---
-    let mut by_x: Vec<usize> = (0..words.len()).collect();
-    by_x.sort_by(|&a, &b| words[a].bbox.x0.partial_cmp(&words[b].bbox.x0).unwrap());
-    let mut occ: Vec<(f32, f32)> = Vec::new();
-    for &i in &by_x {
-        let (x0, x1) = (words[i].bbox.x0, words[i].bbox.x1);
-        match occ.last_mut() {
-            Some(last) if x0 <= last.1 + col_gap => last.1 = last.1.max(x1),
-            _ => occ.push((x0, x1)),
-        }
-    }
+    // --- columns: the column coalescer (intent documented on `column_intervals`) ---
+    let occ = column_intervals(words, col_gap);
     let ncol = occ.len();
 
     let colof = |cx: f32| -> usize {
@@ -597,5 +614,129 @@ mod tests {
         assert_eq!(structure_words(&[], 3.0, 6.0).rows.len(), 0);
         assert_eq!(words_to_ascii(&[]), "");
         assert_eq!(median_bbox(&[]), None);
+    }
+
+    // ---- The column coalescer: what it's FOR (one column = one whitespace gap) ----
+
+    /// Words closer than the gap belong to the SAME cell — "Total revenue" is one
+    /// label, not two columns.
+    #[test]
+    fn coalescer_keeps_words_closer_than_the_gap_in_one_column() {
+        let ws = vec![w("Total", 0.0, 30.0, 0.0), w("revenue", 33.0, 80.0, 0.0)];
+        assert_eq!(column_intervals(&ws, 6.0).len(), 1);
+    }
+
+    /// A real whitespace gap (≥ col_gap) is a column boundary.
+    #[test]
+    fn coalescer_splits_words_separated_by_more_than_the_gap() {
+        let ws = vec![w("Left", 0.0, 30.0, 0.0), w("Right", 100.0, 130.0, 0.0)];
+        assert_eq!(column_intervals(&ws, 6.0).len(), 2);
+    }
+
+    /// THE point of using x-spans not x0s: right-aligned numbers of different
+    /// widths (a wide "1,234" and a narrow "9" sharing the right edge) are ONE
+    /// column. x0-clustering would have split them into two.
+    #[test]
+    fn coalescer_keeps_right_aligned_numbers_in_one_column() {
+        let ws = vec![w("1,234", 100.0, 140.0, 0.0), w("9", 132.0, 140.0, 20.0)];
+        assert_eq!(column_intervals(&ws, 6.0).len(), 1);
+        // and their left edges differ by 32pt — far more than col_gap — so this is
+        // genuinely the alignment case, not just "they happened to be close".
+        assert!((ws[0].bbox.x0 - ws[1].bbox.x0).abs() > 6.0);
+    }
+
+    /// One interval per real column: a label column + two number columns.
+    #[test]
+    fn coalescer_finds_one_interval_per_column() {
+        let ws = vec![
+            w("Item", 0.0, 40.0, 0.0),
+            w("100", 100.0, 140.0, 0.0),
+            w("200", 200.0, 240.0, 0.0),
+        ];
+        assert_eq!(column_intervals(&ws, 6.0).len(), 3);
+    }
+
+    // ---- structure_words: the intent of each behaviour ----
+
+    /// A multi-word label stays a single cell (the coalescer at work inside
+    /// structuring) — not shredded across columns.
+    #[test]
+    fn structure_keeps_a_multi_word_label_as_one_cell() {
+        let words = vec![
+            w("Item", 0.0, 40.0, 0.0),
+            w("Q1", 100.0, 130.0, 0.0),
+            w("Q2", 200.0, 230.0, 0.0),
+            w("Total", 0.0, 30.0, 20.0),
+            w("revenue", 33.0, 80.0, 20.0),
+            w("10", 100.0, 120.0, 20.0),
+            w("20", 200.0, 220.0, 20.0),
+        ];
+        let s = structure_words(&words, 3.0, 6.0);
+        assert_eq!(s.rows[0].len(), 3, "label + two numeric columns");
+        assert_eq!(texts(&s)[1][0], "Total revenue");
+    }
+
+    /// A `$`/`(` split into its own thin column rejoins the number to its RIGHT, so
+    /// the value still reads as currency / a negative instead of leaving a phantom
+    /// symbol column.
+    #[test]
+    fn structure_rejoins_a_split_dollar_onto_the_number_to_its_right() {
+        let words = vec![
+            w("Item", 0.0, 30.0, 0.0),
+            w("Amount", 100.0, 150.0, 0.0),
+            w("A", 0.0, 10.0, 20.0),
+            w("$", 80.0, 86.0, 20.0), // its own column, 14pt left of the number
+            w("3,367", 100.0, 140.0, 20.0),
+        ];
+        let row = &texts(&structure_words(&words, 3.0, 6.0))[1];
+        assert!(row.iter().any(|c| c.contains("3,367")));
+        assert!(!row.iter().any(|c| c == "$"), "the lone $ column should have merged right");
+    }
+
+    /// A closing `)` split into its own column rejoins the number to its LEFT
+    /// (`$`/`(` go right, `)` goes left) — so split accounting negatives reunite.
+    #[test]
+    fn structure_rejoins_a_split_close_paren_onto_the_number_to_its_left() {
+        let words = vec![
+            w("Item", 0.0, 40.0, 0.0),
+            w("Loss", 100.0, 140.0, 0.0),
+            w("A", 0.0, 10.0, 20.0),
+            w("902", 100.0, 140.0, 20.0),
+            w(")", 150.0, 156.0, 20.0),
+        ];
+        let row = &texts(&structure_words(&words, 3.0, 6.0))[1];
+        assert!(row.iter().any(|c| c == "902)"), "got {row:?}");
+        assert!(!row.iter().any(|c| c == ")"), "the lone ) column should have merged left");
+    }
+
+    // ---- sign-fix / markdown: intent (re-express, don't reshape) ----
+
+    /// sign-fix changes only the SIGN representation — never the table's shape,
+    /// labels, or non-accounting cells.
+    #[test]
+    fn sign_fix_changes_only_signs_not_the_table_shape() {
+        let grid = vec![
+            vec!["Item".to_string(), "A".into(), "B".into()],
+            vec!["x".into(), "(5)".into(), "10".into()],
+        ];
+        let (out, changed) = sign_fix(&grid);
+        assert_eq!(out.len(), grid.len(), "same number of rows");
+        assert_eq!(out[0], grid[0], "header row untouched");
+        assert_eq!(out[1][0], "x", "label untouched");
+        assert_eq!(out[1][1], "-5", "the negative is rewritten");
+        assert_eq!(out[1][2], "10", "the positive is left alone");
+        assert_eq!(changed, 1);
+    }
+
+    /// markdown is a LOSSLESS re-expression: round-tripping a grid through it
+    /// returns the same cells. (It exists to re-detect structure, not to edit data.)
+    #[test]
+    fn markdown_is_a_lossless_re_expression_of_the_grid() {
+        let grid = vec![
+            vec!["Seg".to_string(), "Rev".into()],
+            vec!["A".into(), "10".into()],
+            vec!["B".into(), "(20)".into()],
+        ];
+        assert_eq!(markdown_to_grid(&to_markdown(&grid)), grid);
     }
 }

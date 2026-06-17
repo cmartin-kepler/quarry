@@ -575,6 +575,79 @@ mod tests {
         assert!(Merge.extract(ExtractInput::Artifacts(&refs(&[one])), &ctx(&doc)).is_err());
     }
 
+    /// Intent of `text-grid`: it reads the source scoped to the REGION — words
+    /// outside the located box (a footnote below the table) must not leak in.
+    #[test]
+    fn text_grid_reads_only_words_inside_the_region() {
+        let page = Page {
+            page: 1,
+            width: 600.0,
+            height: 800.0,
+            spans: vec![
+                span("In", 0.0, 0.0, 20.0, 10.0),
+                span("box", 100.0, 0.0, 140.0, 10.0),
+                span("footnote", 0.0, 500.0, 80.0, 510.0), // well below the region
+            ],
+            table_regions: vec![TableRegion { bbox: [0.0, 0.0, 200.0, 60.0], note: None, figure_score: 0.0 }],
+        };
+        let doc = QDoc { format: DocFormat::Pdf, pages: vec![page] };
+        let dh = DocHash::of(b"scoped");
+        let cx = ctx(&doc);
+        let anchor = SourceAnchor::Pdf { doc: dh, page: 1, bbox: BBox::new(0.0, 0.0, 600.0, 800.0) };
+        let regions = RegionLayout.extract(ExtractInput::DocumentRegion { doc: dh, anchor }, &cx).unwrap();
+        let grids = TextGridExtractor.extract(ExtractInput::Artifacts(&refs(&regions)), &cx).unwrap();
+        let tg = grids[0].as_any().downcast_ref::<TextGrid>().unwrap();
+        let words: Vec<&str> = tg.words.iter().map(|w| w.text.as_str()).collect();
+        assert!(words.contains(&"In") && words.contains(&"box"));
+        assert!(!words.contains(&"footnote"), "words outside the region must be excluded");
+    }
+
+    /// Intent of `merge`: when detections AGREE, the consensus region is their
+    /// shared box (agreement → one region, not an argument).
+    #[test]
+    fn merge_collapses_agreeing_detections_to_their_shared_box() {
+        let dh = DocHash::of(b"d");
+        let mk = |bbox: BBox| -> Box<dyn Artifact> {
+            let anchor = SourceAnchor::Pdf { doc: dh, page: 1, bbox };
+            Box::new(Region {
+                meta: meta(hash_str(&format!("{bbox:?}")), Provenance::Source(anchor), Generation(0), RiskMarkers::default()),
+                label: "Table".into(),
+                confidence: 1.0,
+            })
+        };
+        let same = BBox::new(50.0, 100.0, 540.0, 300.0);
+        let regions = vec![mk(same), mk(same)];
+        let doc = QDoc { format: DocFormat::Pdf, pages: vec![] };
+        let out = Merge.extract(ExtractInput::Artifacts(&refs(&regions)), &ctx(&doc)).unwrap();
+        assert_eq!(out[0].as_any().downcast_ref::<Region>().unwrap().bbox(), same);
+    }
+
+    /// Intent of the graph as a whole: every op APPENDS a derived artifact that
+    /// names its parent(s) and carries a RESOLVED source anchor — so the table a
+    /// claim cites traces back to a box in the original bytes in O(1).
+    #[test]
+    fn the_chain_forms_a_provenance_dag_with_resolved_anchors() {
+        let (doc, dh) = fixture();
+        let cx = ctx(&doc);
+        let anchor = SourceAnchor::Pdf { doc: dh, page: 1, bbox: BBox::new(0.0, 0.0, 600.0, 800.0) };
+        let regions = RegionLayout.extract(ExtractInput::DocumentRegion { doc: dh, anchor }, &cx).unwrap();
+        let region_id = regions[0].id();
+        let grids = TextGridExtractor.extract(ExtractInput::Artifacts(&refs(&regions)), &cx).unwrap();
+        let tg_id = grids[0].id();
+        let tables = Structure.extract(ExtractInput::Artifacts(&refs(&grids)), &cx).unwrap();
+
+        // text-grid derives from the region
+        assert!(matches!(grids[0].provenance(), Provenance::Derived { parents, .. } if parents == &vec![region_id]));
+        // table derives from the text-grid, and its anchor is a resolved PDF box
+        match tables[0].provenance() {
+            Provenance::Derived { parents, anchor } => {
+                assert_eq!(parents, &vec![tg_id]);
+                assert!(matches!(anchor, SourceAnchor::Pdf { doc, .. } if *doc == dh));
+            }
+            _ => panic!("structured table should be Derived"),
+        }
+    }
+
     #[test]
     fn stored_artifact_round_trips_region_and_textgrid() {
         let dh = DocHash::of(b"d");
