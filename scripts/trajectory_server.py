@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["flask>=3", "docling", "pdfplumber>=0.11", "ultralytics", "huggingface_hub", "doclayout-yolo"]
+# dependencies = ["flask>=3", "docling", "pdfplumber>=0.11", "ultralytics", "huggingface_hub", "doclayout-yolo", "pypdf"]
 # ///
 """
 trajectory_server.py - Interactive, ON-DEMAND parsing-trajectory UI.
@@ -54,9 +54,23 @@ import typed_table as typ  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 QUARRY = os.path.join(REPO, "target", "debug", "quarry")
+
+
+def _load_env():
+    """Load REDUCTO_API_KEY / LLAMAPARSE_API_KEY etc. from .env (gitignored)."""
+    p = os.path.join(REPO, ".env")
+    if os.path.exists(p):
+        for line in open(p):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+_load_env()
 DH = "0" * 64
 VISION_RATE, VISION_TIME = 0.02, 1.2
-BUILD = "surya-warm-25"  # bump on server changes; shown in the UI header to verify what's running
+BUILD = "cloud-parse-26"  # bump on server changes; shown in the UI header to verify what's running
 
 INPUT_DIR = os.path.join(REPO, "input")
 # Friendlier display names for known files; any other PDF shows as its path under input/.
@@ -341,6 +355,101 @@ def lite_best_grid(name, page, bbox):
     else:
         why = None
     return best, secs, best_score, why
+
+
+# ---- cloud page parsers (Reducto, LlamaParse) -------------------------------
+# Both parse a page into structured content (Reducto -> HTML tables, LlamaParse ->
+# markdown pipe tables); we pull the tables out, match the one over the region, and
+# validate it the same way as every other extractor. Cost is real $ (per page).
+
+def match_region_grid(name, page, bbox, grids):
+    """Pick the grid best matching the region by token overlap (same scoring as
+    lite_best_grid). Returns (grid|None, score)."""
+    pg = pdf(name).pages[page-1]
+    x0, top, x1, bottom = bbox
+    cr = pg.crop((max(0, x0), max(0, top), min(pg.width, x1), min(pg.height, bottom)))
+    ref = tokens(" ".join(w["text"] for w in cr.extract_words()))
+    best, best_inter, best_score = None, -1, 0.0
+    for g in grids:
+        gt = tokens(" ".join(c for row in g for c in row))
+        inter = len(ref & gt)
+        score = max(inter / (len(gt) + 1e-9), inter / (len(ref) + 1e-9))
+        if score >= 0.5 and inter > best_inter:
+            best, best_inter, best_score = g, inter, score
+    return best, best_score
+
+
+def grids_from_content(content):
+    """Tables in a parser's page output: HTML <table> blocks (Reducto) AND
+    pipe/space-aligned tables (LlamaParse / text)."""
+    grids = []
+    for m in re.findall(r"<table.*?</table>", content or "", re.S | re.I):
+        g, _ = rv.parse_html_grid(m)
+        if g and len(g) >= 2:
+            grids.append([[c.strip() for c in row] for row in g])
+    grids += tt.detect_tables(content or "")
+    return grids
+
+
+_page_pdf, _provider = {}, {}
+
+
+def single_page_pdf(name, page):
+    """Extract page `page` as a 1-page PDF, so a cloud parse bills for one page."""
+    key = (name, page)
+    if key not in _page_pdf:
+        from pypdf import PdfReader, PdfWriter
+        w = PdfWriter(); w.add_page(PdfReader(DOCS[name]).pages[page-1])
+        out = os.path.join(_wd, f"pg_{abs(hash(name))}_{page}.pdf")
+        with open(out, "wb") as f:
+            w.write(f)
+        _page_pdf[key] = out
+    return _page_pdf[key]
+
+
+def _curl_json(args, timeout=180):
+    r = subprocess.run(["curl", "-s", "--max-time", str(timeout)] + args,
+                       capture_output=True, text=True, timeout=timeout + 10)
+    if not r.stdout.strip():
+        raise RuntimeError((r.stderr or "no response")[:200])
+    return json.loads(r.stdout)
+
+
+def reducto_content(name, page):
+    key = ("reducto", name, page)
+    if key not in _provider:
+        api = os.environ.get("REDUCTO_API_KEY")
+        if not api:
+            raise RuntimeError("REDUCTO_API_KEY not set (.env)")
+        path = single_page_pdf(name, page)
+        up = _curl_json(["-X", "POST", "https://platform.reducto.ai/upload",
+                         "-H", f"Authorization: Bearer {api}", "-F", f"file=@{path}"])
+        body = json.dumps({"document_url": up["file_id"], "options": {"chunking": {"chunk_mode": "page"}}})
+        d = _curl_json(["-X", "POST", "https://platform.reducto.ai/parse",
+                        "-H", f"Authorization: Bearer {api}", "-H", "Content-Type: application/json", "-d", body])
+        _provider[key] = "\n".join(c.get("content", "") for c in d.get("result", {}).get("chunks", []))
+    return _provider[key]
+
+
+def llamaparse_content(name, page):
+    key = ("llamaparse", name, page)
+    if key not in _provider:
+        api = os.environ.get("LLAMAPARSE_API_KEY")
+        if not api:
+            raise RuntimeError("LLAMAPARSE_API_KEY not set (.env)")
+        path = single_page_pdf(name, page)
+        base = "https://api.cloud.llamaindex.ai/api/v1/parsing"
+        auth = ["-H", f"Authorization: Bearer {api}"]
+        jid = _curl_json(["-X", "POST", f"{base}/upload", *auth, "-F", f"file=@{path}"])["id"]
+        for _ in range(60):
+            st = _curl_json([*auth, f"{base}/job/{jid}"]).get("status")
+            if st == "SUCCESS":
+                break
+            if st == "ERROR":
+                raise RuntimeError("LlamaParse job failed")
+            time.sleep(2)
+        _provider[key] = _curl_json([*auth, f"{base}/job/{jid}/result/markdown"]).get("markdown", "")
+    return _provider[key]
 
 
 # ---- API -------------------------------------------------------------------
@@ -636,6 +745,8 @@ OPS: dict[str, Operation] = {o.name: o for o in [
     Operation("cheap",       OpKind.EXTRACT, _RG, _TB, reads="PDF text-layer (glyph boxes)"),
     Operation("text-table",  OpKind.EXTRACT, _RG, _TB, reads="LiteParse space-aligned text"),
     Operation("Docling",     OpKind.EXTRACT, _RG, _TB, reads="PDF (direct, per page)"),
+    Operation("reducto",     OpKind.EXTRACT, _RG, _TB, reads="Reducto API (cloud, ~$0.015/pg)"),
+    Operation("llamaparse",  OpKind.EXTRACT, _RG, _TB, reads="LlamaParse API (cloud, ~$0.0013/pg)"),
     # transform: Table -> Table / Typed  (consume the artifact's own content)
     Operation("markdown",    OpKind.TRANSFORM, _TB, _TB, label="grid → markdown → table"),
     Operation("sign-fix",    OpKind.TRANSFORM, _TB, _TB, label="reinterpret signs (parens / CR / DR → signed)"),
@@ -798,6 +909,21 @@ def api_parse():
         else:
             err, png = recon_for(name, page, bbox, t["html"])
             r = _artifact(op, t["ev"], t["html"], dl["secs"], recon=err, detail=png)
+
+    elif method in ("reducto", "llamaparse"):  # EXTRACT via a cloud parser (real $/page)
+        t0 = time.monotonic()
+        dollars = 0.015 if method == "reducto" else 0.0013
+        try:
+            content = reducto_content(name, page) if method == "reducto" else llamaparse_content(name, page)
+            best, _score = match_region_grid(name, page, bbox, grids_from_content(content))
+        except Exception as e:  # noqa: BLE001 — network / key / quota
+            r = _missing(op, time.monotonic()-t0, f"{method} unavailable: {str(e)[:140]}")
+        else:
+            if best:
+                r = _artifact(op, explain_grid(best, page), tt.to_html(best), time.monotonic()-t0)
+            else:
+                r = _missing(op, time.monotonic()-t0, "cloud parser returned no table overlapping this region")
+            r.dollars = dollars
 
     elif method == "vision":  # VALIDATE: an evidence patch merged onto the table (no new artifact)
         r = OpResult(method=op.name, kind=op.kind.value, input=op.input, status="verified",

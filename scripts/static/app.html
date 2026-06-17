@@ -91,11 +91,13 @@ details img{max-width:100%;border:1px solid var(--line);border-radius:8px;margin
 const STATUS={confirmed:'#1a5a40',ok:'#3f7a8c',suspect:'#b4453a',figure:'#7a4fa3',missing:'#b07515',verified:'#1a8a6a',typed:'#1a5a40',located:'#0a8',idle:'#9aa39e'};
 const LABEL={confirmed:'reconciles',ok:'no issues',suspect:'suspect',figure:'figure',missing:'no table',verified:'verified',typed:'typed',located:'region',idle:'table'};
 const LAYCOLOR={Text:'#9aa39e',Title:'#1a5a40','Section-header':'#3f7a8c',Table:'#0a7',Picture:'#7a4fa3',Caption:'#b07515','List-item':'#7fb89a',Formula:'#b4453a','Page-header':'#c4c4c4','Page-footer':'#c4c4c4',Footnote:'#c4c4c4'};
-const OPKIND={cheap:'extract','text-table':'extract',Docling:'extract',markdown:'transform','sign-fix':'transform',materialize:'transform',vision:'validate'};
-const TABLEART={cheap:'HTML table',Docling:'HTML table','text-table':'text grid',markdown:'markdown table','sign-fix':'signed table'};
+const OPKIND={cheap:'extract','text-table':'extract',Docling:'extract',reducto:'extract',llamaparse:'extract',markdown:'transform','sign-fix':'transform',materialize:'transform',vision:'validate'};
+const TABLEART={cheap:'HTML table',Docling:'HTML table','text-table':'text grid',reducto:'table (Reducto)',llamaparse:'table (LlamaParse)',markdown:'markdown table','sign-fix':'signed table'};
 const EXTRACTORS=[{op:'cheap',kind:'extract',reason:'parse the PDF text layer in this region (cheapest)'},
                   {op:'text-table',kind:'extract',reason:'parse LiteParse space-aligned text'},
-                  {op:'Docling',kind:'extract',reason:'parse table structure from the PDF'}];
+                  {op:'Docling',kind:'extract',reason:'parse table structure from the PDF'},
+                  {op:'reducto',kind:'extract',reason:'Reducto cloud parser (~$0.015/page)'},
+                  {op:'llamaparse',kind:'extract',reason:'LlamaParse cloud parser (~$0.0013/page)'}];
 const LAYOUT_OPS=[
  {op:'find_tables',kind:'layout',reason:'geometric: ruled lines + text-aligned columns'},
  {op:'yolo26',kind:'layout',reason:'YOLO26 learned layout (DocLayNet)'},
