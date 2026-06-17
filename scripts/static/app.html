@@ -91,8 +91,8 @@ details img{max-width:100%;border:1px solid var(--line);border-radius:8px;margin
 const STATUS={confirmed:'#1a5a40',ok:'#3f7a8c',suspect:'#b4453a',figure:'#7a4fa3',missing:'#b07515',verified:'#1a8a6a',typed:'#1a5a40',located:'#0a8',idle:'#9aa39e'};
 const LABEL={confirmed:'reconciles',ok:'no issues',suspect:'suspect',figure:'figure',missing:'no table',verified:'verified',typed:'typed',located:'region',idle:'table'};
 const LAYCOLOR={Text:'#9aa39e',Title:'#1a5a40','Section-header':'#3f7a8c',Table:'#0a7',Picture:'#7a4fa3',Caption:'#b07515','List-item':'#7fb89a',Formula:'#b4453a','Page-header':'#c4c4c4','Page-footer':'#c4c4c4',Footnote:'#c4c4c4'};
-const OPKIND={cheap:'extract','text-table':'extract',Docling:'extract',reducto:'extract',llamaparse:'extract',markdown:'transform','sign-fix':'transform',materialize:'transform',vision:'validate'};
-const TABLEART={cheap:'HTML table',Docling:'HTML table','text-table':'text grid',reducto:'table (Reducto)',llamaparse:'table (LlamaParse)',markdown:'markdown table','sign-fix':'signed table'};
+const OPKIND={cheap:'extract','text-table':'extract',Docling:'extract',reducto:'extract',llamaparse:'extract',markdown:'transform',canonicalize:'transform','sign-fix':'transform',materialize:'transform',vision:'validate'};
+const TABLEART={cheap:'HTML table',Docling:'HTML table','text-table':'text grid',reducto:'table (Reducto)',llamaparse:'table (LlamaParse)',markdown:'markdown table',canonicalize:'cleaned table','sign-fix':'signed table'};
 const EXTRACTORS=[{op:'cheap',kind:'extract',reason:'parse the PDF text layer in this region (cheapest)'},
                   {op:'text-table',kind:'extract',reason:'parse LiteParse space-aligned text'},
                   {op:'Docling',kind:'extract',reason:'parse table structure from the PDF'}];
@@ -117,6 +117,8 @@ let docName=null,doc=null,layoutData={},activeLayout={},sel=null,nodes=[],cur=nu
 let clusterRegions={};
 // Artifacts the user has check-marked in the graph to merge by hand.
 let picked=new Set();
+// Per typed-node: show the tidy/melted shape instead of wide.
+let tidyOn={};
 const med=xs=>{const s=[...xs].sort((a,b)=>a-b),m=s.length>>1;return s.length%2?s[m]:(s[m-1]+s[m])/2;};
 
 function active(p){const m=layoutData[p];return m?m[activeLayout[p]]:null;}
@@ -141,7 +143,7 @@ async function init(){try{const h=await J('/api/health');document.getElementById
  s.innerHTML=ds.map(d=>'<option>'+d+'</option>').join('');s.onchange=()=>selectDoc(s.value);
  document.getElementById('pagejump').onchange=e=>scrollToPage(+e.target.value);
  selectDoc(ds[0]);}
-async function selectDoc(n){docName=n;doc=await J('/api/doc/'+enc(n));layoutData={};activeLayout={};clusterRegions={};picked=new Set();sel=null;nodes=[];cur=null;seq=0;
+async function selectDoc(n){docName=n;doc=await J('/api/doc/'+enc(n));layoutData={};activeLayout={};clusterRegions={};picked=new Set();tidyOn={};sel=null;nodes=[];cur=null;seq=0;
  document.getElementById('npages').textContent=doc.pages.length;curPage=doc.pages[0].page;buildViewer();renderPanel();}
 
 function buildViewer(){const v=document.getElementById('viewer');v.innerHTML='';
@@ -174,7 +176,7 @@ function drawOverlays(p){const slot=document.querySelector('.pageslot[data-page=
 
 // --- the operation graph: Page -(layout)-> Region -(extract)-> table -> ... ---
 
-function selectPage(p){curPage=p;sel=null;nodes=[];cur=null;seq=0;picked=new Set();
+function selectPage(p){curPage=p;sel=null;nodes=[];cur=null;seq=0;picked=new Set();tidyOn={};
  const pg={id:seq++,parent:null,result:{atype:'page',method:'page',status:'idle',input:'Page p.'+p,page:p}};nodes.push(pg);
  cur=pg.id;document.getElementById('pagejump').value=p;drawOverlays(p);renderPanel();}
 
@@ -343,7 +345,7 @@ function renderDetail(){const d=document.getElementById('det');if(!d)return;
  if(r.checks&&r.checks.length)h+='<div class="dim" style="margin-top:3px">✓ validated by '+r.checks.map(c=>'<b>'+c.op+'</b> ('+(+c.seconds).toFixed(2)+'s · $'+(+c.dollars).toFixed(2)+')').join(', ')+'</div>';
  if(r.note)h+='<div class="dim" style="margin-top:6px">'+r.note+'</div>';
  if(r.markdown)h+='<details open style="margin:8px 0"><summary>grid → markdown (re-parsed into the table below)</summary><pre class="mono" style="font-size:11px;white-space:pre;overflow-x:auto;background:var(--g50);padding:8px;border-radius:6px;margin:6px 0 0">'+r.markdown.replace(/</g,"&lt;")+'</pre></details>';
- if(r.typed)h+=typedHtml(r.typed);
+ if(r.typed)h+=typedHtml(r.typed,me.id);
  else if(r.html)h+='<div class="tbl">'+r.html+'</div>';
  (r.signals||[]).forEach(s=>h+='<div class="sig '+(s.positive?'pos':'neg')+'">'+(s.positive?'✓':'✗')+' <span>'+s.detail+'</span></div>');
  if(r.detail)h+='<details><summary>reconstruction diff — green matched · orange misplaced · red missing</summary><img src="data:image/png;base64,'+r.detail+'"></details>';
@@ -365,15 +367,20 @@ function renderNext(n){const r=n.result,nx=nextOps(n),isPage=r.atype==='page';
  return h;}
 
 const DT={int:'#1a5a40',float:'#1a5a40',currency:'#1a5a40',percent:'#7a4fa3',label:'#9aa39e'};
-function typedHtml(res){
- let h='<div style="margin-top:10px"><div class="dim" style="margin-bottom:4px">⤓ typed table — materialized · '+res.n_rows+' rows · non-reversible (parent HtmlTable retained)</div>';
- h+='<div class="tbl"><table><tr>'+res.columns.map(c=>'<th>'+c.name+'<div class="dt" style="color:'+DT[c.dtype]+'">'+c.dtype+'</div></th>').join('')+'</tr>';
- res.rows.forEach(row=>{h+='<tr>'+row.map(v=>'<td class="'+(typeof v==='number'?'num':'')+'">'+(v===null?'<span class="dim">·</span>':v)+'</td>').join('')+'</tr>';});
+function typedHtml(res,id){
+ const tidy=!!tidyOn[id],view=tidy?res.tidy:res;
+ let h='<div style="margin-top:10px">';
+ h+='<div style="margin-bottom:6px"><button class="btn'+(tidy?' ghost':'')+'" style="margin-right:6px" onclick="tidyOn['+id+']=false;renderPanel()">wide</button>'+
+   '<button class="btn'+(tidy?'':' ghost')+'" onclick="tidyOn['+id+']=true;renderPanel()" title="one value per row, keyed by the label columns — the shape for analysis">tidy (melt)</button>'+
+   (res.sections?'<span class="dim" style="margin-left:8px">▸ nested section headers promoted to a <b>Section</b> column</span>':'')+'</div>';
+ h+='<div class="dim" style="margin-bottom:4px">⤓ typed table — '+(tidy?'tidy/long · ':'')+'materialized · '+view.n_rows+' rows · non-reversible (parent HtmlTable retained)</div>';
+ h+='<div class="tbl"><table><tr>'+view.columns.map(c=>'<th>'+c.name+'<div class="dt" style="color:'+(DT[c.dtype]||'#888')+'">'+c.dtype+'</div></th>').join('')+'</tr>';
+ view.rows.forEach(row=>{h+='<tr>'+row.map(v=>'<td class="'+(typeof v==='number'?'num':'')+'">'+(v===null?'<span class="dim">·</span>':v)+'</td>').join('')+'</tr>';});
  h+='</table></div>';
- const chips=res.columns.filter(c=>Object.keys(c.transforms).length).map(c=>'<b>'+c.name+'</b>: '+Object.entries(c.transforms).map(t=>t[0]+'×'+t[1]).join(', '));
+ const chips=view.columns.filter(c=>Object.keys(c.transforms).length).map(c=>'<b>'+c.name+'</b>: '+Object.entries(c.transforms).map(t=>t[0]+'×'+t[1]).join(', '));
  if(chips.length)h+='<div class="dim" style="margin-top:8px">transforms — '+chips.join(' · ')+'</div>';
- if(res.violations.length)h+='<div class="sig neg" style="margin-top:6px">✗ '+res.violations.length+' violation(s): '+res.violations.slice(0,3).join('; ')+'</div>';
- h+='<details style="margin-top:8px"><summary>DuckDB DDL</summary><pre class="mono" style="font-size:11px;white-space:pre-wrap;margin:6px 0 0">'+res.ddl+'</pre></details></div>';
+ if(view.violations.length)h+='<div class="sig neg" style="margin-top:6px">✗ '+view.violations.length+' violation(s): '+view.violations.slice(0,3).join('; ')+'</div>';
+ h+='<details style="margin-top:8px"><summary>DuckDB DDL</summary><pre class="mono" style="font-size:11px;white-space:pre-wrap;margin:6px 0 0">'+view.ddl+'</pre></details></div>';
  return h;}
 init();
 </script></body></html>

@@ -70,7 +70,7 @@ def _load_env():
 _load_env()
 DH = "0" * 64
 VISION_RATE, VISION_TIME = 0.02, 1.2
-BUILD = "merge-regions-30"  # bump on server changes; shown in the UI header to verify what's running
+BUILD = "canon-tidy-31"  # bump on server changes; shown in the UI header to verify what's running
 
 INPUT_DIR = os.path.join(REPO, "input")
 # Friendlier display names for known files; any other PDF shows as its path under input/.
@@ -802,6 +802,7 @@ OPS: dict[str, Operation] = {o.name: o for o in [
     Operation("Docling",     OpKind.EXTRACT, _RG, _TB, reads="PDF (direct, per page)"),
     # transform: Table -> Table / Typed  (consume the artifact's own content)
     Operation("markdown",    OpKind.TRANSFORM, _TB, _TB, label="grid → markdown → table"),
+    Operation("canonicalize", OpKind.TRANSFORM, _TB, _TB, label="clean structure (rejoin $/() columns, drop empties)"),
     Operation("sign-fix",    OpKind.TRANSFORM, _TB, _TB, label="reinterpret signs (parens / CR / DR → signed)"),
     Operation("materialize", OpKind.TRANSFORM, _TB, _TY, label="HtmlTable → typed columns"),
     # merge: [Region…] -> Region  (agree on a bbox across layout models; runs client-side)
@@ -894,10 +895,12 @@ def route(r: OpResult, tried: list[str]) -> list[dict]:
     if "no column reconciles" in sigs or "rows sum to" in sigs:
         if "CR" in html or "DR" in html:
             add("sign-fix", "totals fail and CR/DR markers present — reinterpret signs")
+        add("canonicalize", "totals fail — rejoin split $/() columns, then re-check")
         add("Docling", "totals don't reconcile — re-parse structure from the PDF")
     if "no column headers" in sigs:
         add("Docling", "header row looks like data — re-parse from the PDF")
     if "non-numeric" in sigs:
+        add("canonicalize", "stray $/() in a numeric column — rejoin it structurally")
         add("Docling", "stray text in a numeric column — re-parse from the PDF")
     if status == "missing":
         for op in ("text-table", "markdown", "Docling"):
@@ -945,6 +948,16 @@ def api_parse():
         else:
             r = _missing(op, time.monotonic()-t0, "no parent grid to re-express as markdown")
 
+    elif method == "canonicalize":  # TRANSFORM: clean split-off $/() columns + empties
+        t0 = time.monotonic()
+        src = grid_from_html(parent_html)
+        if src:
+            grid, changes = tt.canonicalize(src)
+            note = ("; ".join(changes) if changes else "already canonical — nothing to clean")
+            r = _artifact(op, explain_grid(grid, page), tt.to_html(grid), time.monotonic()-t0, note=note)
+        else:
+            r = _missing(op, time.monotonic()-t0, "no parent grid to canonicalize")
+
     elif method == "sign-fix":  # TRANSFORM: rewrite the parent grid's accounting signs
         t0 = time.monotonic()
         src = grid_from_html(parent_html)
@@ -981,18 +994,9 @@ _SQL = {"int": "BIGINT", "float": "DOUBLE", "percent": "DOUBLE",
         "currency": "DOUBLE", "label": "VARCHAR"}
 
 
-@app.post("/api/materialize")
-def api_materialize():
-    """The non-reversible HtmlTable -> TypedTable step: materialize the parsed
-    HTML into typed, math-ready columns (negatives, scale, %, currency resolved)
-    with per-cell provenance. Returns a typed preview + the DuckDB DDL it implies."""
+def _typed_payload(t):
+    """Serialize a TypedTable into the column/row/DDL preview the UI renders."""
     from collections import Counter
-    d = request.get_json()
-    html = d.get("html") or ""
-    try:
-        t = typ.from_html(html)
-    except Exception as e:  # noqa: BLE001
-        return jsonify({"error": str(e)})
     cols = []
     for c in t.columns:
         tf = Counter(x for cell in c.cells for x in cell.transforms)
@@ -1003,8 +1007,29 @@ def api_materialize():
             for r in range(min(t.n_rows, 60))]
     ddl = ("CREATE TABLE t (\n  "
            + ",\n  ".join(f'"{c["name"]}" {c["sql"]}' for c in cols) + "\n);")
-    return jsonify({"columns": cols, "rows": rows, "violations": t.violations,
-                    "n_rows": t.n_rows, "ddl": ddl})
+    return {"columns": cols, "rows": rows, "violations": t.violations,
+            "n_rows": t.n_rows, "ddl": ddl}
+
+
+@app.post("/api/materialize")
+def api_materialize():
+    """The non-reversible HtmlTable -> TypedTable step: materialize the parsed
+    HTML into typed, math-ready columns (negatives, scale, %, currency resolved)
+    with per-cell provenance. Auto-promotes nested section headers to a column, and
+    also returns the tidy/long (melted) shape. Includes the DuckDB DDL each implies."""
+    d = request.get_json()
+    html = d.get("html") or ""
+    try:
+        grid, hdr = rv.parse_html_grid(html)
+        hr = (max(hdr) + 1) if hdr else 1
+        grid, hr, sectioned = typ.section_to_column(grid, hr)
+        t = typ.materialize(grid, hr)
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": str(e)})
+    out = _typed_payload(t)
+    out["sections"] = sectioned
+    out["tidy"] = _typed_payload(t.melt())
+    return jsonify(out)
 
 
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
