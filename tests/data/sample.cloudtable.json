@@ -1,0 +1,14 @@
+{
+  "tables": [
+    {
+      "page": 1, "bbox": [0, 0, 200, 80], "n_rows": 4, "n_cols": 2,
+      "cells": [
+        {"row": 0, "col": 0, "text": "Seg",   "is_header": true},
+        {"row": 0, "col": 1, "text": "Rev",   "is_header": true},
+        {"row": 1, "col": 0, "text": "A"},     {"row": 1, "col": 1, "text": "100"},
+        {"row": 2, "col": 0, "text": "Parks"}, {"row": 2, "col": 1, "text": "220"},
+        {"row": 3, "col": 0, "text": "Total"}, {"row": 3, "col": 1, "text": "320"}
+      ]
+    }
+  ]
+}

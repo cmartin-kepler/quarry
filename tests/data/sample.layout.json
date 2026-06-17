@@ -1,0 +1,6 @@
+{
+  "regions": [
+    {"label": "Table",  "confidence": 0.97, "bbox": [50, 100, 540, 300]},
+    {"label": "Figure", "confidence": 0.88, "bbox": [60, 320, 500, 500]}
+  ]
+}
