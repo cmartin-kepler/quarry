@@ -24,11 +24,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the tier-n extractor and emit artifacts (HTML + manifest) to <out>.
+    /// Run an extractor and emit artifacts (HTML + manifest) to <out>. Choose a
+    /// named op with `--op` (e.g. pdf-text, docling, reducto, yolo26) or a tier;
+    /// sidecars run on `--source` (the original file) if it isn't `file` itself.
     Parse {
         file: PathBuf,
+        #[arg(long)]
+        op: Option<String>,
         #[arg(long, default_value_t = 0)]
         tier: u8,
+        #[arg(long)]
+        source: Option<PathBuf>,
         #[arg(long)]
         out: PathBuf,
     },
@@ -73,7 +79,9 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Command::Parse { file, tier, out } => cmd_parse(&file, tier, &out),
+        Command::Parse { file, op, tier, source, out } => {
+            cmd_parse(&file, op.as_deref(), tier, source.as_deref(), &out)
+        }
         Command::Check { artifact_dir } => cmd_check(&artifact_dir),
         Command::Eval {
             file,
@@ -236,13 +244,36 @@ fn adjudicate_and_store(
         .count())
 }
 
-fn cmd_parse(file: &Path, tier: u8, out: &Path) -> Result<()> {
-    let (doc, doc_hash) = QDoc::load(file)?;
-    let artifacts = pipeline::cheap_parse(&doc, doc_hash, tier)?;
+fn cmd_parse(
+    file: &Path,
+    op: Option<&str>,
+    tier: u8,
+    source: Option<&Path>,
+    out: &Path,
+) -> Result<()> {
+    // A `.qdoc` loads as the native text-layer context; any other file (a real
+    // PDF for a sidecar) gets an empty context + a doc_hash of its bytes.
+    let (doc, doc_hash) = match QDoc::load(file) {
+        Ok(x) => x,
+        Err(_) => {
+            let bytes = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
+            (QDoc { format: quarry::doc::DocFormat::Pdf, pages: vec![] }, quarry::core::DocHash::of(&bytes))
+        }
+    };
+    // sidecars run the tool on `--source`, defaulting to `file` itself.
+    let source_path = Some(source.unwrap_or(file).to_path_buf());
+
+    let extractor = match op {
+        Some(id) => pipeline::extractor_by_id(id)
+            .ok_or_else(|| anyhow::anyhow!("unknown op `{id}`"))?,
+        None => pipeline::extractor_for(doc.format, tier)?,
+    };
+    let artifacts = pipeline::run_document_extractor(&doc, doc_hash, source_path, extractor.as_ref())?;
     let n_tables = adjudicate_and_store(&artifacts, doc_hash, out)?;
     println!(
-        "parsed {} (doc {}) → {} artifact(s), {} table(s) → {}",
+        "parsed {} with `{}` (doc {}) → {} artifact(s), {} table(s) → {}",
         file.display(),
+        op.unwrap_or("pdf-text"),
         doc_hash.short(),
         artifacts.len(),
         n_tables,
