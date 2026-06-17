@@ -30,3 +30,6 @@ __pycache__/
 
 # OCR language data (downloaded by tesseract/liteparse)
 *.traineddata
+
+# ENVIRONMENT VARIABLES
+.env
