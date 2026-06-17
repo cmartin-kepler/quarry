@@ -70,7 +70,7 @@ def _load_env():
 _load_env()
 DH = "0" * 64
 VISION_RATE, VISION_TIME = 0.02, 1.2
-BUILD = "cloud-parse-26"  # bump on server changes; shown in the UI header to verify what's running
+BUILD = "cloud-page-27"  # bump on server changes; shown in the UI header to verify what's running
 
 INPUT_DIR = os.path.join(REPO, "input")
 # Friendlier display names for known files; any other PDF shows as its path under input/.
@@ -362,23 +362,6 @@ def lite_best_grid(name, page, bbox):
 # markdown pipe tables); we pull the tables out, match the one over the region, and
 # validate it the same way as every other extractor. Cost is real $ (per page).
 
-def match_region_grid(name, page, bbox, grids):
-    """Pick the grid best matching the region by token overlap (same scoring as
-    lite_best_grid). Returns (grid|None, score)."""
-    pg = pdf(name).pages[page-1]
-    x0, top, x1, bottom = bbox
-    cr = pg.crop((max(0, x0), max(0, top), min(pg.width, x1), min(pg.height, bottom)))
-    ref = tokens(" ".join(w["text"] for w in cr.extract_words()))
-    best, best_inter, best_score = None, -1, 0.0
-    for g in grids:
-        gt = tokens(" ".join(c for row in g for c in row))
-        inter = len(ref & gt)
-        score = max(inter / (len(gt) + 1e-9), inter / (len(ref) + 1e-9))
-        if score >= 0.5 and inter > best_inter:
-            best, best_inter, best_score = g, inter, score
-    return best, best_score
-
-
 def grids_from_content(content):
     """Tables in a parser's page output: HTML <table> blocks (Reducto) AND
     pipe/space-aligned tables (LlamaParse / text)."""
@@ -450,6 +433,36 @@ def llamaparse_content(name, page):
             time.sleep(2)
         _provider[key] = _curl_json([*auth, f"{base}/job/{jid}/result/markdown"]).get("markdown", "")
     return _provider[key]
+
+
+def _bbox_for_grid(grid, words):
+    """Derive a table's region from where its cell text sits on the PDF page —
+    robust across providers (Reducto gives normalized bboxes, LlamaParse none)."""
+    cells = tokens(" ".join(c for row in grid for c in row))
+    pts = [w for w in words
+           if "".join(ch for ch in w["text"].lower() if ch.isalnum()) in cells]
+    if len(pts) < 3:
+        return None
+    return [min(w["x0"] for w in pts), min(w["top"] for w in pts),
+            max(w["x1"] for w in pts), max(w["bottom"] for w in pts)]
+
+
+def provider_layout(name, page, provider):
+    """Page-level parse: the cloud parser parses the whole page; we surface each
+    table as a Region carrying its already-parsed, validated HtmlTable (so clicking
+    it costs nothing more). Cost is one page-parse, charged once at this step."""
+    content = reducto_content(name, page) if provider == "reducto" else llamaparse_content(name, page)
+    words = pdf(name).pages[page-1].extract_words()
+    out = []
+    for g in grids_from_content(content):
+        bbox = _bbox_for_grid(g, words)
+        if not bbox:
+            continue
+        ev = explain_grid(g, page)
+        out.append({"label": "Table", "conf": 1.0, "bbox": bbox, "html": tt.to_html(g),
+                    "status": status_of(ev), "impression": ev.get("impression"),
+                    "signals": ev.get("signals", [])})
+    return out
 
 
 # ---- API -------------------------------------------------------------------
@@ -631,6 +644,20 @@ def api_layout(name, n):
         try:
             pg = pdf(name).pages[n-1]
             t0 = time.monotonic()
+            if model in ("reducto", "llamaparse"):
+                # Page-level cloud parse: each table region carries its parsed,
+                # validated HtmlTable (+ next ops). Cost is one page ($/page).
+                dollars = 0.015 if model == "reducto" else 0.0013
+                els = []
+                for i, el in enumerate(provider_layout(name, n, model)):
+                    x0, y0, x1, y1 = el["bbox"]
+                    nx = route(OpResult(method=model, kind="extract", input=model,
+                                        status=el["status"], signals=el["signals"], html=el["html"]), [])
+                    els.append({**el, "label": norm_label(el["label"]), "id": f"{model}_p{n}_{i}", "next": nx,
+                                "box": {"left": 100*x0/pg.width, "top": 100*y0/pg.height,
+                                        "width": 100*(x1-x0)/pg.width, "height": 100*(y1-y0)/pg.height}})
+                _layout[key] = {"elements": els, "seconds": round(time.monotonic()-t0, 3), "dollars": dollars}
+                return jsonify({**_layout[key], "model": model})
             if model == "find_tables":
                 # Geometric detection (ruled + text-aligned) — just another model.
                 raw = [{"label": "Table", "conf": 1.0, "bbox": list(b)}
@@ -745,8 +772,6 @@ OPS: dict[str, Operation] = {o.name: o for o in [
     Operation("cheap",       OpKind.EXTRACT, _RG, _TB, reads="PDF text-layer (glyph boxes)"),
     Operation("text-table",  OpKind.EXTRACT, _RG, _TB, reads="LiteParse space-aligned text"),
     Operation("Docling",     OpKind.EXTRACT, _RG, _TB, reads="PDF (direct, per page)"),
-    Operation("reducto",     OpKind.EXTRACT, _RG, _TB, reads="Reducto API (cloud, ~$0.015/pg)"),
-    Operation("llamaparse",  OpKind.EXTRACT, _RG, _TB, reads="LlamaParse API (cloud, ~$0.0013/pg)"),
     # transform: Table -> Table / Typed  (consume the artifact's own content)
     Operation("markdown",    OpKind.TRANSFORM, _TB, _TB, label="grid → markdown → table"),
     Operation("sign-fix",    OpKind.TRANSFORM, _TB, _TB, label="reinterpret signs (parens / CR / DR → signed)"),
@@ -909,21 +934,6 @@ def api_parse():
         else:
             err, png = recon_for(name, page, bbox, t["html"])
             r = _artifact(op, t["ev"], t["html"], dl["secs"], recon=err, detail=png)
-
-    elif method in ("reducto", "llamaparse"):  # EXTRACT via a cloud parser (real $/page)
-        t0 = time.monotonic()
-        dollars = 0.015 if method == "reducto" else 0.0013
-        try:
-            content = reducto_content(name, page) if method == "reducto" else llamaparse_content(name, page)
-            best, _score = match_region_grid(name, page, bbox, grids_from_content(content))
-        except Exception as e:  # noqa: BLE001 — network / key / quota
-            r = _missing(op, time.monotonic()-t0, f"{method} unavailable: {str(e)[:140]}")
-        else:
-            if best:
-                r = _artifact(op, explain_grid(best, page), tt.to_html(best), time.monotonic()-t0)
-            else:
-                r = _missing(op, time.monotonic()-t0, "cloud parser returned no table overlapping this region")
-            r.dollars = dollars
 
     elif method == "vision":  # VALIDATE: an evidence patch merged onto the table (no new artifact)
         r = OpResult(method=op.name, kind=op.kind.value, input=op.input, status="verified",

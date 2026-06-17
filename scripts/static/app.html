@@ -95,16 +95,16 @@ const OPKIND={cheap:'extract','text-table':'extract',Docling:'extract',reducto:'
 const TABLEART={cheap:'HTML table',Docling:'HTML table','text-table':'text grid',reducto:'table (Reducto)',llamaparse:'table (LlamaParse)',markdown:'markdown table','sign-fix':'signed table'};
 const EXTRACTORS=[{op:'cheap',kind:'extract',reason:'parse the PDF text layer in this region (cheapest)'},
                   {op:'text-table',kind:'extract',reason:'parse LiteParse space-aligned text'},
-                  {op:'Docling',kind:'extract',reason:'parse table structure from the PDF'},
-                  {op:'reducto',kind:'extract',reason:'Reducto cloud parser (~$0.015/page)'},
-                  {op:'llamaparse',kind:'extract',reason:'LlamaParse cloud parser (~$0.0013/page)'}];
+                  {op:'Docling',kind:'extract',reason:'parse table structure from the PDF'}];
 const LAYOUT_OPS=[
  {op:'find_tables',kind:'layout',reason:'geometric: ruled lines + text-aligned columns'},
  {op:'yolo26',kind:'layout',reason:'YOLO26 learned layout (DocLayNet)'},
  {op:'doclayout',kind:'layout',reason:'DocLayout-YOLO (DocStructBench)'},
  {op:'docling',kind:'layout',reason:'Docling layout model'},
- {op:'surya',kind:'layout',reason:'Surya — VLM layout + reading order (sidecar; slow on CPU)'}];
-const LAYOUT_NAME={find_tables:'find_tables',yolo26:'YOLO26 layout',doclayout:'DocLayout-YOLO',docling:'Docling layout',surya:'Surya layout'};
+ {op:'surya',kind:'layout',reason:'Surya — VLM layout + reading order (sidecar; slow on CPU)'},
+ {op:'reducto',kind:'layout',reason:'Reducto cloud page parse (~$0.015/page; tables come parsed)'},
+ {op:'llamaparse',kind:'layout',reason:'LlamaParse cloud page parse (~$0.0013/page; tables come parsed)'}];
+const LAYOUT_NAME={find_tables:'find_tables',yolo26:'YOLO26 layout',doclayout:'DocLayout-YOLO',docling:'Docling layout',surya:'Surya layout',reducto:'Reducto parse',llamaparse:'LlamaParse parse'};
 const enc=encodeURIComponent;
 const GOOD=s=>['ok','confirmed','verified','typed'].includes(s);
 async function J(u,o){return (await fetch(u,o)).json();}
@@ -175,11 +175,12 @@ async function runLayout(op,pageId){const p=node(pageId).result.page;
  const det=document.getElementById('det');if(det)det.insertAdjacentHTML('afterbegin','<div class="card"><span class="spin">layout: '+LAYOUT_NAME[op]+' on p.'+p+' …</span></div>');
  const res=await J('/api/layout/'+enc(docName)+'/'+p+'?model='+op);
  if(res.error){const m=document.getElementById('det');if(m)m.insertAdjacentHTML('afterbegin','<div class="card dim">layout unavailable: '+res.error+'</div>');return;}
- const tabs=res.elements.filter(e=>e.label==='Table').map(t=>({id:t.id,page:p,bbox:t.bbox,box:t.box,src:op,label:'Table',conf:t.conf}));
+ const tabs=res.elements.filter(e=>e.label==='Table').map(t=>({id:t.id,page:p,bbox:t.bbox,box:t.box,src:op,label:'Table',conf:t.conf,
+   html:t.html,status:t.status,impression:t.impression,signals:t.signals,next:t.next}));
  const others=res.elements.filter(e=>e.label!=='Table');
- (layoutData[p]=layoutData[p]||{})[op]={model:LAYOUT_NAME[op],tables:tabs,others,secs:res.seconds};
+ (layoutData[p]=layoutData[p]||{})[op]={model:LAYOUT_NAME[op],tables:tabs,others,secs:res.seconds,dollars:res.dollars};
  activateLayout(p,op);
- const m=document.getElementById('ppmsg');if(m)m.textContent=LAYOUT_NAME[op]+': '+tabs.length+' table(s) · '+others.length+' other element(s) in '+(+res.seconds).toFixed(2)+'s';}
+ const m=document.getElementById('ppmsg');if(m)m.textContent=LAYOUT_NAME[op]+': '+tabs.length+' table(s) · '+others.length+' other element(s) in '+(+res.seconds).toFixed(2)+'s'+(res.dollars?' · $'+(+res.dollars).toFixed(4):'');}
 
 // Show one model's detection on the page (cards in the Page detail switch models).
 function activateLayout(p,op){if(!(layoutData[p]||{})[op])return;activeLayout[p]=op;drawOverlays(p);renderPanel();}
@@ -191,7 +192,13 @@ function pick(id){const r=tableById(id);if(!r)return;sel=id;
  if(!pg){nodes=[];seq=0;pg={id:seq++,parent:null,result:{atype:'page',method:'page',status:'idle',input:'Page p.'+r.page,page:r.page}};nodes.push(pg);}
  let reg=children(pg.id).find(n=>n.result.atype==='region'&&Math.abs(n.result.box.top-r.box.top)<3&&Math.abs(n.result.box.left-r.box.left)<3);
  if(!reg){reg={id:seq++,parent:pg.id,result:{atype:'region',opkind:'layout',method:LAYOUT_NAME[r.src]||'layout',status:'located',label:r.label||'Table',bbox:r.bbox,box:r.box,page:r.page,conf:r.conf}};nodes.push(reg);}
- cur=reg.id;drawOverlays(r.page);renderPanel();}
+ cur=reg.id;
+ // Cloud page-parsers (Reducto/LlamaParse) already parsed + validated this table —
+ // attach it as a child for free instead of asking which extractor to run.
+ if(r.html&&!children(reg.id).length){
+   const res={atype:'table',opkind:'extract',method:r.src,input:LAYOUT_NAME[r.src],status:r.status,impression:r.impression,signals:r.signals||[],html:r.html,seconds:0,dollars:0,next:r.next||[]};
+   const nd={id:seq++,parent:reg.id,result:res};nodes.push(nd);cur=nd.id;}
+ drawOverlays(r.page);renderPanel();}
 
 // Apply an op. Extractors read the source at the Region's bbox (parent = Region);
 // transforms/validators consume the artifact (parent = it).
@@ -259,7 +266,7 @@ function renderDetail(){const d=document.getElementById('det');if(!d)return;
  if(r.atype==='page'){const runs=layoutData[r.page]||{};
    const cards=Object.keys(runs).length?('<div class="dim" style="margin:10px 0 4px">detected layouts — click a model to show it on the page:</div>'+
      Object.entries(runs).map(([op,dd])=>'<div class="lcard'+(activeLayout[r.page]===op?' active':'')+'" onclick="activateLayout('+r.page+',\''+op+'\')">'+
-       '<b>'+dd.model+'</b><span class="dim"> · '+dd.tables.length+' table(s) · '+dd.others.length+' other · '+(+dd.secs).toFixed(2)+'s</span>'+
+       '<b>'+dd.model+'</b><span class="dim"> · '+dd.tables.length+' table(s) · '+dd.others.length+' other · '+(+dd.secs).toFixed(2)+'s'+(dd.dollars?' · $'+(+dd.dollars).toFixed(4):'')+'</span>'+
        (activeLayout[r.page]===op?'<span style="margin-left:auto;color:#0a8">● shown</span>':'')+'</div>').join(''))
      :'';
    d.innerHTML='<div class="card"><h4>📄 <b>'+artifactLabel(r)+'</b></h4>'+
