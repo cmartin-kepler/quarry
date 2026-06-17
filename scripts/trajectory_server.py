@@ -56,7 +56,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 QUARRY = os.path.join(REPO, "target", "debug", "quarry")
 DH = "0" * 64
 VISION_RATE, VISION_TIME = 0.02, 1.2
-BUILD = "surya-22"  # bump on server changes; shown in the UI header to verify what's running
+BUILD = "surya-warm-25"  # bump on server changes; shown in the UI header to verify what's running
 
 INPUT_DIR = os.path.join(REPO, "input")
 # Friendlier display names for known files; any other PDF shows as its path under input/.
@@ -378,6 +378,88 @@ def api_doc(name):
 
 
 
+# Persistent Surya sidecar: a long-lived server process (isolated env) that loads
+# the VLM once, so per-call cost is just inference rather than a model reload.
+_surya = {"proc": None, "url": None}
+
+
+def ensure_surya():
+    if _surya["url"]:
+        return _surya["url"]
+    import socket
+    import urllib.request
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "surya_layout.py")
+    log = open(os.path.join(_wd, "surya_server.log"), "w")
+    # New session so we can kill the whole group (surya server + its llama-server).
+    _surya["proc"] = subprocess.Popen(["uv", "run", script, "--serve", str(port)],
+                                      stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    url = f"http://127.0.0.1:{port}"
+    for _ in range(900):  # first run downloads the model; wait generously
+        if _surya["proc"].poll() is not None:
+            raise RuntimeError("surya server exited (is llama.cpp installed?) — see surya_server.log")
+        try:
+            urllib.request.urlopen(url + "/health", timeout=2)
+            _surya["url"] = url
+            print(f"  surya server ready at {url}", flush=True)
+            return url
+        except Exception:  # noqa: BLE001 — not ready yet
+            time.sleep(1)
+    raise RuntimeError("surya server did not become ready in time")
+
+
+import atexit
+import signal
+
+
+def _descendants(pid):
+    """All transitive child pids of `pid` (llama-server is a grandchild of the
+    `uv run` process, and may be in a different group, so kill the whole tree)."""
+    out = subprocess.run(["ps", "-Ao", "pid=,ppid="], capture_output=True, text=True).stdout
+    kids = {}
+    for line in out.splitlines():
+        try:
+            c, p = (int(x) for x in line.split())
+        except ValueError:
+            continue
+        kids.setdefault(p, []).append(c)
+    seen, stack = [], [pid]
+    while stack:
+        for c in kids.get(stack.pop(), []):
+            seen.append(c); stack.append(c)
+    return seen
+
+
+@atexit.register
+def _stop_surya():
+    p = _surya.get("proc")
+    if not (p and p.poll() is None):
+        return
+    pids = _descendants(p.pid) + [p.pid]   # collect before killing (ppids change after)
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+        time.sleep(1.0)
+
+
+def surya_layout(name, n):
+    """Render page n, POST it to the warm Surya server, return its layout boxes."""
+    import urllib.request
+    url = ensure_surya()
+    rr = 150
+    tmp = os.path.join(_wd, f"surya_{abs(hash(name))}_{n}.png")
+    pdf(name).pages[n-1].to_image(resolution=rr).save(tmp)
+    req = urllib.request.Request(url + "/layout", data=json.dumps({"path": tmp}).encode(),
+                                 headers={"Content-Type": "application/json"})
+    boxes = json.loads(urllib.request.urlopen(req, timeout=300).read())
+    scale = 72.0 / rr
+    return [{"label": b["label"], "conf": b.get("conf", 1.0),
+             "bbox": [v*scale for v in b["bbox"]]} for b in boxes]
+
+
 def crop_table(name, page, bbox):
     """Region-scoped cheap extraction: build a grid from the text inside the
     region's bbox (text strategy first, ruled-line fallback). This makes the
@@ -446,18 +528,9 @@ def api_layout(name, n):
                        for b, _nc, _src in detect_regions(pg)]
                 secs = time.monotonic()-t0
             elif model == "surya":
-                # Sidecar: heavy VLM detector run in an isolated env (first call
-                # downloads the model; failures degrade to "layout unavailable").
-                rr = 150
-                tmp = os.path.join(_wd, f"surya_{abs(hash(name))}_{n}.png")
-                pdf(name).pages[n-1].to_image(resolution=rr).save(tmp)
-                script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "surya_layout.py")
-                proc = subprocess.run(["uv", "run", script, tmp], capture_output=True, text=True, timeout=900)
-                if proc.returncode != 0 or not proc.stdout.strip():
-                    raise RuntimeError((proc.stderr or "surya produced no output")[-200:].strip())
-                scale = 72.0 / rr
-                raw = [{"label": b["label"], "conf": b.get("conf", 1.0),
-                        "bbox": [v*scale for v in b["bbox"]]} for b in json.loads(proc.stdout)]
+                # Warm sidecar server (isolated env, model loaded once). First call
+                # spawns it + downloads the model; failures -> "layout unavailable".
+                raw = surya_layout(name, n)
                 secs = time.monotonic()-t0
             elif model == "docling":
                 # Docling's layout comes from the full conversion, so its cost IS
@@ -819,6 +892,10 @@ if __name__ == "__main__":
         print(f"Kill it first:  pkill -f trajectory_server   (or use a different PORT=…)\n", flush=True)
         sys.exit(1)
     probe.close()
+    # pkill sends SIGTERM, which atexit doesn't catch — so stop the surya sidecar
+    # (and its llama-server) explicitly on signals too.
+    for _sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(_sig, lambda *_: (_stop_surya(), sys.exit(0)))
     print(f"trajectory_server build={BUILD}", flush=True)
     warmup()
     print(f"open http://127.0.0.1:{port}   (build {BUILD})", flush=True)
