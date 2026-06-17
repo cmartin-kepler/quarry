@@ -76,17 +76,21 @@ def parse_number(raw: str) -> Num | None:
     tf: list[str] = []
     neg = False
 
-    if t.startswith("(") and ")" in t:
-        neg = True
-        t = t[1:t.rfind(")")]
-        tf.append("paren→neg")
-
+    # Strip currency FIRST: a cell can be "$ (902)" (currency then paren) just as
+    # easily as "($902)", so the paren-negative test must run on the currency-free
+    # string or "$ (902)" slips through as unparseable.
     currency = False
     if any(c in t for c in CURRENCY):
         currency = True
         for c in CURRENCY:
             t = t.replace(c, "")
+        t = t.strip()
         tf.append("strip currency")
+
+    if t.startswith("(") and ")" in t:
+        neg = True
+        t = t[1:t.rfind(")")]
+        tf.append("paren→neg")
 
     percent = False
     if t.strip().endswith("%"):
@@ -150,10 +154,11 @@ class ProvCell:
 
 @dataclass
 class Column:
-    name: str
+    name: str                   # flattened name (the levels joined) — for SQL/display
     dtype: str                  # "int" | "float" | "percent" | "currency" | "label"
     values: list                # coerced to dtype (None = null)
     cells: list[ProvCell]
+    levels: list = field(default_factory=list)  # the multi-index path, e.g. ["2024", "Q1"]
 
 
 @dataclass
@@ -186,6 +191,33 @@ class TypedTable:
             out.append("  materialization violations:")
             out += [f"    - {v}" for v in self.violations]
         return "\n".join(out)
+
+    # -- reshape ------------------------------------------------------------
+    def melt(self) -> "TypedTable":
+        """Tidy/long form: keep the label (non-numeric) columns as identifiers and
+        unpivot every numeric column into ('variable', 'value') pairs — one row per
+        original cell. The shape analysts actually want (one value per row, groupable
+        by variable). Numeric dtypes collapse to a single 'value' float column."""
+        ids = [c for c in self.columns if c.dtype == "label"]
+        vals = [c for c in self.columns if c.dtype != "label"]
+        if not vals:
+            return self
+        id_cols = [Column(c.name, "label", [], []) for c in ids]
+        var_col = Column("variable", "label", [], [])
+        val_col = Column("value", "float", [], [])
+        for r in range(self.n_rows):
+            for vc in vals:
+                v = vc.values[r] if r < len(vc.values) else None
+                if v is None:
+                    continue
+                for ic, src in zip(id_cols, ids):
+                    sv = src.values[r] if r < len(src.values) else None
+                    ic.values.append(sv); ic.cells.append(ProvCell(sv, sv or "", []))
+                var_col.values.append(vc.name); var_col.cells.append(ProvCell(vc.name, vc.name, []))
+                fv = float(v)
+                val_col.values.append(fv)
+                val_col.cells.append(ProvCell(fv, str(v), ["melt"]))
+        return TypedTable(id_cols + [var_col, val_col], source=self.source)
 
     # -- exporters ----------------------------------------------------------
     def _schema(self):
@@ -221,19 +253,22 @@ class TypedTable:
 # ---------------------------------------------------------------------------
 
 def _column_name(grid, header_rows, c, used):
-    parts = []
+    """Return (flattened name, levels). `levels` is the column's multi-index path —
+    the stacked header cells above it (deduped, top to bottom). The flat name is the
+    levels joined (uniquified), for SQL/display; the levels keep the hierarchy."""
+    levels = []
     for r in range(header_rows):
         if c < len(grid[r]):
             t = grid[r][c].strip()
-            if t and t not in parts:
-                parts.append(t)
-    name = " ".join(parts).strip() or f"col_{c}"
+            if t and t not in levels:
+                levels.append(t)
+    name = " ".join(levels).strip() or f"col_{c}"
     base, i = name, 2
     while name in used:
         name = f"{base}_{i}"
         i += 1
     used.add(name)
-    return name
+    return name, levels
 
 
 def materialize(grid: list[list[str]], header_rows: int = 1,
@@ -253,7 +288,7 @@ def materialize(grid: list[list[str]], header_rows: int = 1,
         nums = [i for i in meaningful if parsed[i] is not None]
 
         is_numeric = bool(nums) and len(nums) * 2 >= len(meaningful)  # majority parse
-        name = _column_name(grid, header_rows, c, used)
+        name, levels = _column_name(grid, header_rows, c, used)
 
         if is_numeric:
             is_percent = sum(1 for i in nums if parsed[i].percent) * 2 >= len(nums)
@@ -287,18 +322,60 @@ def materialize(grid: list[list[str]], header_rows: int = 1,
                 cells.append(ProvCell(v, s, p.transforms, box, ok=True))
                 values.append(v)
 
-        columns.append(Column(name, dtype, values, cells))
+        columns.append(Column(name, dtype, values, cells, levels=levels))
 
     return TypedTable(columns, source=source, violations=violations)
 
 
-def from_html(html: str, header_rows: int | None = None, source: dict | None = None) -> TypedTable:
+# ---------------------------------------------------------------------------
+# 4. Reshaping: section-to-column (un-nest group headers) and tidy/melt
+# ---------------------------------------------------------------------------
+
+def _is_section_row(row, ncols) -> bool:
+    """A group-header row: a non-empty first cell, every other cell blank, and the
+    label itself isn't a number (so a one-number row isn't mistaken for a header)."""
+    if not row or not row[0].strip():
+        return False
+    if parse_number(row[0]) is not None:
+        return False
+    return all(not (row[c].strip() if c < len(row) else "") for c in range(1, ncols))
+
+
+def section_to_column(grid, header_rows=1):
+    """Promote nested section headers to a real column. A row that is just a label
+    with no values (e.g. 'Revenues:') heads the rows beneath it until the next such
+    row; we drop those header rows and prepend a 'Section' column carrying the group
+    onto every data row. Returns (grid, header_rows, found). No-op (found=False) when
+    the table isn't sectioned, so it's always safe to apply."""
+    ncols = max((len(r) for r in grid), default=0)
+    body = grid[header_rows:]
+    secrows = [i for i, r in enumerate(body) if _is_section_row(r, ncols)]
+    # need ≥1 section header that actually groups rows beneath it
+    if not secrows or secrows == list(range(len(secrows))):
+        return grid, header_rows, False
+
+    out = [["Section"] + [(grid[r][c].strip() if c < len(grid[r]) else "")
+                          for c in range(ncols)] for r in range(header_rows)]
+    cur = ""
+    for r in body:
+        cells = [(r[c].strip() if c < len(r) else "") for c in range(ncols)]
+        if _is_section_row(r, ncols):
+            cur = cells[0]
+            continue
+        out.append([cur] + cells)
+    return out, header_rows, True
+
+
+def from_html(html: str, header_rows: int | None = None, source: dict | None = None,
+              sections: bool = False) -> TypedTable:
     """Materialize directly from an HtmlTable's HTML, reusing the reconstruction
     validator's dense-grid parser (so rowspan/colspan are expanded consistently)."""
     sys.path.insert(0, __file__.rsplit("/", 1)[0])
     import recon_validate as rv
     grid, hdr = rv.parse_html_grid(html)
     hr = header_rows if header_rows is not None else (max(hdr) + 1 if hdr else 1)
+    if sections:
+        grid, hr, _ = section_to_column(grid, hr)
     return materialize(grid, hr, source=source)
 
 

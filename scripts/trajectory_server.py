@@ -14,8 +14,9 @@ via page_range, then vision) — each timed live. The lineage graph builds up no
 by node as you escalate.
 
 Methods are path-dependent (different representations):
-  cheap geometric (PDF text-layer) · text-table (LiteParse text) ·
-  Docling (PDF, per-page) · vision verify (image)
+  cheap geometric (PDF text-layer) · text-table (region text → a text-grid you
+  then `structure` into columns by word geometry) · Docling (PDF, per-page) ·
+  vision verify (image)
 
 Run (deps declared inline via PEP 723, so plain uv run works):
   uv run scripts/trajectory_server.py            # -> http://127.0.0.1:5050
@@ -70,7 +71,7 @@ def _load_env():
 _load_env()
 DH = "0" * 64
 VISION_RATE, VISION_TIME = 0.02, 1.2
-BUILD = "cloud-bbox-28"  # bump on server changes; shown in the UI header to verify what's running
+BUILD = "liteparse-textgrid-37"  # bump on server changes; shown in the UI header to verify what's running
 
 INPUT_DIR = os.path.join(REPO, "input")
 # Friendlier display names for known files; any other PDF shows as its path under input/.
@@ -226,7 +227,6 @@ def recon_for(name, page, bbox, html):
 # ---- on-demand parsing (each runs live, measures real time) ----------------
 
 
-
 def ensure_lite(name):
     if name not in _lite:
         t = time.monotonic()
@@ -236,16 +236,17 @@ def ensure_lite(name):
             r = sh(["lit", "parse", DOCS[name], "--format", "json", "-o", js, "-q"])
             lj = json.load(open(js))
             text = {p["page"]: p["text"] for p in lj["pages"]}
+            items = {p["page"]: p.get("textItems", []) for p in lj["pages"]}
             n_pages = len(lj["pages"])
         except FileNotFoundError:
             err = "the `lit` (LiteParse) CLI is not on the server's PATH"
-            text, n_pages = {}, len(pdf(name).pages)
+            text, items, n_pages = {}, {}, len(pdf(name).pages)
         except Exception as e:  # noqa: BLE001 — bad/empty lit output
             err = f"LiteParse failed: {(r.stderr if 'r' in dir() else str(e))[:120]}"
-            text, n_pages = {}, len(pdf(name).pages)
+            text, items, n_pages = {}, {}, len(pdf(name).pages)
         if err:
             print(f"[lite] {name}: {err}", flush=True)
-        _lite[name] = {"text": text, "secs": time.monotonic()-t,
+        _lite[name] = {"text": text, "items": items, "secs": time.monotonic()-t,
                        "n_pages": max(1, n_pages), "err": err}
     return _lite[name]
 
@@ -304,9 +305,9 @@ def docling_page(name, page):
     return _docling[key]
 
 
-def explain_grid(grid, page):
+def explain_grid(grid, page, header_rows=1):
     cells = [{"row": r, "col": c, "text": t, "anchor": {"format": "pdf", "doc": DH, "page": page,
-              "bbox": {"x0": 0.0, "y0": 0.0, "x1": 1.0, "y1": 1.0}}, "is_header": r == 0}
+              "bbox": {"x0": 0.0, "y0": 0.0, "x1": 1.0, "y1": 1.0}}, "is_header": r < header_rows}
              for r, row in enumerate(grid) for c, t in enumerate(row)]
     art = {"kind": "HtmlTable", "meta": {"id": "a", "content_hash": DH,
            "provenance": {"Source": {"format": "pdf", "doc": DH, "page": page, "bbox": {"x0": 0.0, "y0": 0.0, "x1": 1.0, "y1": 1.0}}},
@@ -525,8 +526,6 @@ def api_doc(name):
                 pages.append({"page": pg.page_number, "w": 612.0, "h": 792.0})
         _meta[name] = pages
     return jsonify({"pages": _meta[name]})
-
-
 
 
 # Persistent Surya sidecar: a long-lived server process (isolated env) that loads
@@ -753,22 +752,25 @@ def api_page(name, n):
 # uniform — vision is no longer a special "verdict" node.
 
 class ArtifactKind(str, Enum):
-    PAGE = "page"        # the source page
-    REGION = "region"    # a located area on the page (a layout detection)
-    TABLE = "table"      # a parsed HtmlTable (+ its evidence)
-    TYPED = "typed"      # a materialized, math-ready TypedTable
+    PAGE = "page"          # the source page
+    REGION = "region"      # a located area on the page (a layout detection)
+    TEXTGRID = "text-grid"  # raw region text, columns not yet committed
+    TABLE = "table"        # a parsed HtmlTable (+ its evidence)
+    TYPED = "typed"        # a materialized, math-ready TypedTable
 
 
 class OpKind(str, Enum):
-    LAYOUT = "layout"        # Page    -> Region(s)        (segmentation; one op, many regions)
-    EXTRACT = "extract"      # Region  -> Table            (reparse a source repr, scoped to the region)
-    TRANSFORM = "transform"  # Table   -> Table / Typed    (consume the artifact's own content)
-    VALIDATE = "validate"    # Table   -> (no new artifact; attaches evidence to it)
+    LAYOUT = "layout"        # Page      -> Region(s)        (segmentation; one op fans OUT)
+    EXTRACT = "extract"      # Region    -> Table            (reparse a source repr, scoped to the region)
+    TRANSFORM = "transform"  # Table     -> Table / Typed    (consume the artifact's own content)
+    MERGE = "merge"          # [Region…] -> Region          (agree on a bbox; fans IN — the dual of LAYOUT)
+    VALIDATE = "validate"    # Table     -> (no new artifact; attaches evidence to it)
 
 
 # An evidence verdict — we can't prove correctness without ground truth, only
 # gather signals; `status` is the strongest summary of them.
-Status = Literal["confirmed", "ok", "suspect", "figure", "missing", "verified", "typed", "located", "idle"]
+Status = Literal["confirmed", "ok", "suspect", "figure", "missing", "verified",
+                 "typed", "located", "idle", "grid"]
 
 
 @dataclass(frozen=True)
@@ -799,12 +801,16 @@ OPS: dict[str, Operation] = {o.name: o for o in [
     Operation("surya",       OpKind.LAYOUT, _PG, _RG, label="Surya (VLM layout + reading order)"),
     # extract: Region -> Table  (reparse one source representation, scoped to the region)
     Operation("cheap",       OpKind.EXTRACT, _RG, _TB, reads="PDF text-layer (glyph boxes)"),
-    Operation("text-table",  OpKind.EXTRACT, _RG, _TB, reads="LiteParse space-aligned text"),
     Operation("Docling",     OpKind.EXTRACT, _RG, _TB, reads="PDF (direct, per page)"),
+    # extract: Region -> TextGrid  (the raw region text; columns are committed later)
+    Operation("text-table",  OpKind.EXTRACT, _RG, ArtifactKind.TEXTGRID, reads="region text (layout-preserving)"),
+    # structure: TextGrid -> Table  (cluster the region's words into columns)
+    Operation("structure",   OpKind.TRANSFORM, ArtifactKind.TEXTGRID, _TB, label="cluster words into columns → table"),
     # transform: Table -> Table / Typed  (consume the artifact's own content)
     Operation("markdown",    OpKind.TRANSFORM, _TB, _TB, label="grid → markdown → table"),
     Operation("sign-fix",    OpKind.TRANSFORM, _TB, _TB, label="reinterpret signs (parens / CR / DR → signed)"),
     Operation("materialize", OpKind.TRANSFORM, _TB, _TY, label="HtmlTable → typed columns"),
+    # merge: [Region…] -> Region  (agree on a bbox across layout models; runs client-side)
     # validate: Table -> (no artifact; attaches a verdict to the table's evidence)
     Operation("vision",      OpKind.VALIDATE, _TB, None, reads="rendered region image"),
 ]}
@@ -827,6 +833,9 @@ class OpResult:
     recon: Optional[float] = None               # reconstruction error (evidence)
     detail: Optional[str] = None                # recon diff image (base64)
     markdown: Optional[str] = None
+    text: Optional[str] = None                   # raw text-grid content (layout-preserving ASCII)
+    words: Optional[list] = None                # text-grid word geometry [{text,x0,x1,top}], if any
+    produces: Optional[str] = None              # ArtifactKind this op made (table/text-grid/typed)
     note: Optional[str] = None
     next: list[dict] = field(default_factory=list)
 
@@ -838,7 +847,8 @@ def _artifact(op: Operation, ev: dict, html: str, secs: float,
     return OpResult(method=op.name, kind=op.kind.value, input=op.input,
                     status=status_of(ev), impression=ev.get("impression"),
                     signals=ev.get("signals", []), html=html, recon=recon, detail=detail,
-                    markdown=markdown, note=note, seconds=round(secs, 3))
+                    markdown=markdown, note=note, seconds=round(secs, 3),
+                    produces=op.produces.value if op.produces else "table")
 
 
 def _missing(op: Operation, secs: float, note: Optional[str]) -> OpResult:
@@ -871,6 +881,46 @@ def sign_fix_grid(grid):
             r.append(new)
         out.append(r)
     return out, changed
+
+
+_RANK = {"confirmed": 3, "no_issues": 2, "suspect": 1, "figure": 0}
+_RANKNAME = {3: "reconciles", 2: "clean", 1: "suspect", 0: "figure"}
+
+
+def _grid_quality(grid, page):
+    """Score a grid's evidence so a transform can prove it helped. Higher is better,
+    compared lexicographically: (reconciliation, negatives captured, numbers parsed,
+    -violations). 'Negatives captured' is the signal that catches the split-paren
+    fix — rejoining '( 902 )' flips a phantom +902 into -902, which is the whole
+    point — and reconciliation catches whether the totals then add up."""
+    ev = explain_grid(grid, page)
+    rank = _RANK.get(ev.get("impression"), 1)
+    negs = ncells = viol = 0
+    try:
+        t = typ.materialize([[(c or "") for c in row] for row in grid], 1)
+        viol = len(t.violations)
+        for col in t.columns:
+            if col.dtype == "label":
+                continue
+            for v in col.values:
+                if v is not None:
+                    ncells += 1
+                    if isinstance(v, (int, float)) and v < 0:
+                        negs += 1
+    except Exception:  # noqa: BLE001
+        viol = 999
+    return (rank, negs, ncells, -viol), ev
+
+
+def _delta_note(base, new):
+    parts = []
+    if new[0] != base[0]:
+        parts.append(f"reconciliation {_RANKNAME[base[0]]}→{_RANKNAME[new[0]]}")
+    if new[1] != base[1]:
+        parts.append(f"{new[1]-base[1]:+d} negative(s) captured")
+    if new[3] != base[3]:
+        parts.append(f"violations {-base[3]}→{-new[3]}")
+    return ", ".join(parts)
 
 
 def route(r: OpResult, tried: list[str]) -> list[dict]:
@@ -929,10 +979,53 @@ def api_parse():
         else:
             r = _missing(op, time.monotonic()-t0, "no table grid found in this region")
 
-    elif method == "text-table":  # EXTRACT: a grid from LiteParse text, scoped to the region
-        best, secs, _, why = lite_best_grid(name, page, bbox)
-        r = (_artifact(op, explain_grid(best, page), tt.to_html(best), secs) if best
-             else _missing(op, secs, why))
+    elif method == "text-table":  # EXTRACT: the region's text as a text-grid (faithful ASCII +
+        t0 = time.monotonic()       # word geometry; columns are committed later by `structure`)
+        x0, top, x1, bottom = bbox
+        lp = ensure_lite(name)
+        items = lp.get("items", {}).get(page, [])
+
+        def inb(it):
+            return x0 <= it["x"] + it.get("width", 0)/2 <= x1 and top <= it["y"] + it.get("height", 0)/2 <= bottom
+        words = [{"text": it["text"], "x0": it["x"], "x1": it["x"] + it.get("width", 0), "top": it["y"]}
+                 for it in items if inb(it)]
+        if words:  # LiteParse — faithful ASCII art (sliced to the region) + real coordinates
+            lines = lp["text"].get(page, "").split("\n")
+            texts = {it["text"] for it in items if inb(it)}
+            hit = [i for i, l in enumerate(lines) if any(t and t in l for t in texts)]
+            text = "\n".join(lines[min(hit):max(hit)+1]) if hit else ""
+            src = "LiteParse"
+        else:  # LiteParse unavailable — pdfplumber layout text + word boxes
+            pg = pdf(name).pages[page-1]
+            cr = pg.crop((max(0, x0), max(0, top), min(pg.width, x1), min(pg.height, bottom)))
+            text = cr.extract_text(layout=True) or ""
+            words = [{"text": w["text"], "x0": w["x0"], "x1": w["x1"], "top": w["top"]} for w in cr.extract_words()]
+            src = "pdfplumber"
+        if words or text.strip():
+            r = OpResult(method=op.name, kind=op.kind.value, input=op.input, produces="text-grid",
+                         status="grid", text=text, words=words, note=f"text grid via {src}",
+                         seconds=round(time.monotonic()-t0, 3))
+        else:
+            r = _missing(op, time.monotonic()-t0, "no text found in this region")
+
+    elif method == "structure":  # TRANSFORM: commit the text-grid's columns -> table.
+        t0 = time.monotonic()       # Prefer word geometry; fall back to whitespace on bare text.
+        words, text = d.get("parent_words"), d.get("parent_text")
+        if words:
+            grid, hdr = tt.structure_words([{"text": w["text"], "x0": w["x0"], "x1": w["x1"], "top": w["top"]} for w in words])
+            how = "word geometry"
+        elif text:
+            grid, hdr = tt.structure_text(text)
+            how = "whitespace (no coordinates — approximate)"
+        else:
+            grid, hdr, how = [], 0, ""
+        if grid and len(grid) >= 2:
+            html = tt.to_html_headed(grid, hdr)
+            err, png = recon_for(name, page, bbox, html)
+            note = f"columns from {how}" + (f"; {hdr} header rows → column index" if hdr > 1 else "")
+            r = _artifact(op, explain_grid(grid, page, hdr), html, time.monotonic()-t0, recon=err, detail=png, note=note)
+        else:
+            r = _missing(op, time.monotonic()-t0, "could not structure the text grid into columns")
 
     elif method == "markdown":  # TRANSFORM: parent grid -> markdown -> re-parse -> validate
         t0 = time.monotonic()
@@ -950,8 +1043,14 @@ def api_parse():
         src = grid_from_html(parent_html)
         if src:
             grid, changed = sign_fix_grid(src)
-            r = _artifact(op, explain_grid(grid, page), tt.to_html(grid), time.monotonic()-t0,
-                          note=f"rewrote {changed} parenthesised/CR/DR value(s) to signed numbers")
+            base_q, _ = _grid_quality(src, page)
+            new_q, ev = _grid_quality(grid, page)
+            delta = _delta_note(base_q, new_q)
+            ev = dict(ev)
+            ev["signals"] = list(ev.get("signals", [])) + [
+                {"positive": new_q > base_q, "detail": "sign-fix " + (delta if delta else "did not change the evidence")}]
+            note = f"rewrote {changed} parenthesised/CR/DR value(s) to signed numbers" + (" — " + delta if delta else "")
+            r = _artifact(op, ev, tt.to_html(grid), time.monotonic()-t0, note=note)
         else:
             r = _missing(op, time.monotonic()-t0, "no parent grid to reinterpret")
 
@@ -973,40 +1072,53 @@ def api_parse():
     else:
         return jsonify({"error": f"unknown operation {method!r}"}), 400
 
-    r.next = route(r, d.get("tried", []))
+    if r.status == "grid":  # a text-grid's only next step is to commit columns
+        r.next = [{"op": "structure", "reason": OPS["structure"].label, "kind": "transform"}]
+    else:
+        r.next = route(r, d.get("tried", []))
     return jsonify(asdict(r))
-
-
 
 
 _SQL = {"int": "BIGINT", "float": "DOUBLE", "percent": "DOUBLE",
         "currency": "DOUBLE", "label": "VARCHAR"}
 
 
-@app.post("/api/materialize")
-def api_materialize():
-    """The non-reversible HtmlTable -> TypedTable step: materialize the parsed
-    HTML into typed, math-ready columns (negatives, scale, %, currency resolved)
-    with per-cell provenance. Returns a typed preview + the DuckDB DDL it implies."""
+def _typed_payload(t):
+    """Serialize a TypedTable into the column/row/DDL preview the UI renders."""
     from collections import Counter
-    d = request.get_json()
-    html = d.get("html") or ""
-    try:
-        t = typ.from_html(html)
-    except Exception as e:  # noqa: BLE001
-        return jsonify({"error": str(e)})
     cols = []
     for c in t.columns:
         tf = Counter(x for cell in c.cells for x in cell.transforms)
         cols.append({"name": c.name, "dtype": c.dtype, "sql": _SQL[c.dtype],
-                     "nulls": sum(1 for v in c.values if v is None),
+                     "levels": c.levels, "nulls": sum(1 for v in c.values if v is None),
                      "transforms": dict(tf)})
     rows = [[(c.values[r] if r < len(c.values) else None) for c in t.columns]
             for r in range(min(t.n_rows, 60))]
     ddl = ("CREATE TABLE t (\n  "
            + ",\n  ".join(f'"{c["name"]}" {c["sql"]}' for c in cols) + "\n);")
-    return jsonify({"columns": cols, "rows": rows, "violations": t.violations,
-                    "n_rows": t.n_rows, "ddl": ddl})
+    return {"columns": cols, "rows": rows, "violations": t.violations,
+            "n_rows": t.n_rows, "ddl": ddl}
+
+
+@app.post("/api/materialize")
+def api_materialize():
+    """The non-reversible HtmlTable -> TypedTable step: materialize the parsed
+    HTML into typed, math-ready columns (negatives, scale, %, currency resolved)
+    with per-cell provenance. Auto-promotes nested section headers to a column, and
+    also returns the tidy/long (melted) shape. Includes the DuckDB DDL each implies."""
+    d = request.get_json()
+    html = d.get("html") or ""
+    try:
+        grid, hdr = rv.parse_html_grid(html)
+        hr = (max(hdr) + 1) if hdr else 1
+        grid, hr, sectioned = typ.section_to_column(grid, hr)
+        t = typ.materialize(grid, hr)
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": str(e)})
+    out = _typed_payload(t)
+    out["sections"] = sectioned
+    out["tidy"] = _typed_payload(t.melt())
+    return jsonify(out)
 
 
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -1015,7 +1127,6 @@ STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 @app.get("/")
 def index():
     return Response(open(os.path.join(STATIC, "app.html"), encoding="utf-8").read(), mimetype="text/html")
-
 
 
 def warmup():
