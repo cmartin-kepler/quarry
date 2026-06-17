@@ -200,3 +200,16 @@ lands; add the new artifact kinds to the ground-truth diff.
     "run it inside an op chain" message (chains = orchestration, step E).
   - **Remaining C (glue only):** `scripts/cloud_parse.py` — wrap Reducto/LlamaParse
     into the cell-based contract (needs API keys). The crate side is complete.
+- **D — done.** `store.rs` is now the append-only registry (brief §3, §7):
+  - `write` APPENDS `observations.jsonl` (registry rows) + `lineage.jsonl` (DAG
+    edges with `relation`: Derive / Merge; Same / Split await matching) +
+    `verdicts.jsonl` — nothing overwritten.
+  - `current_view` is the pure `DISTINCT ON (element_id) ORDER BY generation DESC`
+    query, behind the one `current_artifacts` access function; tested directly on
+    synthetic re-parses.
+  - `manifest.json` is kept as a re-derived current-view snapshot for the Python
+    tools. `check`/`explain` work unchanged. Cross-generation element matching is
+    still deferred (brief §6) — `element_id == artifact id` for now.
+- **Remaining: E** — demand-driven op-chain orchestration (so transforms/merge run
+  as chains, with the route() escalation policy + lazy staleness) and repointing
+  the thin Python UI at the Rust core.
