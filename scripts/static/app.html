@@ -255,8 +255,10 @@ async function runOp(op,fromId){const reg=regionAncestor(fromId);if(!reg)return 
    const nd={id:seq++,parent:fromId,result:{atype:'typed',opkind:'transform',method:'materialize',input:'HtmlTable → typed columns',status:res.error?'missing':'typed',typed:res.error?null:res,note:res.error||null,seconds:0,dollars:0,signals:[],next:[]}};
    nodes.push(nd);cur=nd.id;drawOverlays(page);renderPanel();return nd;}
  const parent_html=(kind!=='extract'&&fromArt)?fromArt.result.html:null;
+ const parent_text=(op==='structure'&&fromArt)?fromArt.result.text:null;
+ const parent_words=(op==='structure'&&fromArt)?fromArt.result.words:null;
  const res=await J('/api/parse',{method:'POST',headers:{'Content-Type':'application/json'},
-   body:JSON.stringify({name:docName,page,bbox,method:op,parent_html,tried})});
+   body:JSON.stringify({name:docName,page,bbox,method:op,parent_html,parent_text,parent_words,tried})});
  if(kind==='validate'){  // VALIDATE annotates the judged table's evidence — no new artifact
    const t=node(fromId);
    t.result.status=res.status;

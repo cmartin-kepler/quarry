@@ -110,6 +110,29 @@ def detect_tables(text: str) -> list[list[list[str]]]:
 
 
 _NUMCELL = re.compile(r"^[\(\-]?\$?[\d,]+\.?\d*%?\)?$")
+_SYM = set("$€£¥()-—–")
+
+
+def _merge_symbol_cols(grid, header_rows):
+    """Merge a column whose DATA cells are only currency/paren glyphs into its
+    numeric neighbour ('$'/'(' → right, ')' → left). A split-off symbol column is a
+    structuring artifact, not a real column."""
+    if not grid:
+        return grid
+    n = max(len(r) for r in grid)
+    grid = [r + [""] * (n - len(r)) for r in grid]
+    for c in range(n):
+        seen = [grid[r][c] for r in range(min(header_rows, len(grid)), len(grid)) if grid[r][c]]
+        if not seen or not all(v in _SYM for v in seen):
+            continue
+        tgt = c + 1 if seen[0] in "$€£¥(" else c - 1
+        if not 0 <= tgt < n:
+            continue
+        for r in range(len(grid)):
+            if grid[r][c]:
+                grid[r][tgt] = (grid[r][c] + grid[r][tgt]) if tgt > c else (grid[r][tgt] + grid[r][c])
+                grid[r][c] = ""
+    return grid
 
 
 def structure_words(words, row_tol: float = 3, col_gap: float = 6):
@@ -187,7 +210,58 @@ def structure_words(words, row_tol: float = 3, col_gap: float = 6):
         else:
             grid.append(data_grid[ri])
 
-    keep = [c for c in range(len(occ)) if any(row[c] for row in grid)]
+    grid = _merge_symbol_cols(grid, hdr)
+    n = len(grid[0]) if grid else 0
+    keep = [c for c in range(n) if any(row[c] for row in grid)]
+    return [[row[c] for c in keep] for row in grid], hdr
+
+
+def structure_text(text: str, col_gap: int = 2):
+    """Best-effort structuring of a BARE text grid (no coordinates): column
+    boundaries come from the NUMERIC tokens (which align), every token is assigned to
+    a column by character mid-point, then symbol columns merge. Less reliable than
+    structure_words on real coordinates — ASCII rendering doesn't preserve where the
+    labels and headers sit — so it's the fallback when a text-grid carries no words."""
+    L = [l for l in (text or "").split("\n") if l.strip()]
+    if not L:
+        return [], 0
+    numspans = []
+    for l in L:
+        for m in re.finditer(r"\S+", l):
+            if _NUMCELL.match(m.group()):
+                numspans.append((m.start(), m.end()))
+    numspans.sort()
+    occ = []
+    for a, b in numspans:
+        if occ and a <= occ[-1][1] + col_gap:
+            occ[-1][1] = max(occ[-1][1], b)
+        else:
+            occ.append([a, b])
+    cols = ([[0, occ[0][0]]] + [list(o) for o in occ]) if occ else [[0, max(len(l) for l in L)]]
+
+    def colof(mid):
+        for i, (a, b) in enumerate(cols):
+            if a - col_gap <= mid <= b + col_gap:
+                return i
+        return min(range(len(cols)), key=lambda i: min(abs(mid - cols[i][0]), abs(mid - cols[i][1])))
+
+    grid = []
+    for l in L:
+        cells = [""] * len(cols)
+        for m in re.finditer(r"\S+", l):
+            i = colof((m.start() + m.end()) / 2)
+            cells[i] = (cells[i] + " " + m.group()).strip()
+        grid.append(cells)
+    hdr = 0
+    for row in grid:
+        if sum(1 for c in row if _NUMCELL.match(c.replace(" ", ""))) >= 2:
+            break
+        hdr += 1
+    if hdr >= len(grid):
+        hdr = 1 if len(grid) > 1 else 0
+    grid = _merge_symbol_cols(grid, hdr)
+    n = len(grid[0]) if grid else 0
+    keep = [c for c in range(n) if any(row[c] for row in grid)]
     return [[row[c] for c in keep] for row in grid], hdr
 
 

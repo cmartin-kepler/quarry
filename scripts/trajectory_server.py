@@ -71,7 +71,7 @@ def _load_env():
 _load_env()
 DH = "0" * 64
 VISION_RATE, VISION_TIME = 0.02, 1.2
-BUILD = "multiindex-typed-36"  # bump on server changes; shown in the UI header to verify what's running
+BUILD = "liteparse-textgrid-37"  # bump on server changes; shown in the UI header to verify what's running
 
 INPUT_DIR = os.path.join(REPO, "input")
 # Friendlier display names for known files; any other PDF shows as its path under input/.
@@ -236,16 +236,17 @@ def ensure_lite(name):
             r = sh(["lit", "parse", DOCS[name], "--format", "json", "-o", js, "-q"])
             lj = json.load(open(js))
             text = {p["page"]: p["text"] for p in lj["pages"]}
+            items = {p["page"]: p.get("textItems", []) for p in lj["pages"]}
             n_pages = len(lj["pages"])
         except FileNotFoundError:
             err = "the `lit` (LiteParse) CLI is not on the server's PATH"
-            text, n_pages = {}, len(pdf(name).pages)
+            text, items, n_pages = {}, {}, len(pdf(name).pages)
         except Exception as e:  # noqa: BLE001 — bad/empty lit output
             err = f"LiteParse failed: {(r.stderr if 'r' in dir() else str(e))[:120]}"
-            text, n_pages = {}, len(pdf(name).pages)
+            text, items, n_pages = {}, {}, len(pdf(name).pages)
         if err:
             print(f"[lite] {name}: {err}", flush=True)
-        _lite[name] = {"text": text, "secs": time.monotonic()-t,
+        _lite[name] = {"text": text, "items": items, "secs": time.monotonic()-t,
                        "n_pages": max(1, n_pages), "err": err}
     return _lite[name]
 
@@ -832,7 +833,8 @@ class OpResult:
     recon: Optional[float] = None               # reconstruction error (evidence)
     detail: Optional[str] = None                # recon diff image (base64)
     markdown: Optional[str] = None
-    text: Optional[str] = None                   # raw text-grid content (layout-preserving)
+    text: Optional[str] = None                   # raw text-grid content (layout-preserving ASCII)
+    words: Optional[list] = None                # text-grid word geometry [{text,x0,x1,top}], if any
     produces: Optional[str] = None              # ArtifactKind this op made (table/text-grid/typed)
     note: Optional[str] = None
     next: list[dict] = field(default_factory=list)
@@ -977,31 +979,53 @@ def api_parse():
         else:
             r = _missing(op, time.monotonic()-t0, "no table grid found in this region")
 
-    elif method == "text-table":  # EXTRACT: the region's raw text as a text-grid (no columns yet)
-        t0 = time.monotonic()
-        pg = pdf(name).pages[page-1]
+    elif method == "text-table":  # EXTRACT: the region's text as a text-grid (faithful ASCII +
+        t0 = time.monotonic()       # word geometry; columns are committed later by `structure`)
         x0, top, x1, bottom = bbox
-        cr = pg.crop((max(0, x0), max(0, top), min(pg.width, x1), min(pg.height, bottom)))
-        text = cr.extract_text(layout=True) or ""
-        if text.strip():
+        lp = ensure_lite(name)
+        items = lp.get("items", {}).get(page, [])
+
+        def inb(it):
+            return x0 <= it["x"] + it.get("width", 0)/2 <= x1 and top <= it["y"] + it.get("height", 0)/2 <= bottom
+        words = [{"text": it["text"], "x0": it["x"], "x1": it["x"] + it.get("width", 0), "top": it["y"]}
+                 for it in items if inb(it)]
+        if words:  # LiteParse — faithful ASCII art (sliced to the region) + real coordinates
+            lines = lp["text"].get(page, "").split("\n")
+            texts = {it["text"] for it in items if inb(it)}
+            hit = [i for i, l in enumerate(lines) if any(t and t in l for t in texts)]
+            text = "\n".join(lines[min(hit):max(hit)+1]) if hit else ""
+            src = "LiteParse"
+        else:  # LiteParse unavailable — pdfplumber layout text + word boxes
+            pg = pdf(name).pages[page-1]
+            cr = pg.crop((max(0, x0), max(0, top), min(pg.width, x1), min(pg.height, bottom)))
+            text = cr.extract_text(layout=True) or ""
+            words = [{"text": w["text"], "x0": w["x0"], "x1": w["x1"], "top": w["top"]} for w in cr.extract_words()]
+            src = "pdfplumber"
+        if words or text.strip():
             r = OpResult(method=op.name, kind=op.kind.value, input=op.input, produces="text-grid",
-                         status="grid", text=text, seconds=round(time.monotonic()-t0, 3))
+                         status="grid", text=text, words=words, note=f"text grid via {src}",
+                         seconds=round(time.monotonic()-t0, 3))
         else:
             r = _missing(op, time.monotonic()-t0, "no text found in this region")
 
-    elif method == "structure":  # TRANSFORM: cluster the text-grid's words into columns -> table
-        t0 = time.monotonic()
-        pg = pdf(name).pages[page-1]
-        x0, top, x1, bottom = bbox
-        cr = pg.crop((max(0, x0), max(0, top), min(pg.width, x1), min(pg.height, bottom)))
-        grid, hdr = tt.structure_words(cr.extract_words())
+    elif method == "structure":  # TRANSFORM: commit the text-grid's columns -> table.
+        t0 = time.monotonic()       # Prefer word geometry; fall back to whitespace on bare text.
+        words, text = d.get("parent_words"), d.get("parent_text")
+        if words:
+            grid, hdr = tt.structure_words([{"text": w["text"], "x0": w["x0"], "x1": w["x1"], "top": w["top"]} for w in words])
+            how = "word geometry"
+        elif text:
+            grid, hdr = tt.structure_text(text)
+            how = "whitespace (no coordinates — approximate)"
+        else:
+            grid, hdr, how = [], 0, ""
         if grid and len(grid) >= 2:
             html = tt.to_html_headed(grid, hdr)
             err, png = recon_for(name, page, bbox, html)
-            note = f"{hdr} header row(s) collapsed into the column index" if hdr > 1 else None
+            note = f"columns from {how}" + (f"; {hdr} header rows → column index" if hdr > 1 else "")
             r = _artifact(op, explain_grid(grid, page, hdr), html, time.monotonic()-t0, recon=err, detail=png, note=note)
         else:
-            r = _missing(op, time.monotonic()-t0, "could not cluster the text grid into columns")
+            r = _missing(op, time.monotonic()-t0, "could not structure the text grid into columns")
 
     elif method == "markdown":  # TRANSFORM: parent grid -> markdown -> re-parse -> validate
         t0 = time.monotonic()
