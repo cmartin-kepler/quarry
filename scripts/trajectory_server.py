@@ -71,7 +71,7 @@ def _load_env():
 _load_env()
 DH = "0" * 64
 VISION_RATE, VISION_TIME = 0.02, 1.2
-BUILD = "liteparse-textgrid-37"  # bump on server changes; shown in the UI header to verify what's running
+BUILD = "litparse-ui-cleanup-38"  # bump on server changes; shown in the UI header to verify what's running
 
 INPUT_DIR = os.path.join(REPO, "input")
 # Friendlier display names for known files; any other PDF shows as its path under input/.
@@ -321,41 +321,6 @@ def explain_grid(grid, page, header_rows=1):
 
 def tokens(s):
     return {"".join(c for c in w.lower() if c.isalnum()) for w in re.split(r"\s+", s)} - {""}
-
-
-def lite_best_grid(name, page, bbox):
-    """The grid LiteParse's text yields for the table under `bbox`, matched to the
-    region's own PDF words. LiteParse splits a page into several grids while the
-    region may be one big box, so we score each grid by max(precision, recall) of
-    token overlap — precision (grid ⊆ region) catches a sub-table inside a big
-    region; recall (region ⊆ grid) catches a region inside one big grid — then,
-    among grids that clear the bar, pick the one covering the most region tokens.
-    Returns (grid|None, secs, score). Shared by text-table and markdown."""
-    lp = ensure_lite(name)
-    pg = pdf(name).pages[page-1]
-    x0, top, x1, bottom = bbox
-    cr = pg.crop((max(0, x0), max(0, top), min(pg.width, x1), min(pg.height, bottom)))
-    ref = tokens(" ".join(w["text"] for w in cr.extract_words()))
-    grids = tt.detect_tables(lp["text"].get(page, ""))
-    best, best_inter, best_score, max_seen = None, -1, 0.0, 0.0
-    for g in grids:
-        gt = tokens(" ".join(c2 for row in g for c2 in row))
-        inter = len(ref & gt)
-        score = max(inter / (len(gt) + 1e-9), inter / (len(ref) + 1e-9))
-        max_seen = max(max_seen, score)
-        if score >= 0.5 and inter > best_inter:
-            best, best_inter, best_score = g, inter, score
-    secs = lp["secs"] / max(1, lp["n_pages"])
-    if best is None:
-        if lp.get("err"):
-            why = lp["err"]
-        elif not grids:
-            why = "LiteParse produced no detectable text grid on this page"
-        else:
-            why = f"{len(grids)} LiteParse grid(s) on this page, best overlap {max_seen:.2f} (<0.50) — none aligns with this region"
-    else:
-        why = None
-    return best, secs, best_score, why
 
 
 # ---- cloud page parsers (Reducto, LlamaParse) -------------------------------
@@ -1029,7 +994,7 @@ def api_parse():
 
     elif method == "markdown":  # TRANSFORM: parent grid -> markdown -> re-parse -> validate
         t0 = time.monotonic()
-        src = grid_from_html(parent_html) if parent_html else lite_best_grid(name, page, bbox)[0]
+        src = grid_from_html(parent_html)
         if src:
             md = tt.to_markdown(src)
             reparsed = tt.detect_tables(md)

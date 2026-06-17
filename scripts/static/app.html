@@ -94,7 +94,7 @@ const LAYCOLOR={Text:'#9aa39e',Title:'#1a5a40','Section-header':'#3f7a8c',Table:
 const OPKIND={cheap:'extract','text-table':'extract',Docling:'extract',reducto:'extract',llamaparse:'extract',structure:'transform',markdown:'transform','sign-fix':'transform',materialize:'transform',vision:'validate'};
 const TABLEART={cheap:'HTML table',Docling:'HTML table','text-table':'text grid',structure:'HTML table',reducto:'table (Reducto)',llamaparse:'table (LlamaParse)',markdown:'markdown table','sign-fix':'signed table'};
 const EXTRACTORS=[{op:'cheap',kind:'extract',reason:'parse the PDF text layer in this region (cheapest)'},
-                  {op:'text-table',kind:'extract',reason:'extract the region text as a raw text grid (then structure it into columns)'},
+                  {op:'text-table',kind:'extract',reason:'LiteParse → text grid (faithful ASCII + word boxes; then structure into columns)'},
                   {op:'Docling',kind:'extract',reason:'parse table structure from the PDF'}];
 const LAYOUT_OPS=[
  {op:'find_tables',kind:'layout',reason:'geometric: ruled lines + text-aligned columns'},
@@ -343,9 +343,11 @@ function renderDetail(){const d=document.getElementById('det');if(!d)return;
      '<div class="costline">'+(parent?artifactLabel(parent.result)+' —('+(r.opkind==='merge'?'layout ⋈':r.method)+')→ ':'')+'Region · bbox ['+r.bbox.map(v=>Math.round(v)).join(', ')+']</div>'+
      '<div class="dim" style="margin-top:3px">'+(r.agreed?'merged box from <b>'+r.agreed.join('</b>, <b>')+'</b> (per-edge median of their boxes) — extract a table from it:':'located by <b>'+r.method+'</b> (layout) — extract a table from it:')+'</div></div>'+renderNext(me);return;}
  if(r.atype==='text-grid'){const parent=(me.parent!=null)?node(me.parent):null;
-   d.innerHTML='<div class="card"><h4>▦ <b>text grid</b></h4>'+
-     '<div class="costline">'+(parent?artifactLabel(parent.result)+' —('+r.method+')→ ':'')+'raw region text · ⏱ '+(r.seconds||0)+'s · columns not yet committed</div>'+
-     '<div class="dim" style="margin-top:3px">layout-preserving text from the region — the structure op clusters its words into columns:</div>'+
+   const src=(r.note||'').replace('text grid via ','')||'?';
+   const viaLP=/LiteParse/i.test(src), nwords=(r.words||[]).length;
+   d.innerHTML='<div class="card"><h4>▦ <b>text grid</b> <span class="badge" style="background:'+(viaLP?'#1a5a40':'#b07515')+'">parsed by '+src+'</span></h4>'+
+     '<div class="costline">'+(parent?artifactLabel(parent.result)+' —(text-table)→ ':'')+'raw region text · ⏱ '+(r.seconds||0)+'s · '+nwords+' word boxes · columns not yet committed</div>'+
+     '<div class="dim" style="margin-top:3px">'+(viaLP?'<b>LiteParse</b> ASCII layout of the region (positionally faithful)':'pdfplumber layout text (LiteParse unavailable)')+' — the <b>structure</b> op clusters its '+(nwords?'word boxes':'whitespace')+' into columns:</div>'+
      '<pre class="mono" style="font-size:11px;white-space:pre;overflow-x:auto;background:var(--g50);padding:8px;border-radius:6px;margin:8px 0 0">'+(r.text||'').replace(/</g,'&lt;')+'</pre>'+
      '</div>'+renderNext(me);return;}
  const parent=(me.parent!=null)?node(me.parent):null;
