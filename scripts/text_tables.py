@@ -109,14 +109,23 @@ def detect_tables(text: str) -> list[list[list[str]]]:
     return _spacealigned_tables(text)
 
 
+_NUMCELL = re.compile(r"^[\(\-]?\$?[\d,]+\.?\d*%?\)?$")
+
+
 def structure_words(words, row_tol: float = 3, col_gap: float = 6):
     """Cluster a region's words (pdfplumber dicts with text/x0/x1/top) into a table
     grid by GEOMETRY: rows by vertical position, columns by gaps in the horizontal
     word projection. Geometry-based so it never splits a word (words are atomic) and
-    column boundaries come from real whitespace gaps — the structuring step that
-    turns a raw text grid into columns. Returns a list-of-rows string grid."""
+    column boundaries come from real whitespace gaps.
+
+    Multi-row headers are handled: the leading rows (until the first row with ≥2
+    numeric cells) are the header. A header word that SPANS several data columns is
+    spread across each of them (a `colspan` group); a header that just wraps over
+    lines stacks down its one column. So each data column ends up with a tuple of
+    header levels — the multi-index — which to_html_headed renders with colspan and
+    materialize flattens into one column name. Returns (grid, header_rows)."""
     if not words:
-        return []
+        return [], 0
     ws = sorted(words, key=lambda w: (w["top"], w["x0"]))
     rows, cur, y0 = [], [], None
     for w in ws:
@@ -128,8 +137,7 @@ def structure_words(words, row_tol: float = 3, col_gap: float = 6):
     if cur:
         rows.append(cur)
 
-    # column intervals: merge word x-spans that are within col_gap of each other;
-    # the holes between intervals are the column separators.
+    # column intervals: merge word x-spans within col_gap; holes are separators.
     occ = []
     for w in sorted(words, key=lambda w: w["x0"]):
         if occ and w["x0"] <= occ[-1][1] + col_gap:
@@ -148,15 +156,66 @@ def structure_words(words, row_tol: float = 3, col_gap: float = 6):
                 bd, best = d, i
         return best
 
-    grid = []
+    def spanned(w):  # columns whose CENTRE falls within the word's x-extent
+        cs = [i for i, (a, b) in enumerate(occ) if w["x0"] - 2 <= (a + b) / 2 <= w["x1"] + 2]
+        return cs or [colof(w)]
+
+    # data-row assignment (centre) first, to find where the header ends
+    data_grid = []
     for r in rows:
         cells = [""] * len(occ)
         for w in sorted(r, key=lambda w: w["x0"]):
             i = colof(w)
             cells[i] = (cells[i] + " " + w["text"]).strip()
-        grid.append(cells)
+        data_grid.append(cells)
+    hdr = 0
+    for cells in data_grid:
+        if sum(1 for c in cells if _NUMCELL.match(c.replace(" ", ""))) >= 2:
+            break
+        hdr += 1
+    if hdr >= len(rows):  # no data row found — treat just the top line as header
+        hdr = 1 if len(rows) > 1 else 0
+
+    grid = []
+    for ri, r in enumerate(rows):
+        if ri < hdr:  # header row: spread spanning words across the columns they cover
+            cells = [""] * len(occ)
+            for w in sorted(r, key=lambda w: w["x0"]):
+                for i in spanned(w):
+                    cells[i] = (cells[i] + " " + w["text"]).strip()
+            grid.append(cells)
+        else:
+            grid.append(data_grid[ri])
+
     keep = [c for c in range(len(occ)) if any(row[c] for row in grid)]
-    return [[row[c] for c in keep] for row in grid]
+    return [[row[c] for c in keep] for row in grid], hdr
+
+
+def to_html_headed(grid: list[list[str]], header_rows: int = 1) -> str:
+    """HTML for a grid with multi-row headers: the first `header_rows` rows are <th>;
+    horizontally-adjacent identical header cells (a spread span) collapse into one
+    colspan'd cell, so the multi-index renders as the hierarchy it is."""
+    import html as H
+    if not grid:
+        return "<table></table>"
+    n = max(len(r) for r in grid)
+    out = ["<table>"]
+    for ri, row in enumerate(grid):
+        cells = [c for c in row] + [""] * (n - len(row))
+        if ri < header_rows:
+            tds, i = [], 0
+            while i < n:
+                j = i + 1
+                while j < n and cells[j] == cells[i] and cells[i] != "":
+                    j += 1
+                span = f" colspan={j-i}" if j - i > 1 else ""
+                tds.append(f"<th{span}>{H.escape(cells[i])}</th>")
+                i = j
+            out.append("  <tr>" + "".join(tds) + "</tr>")
+        else:
+            out.append("  <tr>" + "".join(f"<td>{H.escape(c)}</td>" for c in cells) + "</tr>")
+    out.append("</table>")
+    return "\n".join(out)
 
 
 def to_markdown(grid: list[list[str]]) -> str:

@@ -71,7 +71,7 @@ def _load_env():
 _load_env()
 DH = "0" * 64
 VISION_RATE, VISION_TIME = 0.02, 1.2
-BUILD = "textgrid-34"  # bump on server changes; shown in the UI header to verify what's running
+BUILD = "multihdr-35"  # bump on server changes; shown in the UI header to verify what's running
 
 INPUT_DIR = os.path.join(REPO, "input")
 # Friendlier display names for known files; any other PDF shows as its path under input/.
@@ -304,9 +304,9 @@ def docling_page(name, page):
     return _docling[key]
 
 
-def explain_grid(grid, page):
+def explain_grid(grid, page, header_rows=1):
     cells = [{"row": r, "col": c, "text": t, "anchor": {"format": "pdf", "doc": DH, "page": page,
-              "bbox": {"x0": 0.0, "y0": 0.0, "x1": 1.0, "y1": 1.0}}, "is_header": r == 0}
+              "bbox": {"x0": 0.0, "y0": 0.0, "x1": 1.0, "y1": 1.0}}, "is_header": r < header_rows}
              for r, row in enumerate(grid) for c, t in enumerate(row)]
     art = {"kind": "HtmlTable", "meta": {"id": "a", "content_hash": DH,
            "provenance": {"Source": {"format": "pdf", "doc": DH, "page": page, "bbox": {"x0": 0.0, "y0": 0.0, "x1": 1.0, "y1": 1.0}}},
@@ -994,10 +994,12 @@ def api_parse():
         pg = pdf(name).pages[page-1]
         x0, top, x1, bottom = bbox
         cr = pg.crop((max(0, x0), max(0, top), min(pg.width, x1), min(pg.height, bottom)))
-        grid = tt.structure_words(cr.extract_words())
+        grid, hdr = tt.structure_words(cr.extract_words())
         if grid and len(grid) >= 2:
-            err, png = recon_for(name, page, bbox, tt.to_html(grid))
-            r = _artifact(op, explain_grid(grid, page), tt.to_html(grid), time.monotonic()-t0, recon=err, detail=png)
+            html = tt.to_html_headed(grid, hdr)
+            err, png = recon_for(name, page, bbox, html)
+            note = f"{hdr} header row(s) collapsed into the column index" if hdr > 1 else None
+            r = _artifact(op, explain_grid(grid, page, hdr), html, time.monotonic()-t0, recon=err, detail=png, note=note)
         else:
             r = _missing(op, time.monotonic()-t0, "could not cluster the text grid into columns")
 

@@ -76,17 +76,21 @@ def parse_number(raw: str) -> Num | None:
     tf: list[str] = []
     neg = False
 
-    if t.startswith("(") and ")" in t:
-        neg = True
-        t = t[1:t.rfind(")")]
-        tf.append("paren→neg")
-
+    # Strip currency FIRST: a cell can be "$ (902)" (currency then paren) just as
+    # easily as "($902)", so the paren-negative test must run on the currency-free
+    # string or "$ (902)" slips through as unparseable.
     currency = False
     if any(c in t for c in CURRENCY):
         currency = True
         for c in CURRENCY:
             t = t.replace(c, "")
+        t = t.strip()
         tf.append("strip currency")
+
+    if t.startswith("(") and ")" in t:
+        neg = True
+        t = t[1:t.rfind(")")]
+        tf.append("paren→neg")
 
     percent = False
     if t.strip().endswith("%"):
