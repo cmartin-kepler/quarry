@@ -193,5 +193,10 @@ lands; add the new artifact kinds to the ground-truth diff.
   - **Cloud** (`TableSidecar`, page → HtmlTable) + `tables_from_json` — a generic
     cell-based contract for Reducto/LlamaParse.
   - All shell-out + adapt paths tested via a fixture-echoing stub (52 tests).
-  - **Remaining C:** CLI/pipeline wiring (run a named op/sidecar over a file with
-    `source_path`), and the cloud bridge `scripts/cloud_parse.py`.
+  - **CLI wiring done:** `pipeline::extractor_by_id` (one registry for native ops +
+    sidecars) and `run_document_extractor`; `quarry parse <file> --op <id>
+    [--source <pdf>]` runs any document-region op, threading `source_path`.
+    Artifact-consuming ops (structure/sign-fix/…) are rejected with a clear
+    "run it inside an op chain" message (chains = orchestration, step E).
+  - **Remaining C (glue only):** `scripts/cloud_parse.py` — wrap Reducto/LlamaParse
+    into the cell-based contract (needs API keys). The crate side is complete.
