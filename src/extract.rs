@@ -50,11 +50,14 @@ pub enum OpKind {
     Merge,
 }
 
-/// Context handed to an extractor: the loaded source document and the running
-/// per-document generation counter.
+/// Context handed to an extractor: the loaded source document, the running
+/// per-document generation counter, and the path to the ORIGINAL document file.
+/// Native ops read `source` (the cheap text layer); sidecar ops shell out to a
+/// real parser over `source_path`.
 pub struct ExtractCtx<'a> {
     pub source: &'a QDoc,
     pub generation: Generation,
+    pub source_path: Option<std::path::PathBuf>,
 }
 
 pub trait Extractor: Send + Sync {

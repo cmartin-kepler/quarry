@@ -175,3 +175,20 @@ lands; add the new artifact kinds to the ground-truth diff.
   - `merge` : `[Region]` → `Region` (per-edge median bbox).
 - Wire them into `pipeline`/CLI so an op chain runs; keep `eval` green and add the
   new kinds to the checks path. Unit tests on geometry/typing/merge.
+
+## Progress
+
+- **A + B — done.** Region/TextGrid kinds, OpKind, and the native ops
+  (regions/text-grid/structure/sign-fix/markdown/merge) in `ops.rs` + `grid.rs`,
+  with the column coalescer (`grid::column_intervals`) extracted and intent-tested.
+- **C — in progress.** `ExtractCtx` now carries `source_path` (the original file).
+  `src/sidecar.rs` wraps external parsers as `Extractor`s that shell out (an
+  injectable `Vec<String>` command, so tests drive it with a fixture-echoing stub):
+  - **Docling** (`DoclingSidecar`, DocumentRegion → HtmlTable) reusing the proven
+    `docling::artifacts_from_docling` adapter,
+  - **LiteParse** (`LiteParseSidecar`, Region → TextGrid) + the pure
+    `textgrid_from_json` adapter; bridge scripts `scripts/{litparse_region,
+    docling_parse}.py`.
+  - **Remaining C:** layout-model sidecars (YOLO/DocLayout/Surya → Region), the
+    cloud parsers (Reducto/LlamaParse → HtmlTable — same JSON-tool shape as
+    Docling), and CLI/pipeline wiring so a tier maps to a sidecar.
