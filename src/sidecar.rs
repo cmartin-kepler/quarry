@@ -205,6 +205,249 @@ impl Extractor for LiteParseSidecar {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Layout models — detect regions: DocumentRegion(page) → Region(s).
+// (YOLO / DocLayout-YOLO / Surya, each a `LayoutSidecar` with its own command.)
+// ---------------------------------------------------------------------------
+
+fn bbox4(a: [f32; 4]) -> BBox {
+    BBox::new(a[0], a[1], a[2], a[3])
+}
+
+#[derive(Deserialize)]
+struct LayoutOut {
+    #[serde(default)]
+    regions: Vec<LayoutRegion>,
+}
+#[derive(Deserialize)]
+struct LayoutRegion {
+    #[serde(default = "table_label")]
+    label: String,
+    #[serde(default = "one")]
+    confidence: f32,
+    bbox: [f32; 4],
+}
+fn table_label() -> String {
+    "Table".into()
+}
+fn one() -> f32 {
+    1.0
+}
+
+/// Pure adapter: a layout model's `{regions:[{label,confidence,bbox}]}` (page
+/// top-left coords) into Region artifacts on `page`.
+pub fn regions_from_json(json: &str, doc: DocHash, page: u32, generation: Generation) -> Result<Vec<Region>> {
+    let lo: LayoutOut = serde_json::from_str(json).context("parsing layout JSON")?;
+    Ok(lo
+        .regions
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let bbox = bbox4(r.bbox);
+            let content = DocHash::of(format!("layout:{page}:{i}:{}:{bbox:?}", r.label).as_bytes());
+            Region {
+                meta: Meta {
+                    id: ArtifactId::mint(&content, generation),
+                    content_hash: content,
+                    provenance: Provenance::Source(SourceAnchor::Pdf { doc, page, bbox }),
+                    generation,
+                    risk: RiskMarkers::default(),
+                },
+                label: r.label,
+                confidence: r.confidence,
+            }
+        })
+        .collect())
+}
+
+pub struct LayoutSidecar {
+    /// Model id (e.g. "yolo26", "surya"); becomes the ExtractorId.
+    pub model: String,
+    pub cmd: Vec<String>,
+}
+
+impl LayoutSidecar {
+    /// Default invocation: a Python bridge that renders the page and runs the
+    /// named layout model. The source path + page number are appended at run time.
+    pub fn model(model: &str) -> Self {
+        LayoutSidecar {
+            model: model.into(),
+            cmd: vec!["python3".into(), "scripts/layout_detect.py".into(), model.into()],
+        }
+    }
+}
+
+impl Extractor for LayoutSidecar {
+    fn id(&self) -> ExtractorId {
+        ExtractorId(self.model.clone())
+    }
+    fn version(&self) -> Version {
+        Version(1)
+    }
+    fn cost_tier(&self) -> CostTier {
+        CostTier(1)
+    }
+    fn op_kind(&self) -> OpKind {
+        OpKind::Layout
+    }
+    fn accepts(&self) -> &[InputKind] {
+        &DOC_ACCEPTS
+    }
+    fn produces(&self) -> ArtifactKind {
+        ArtifactKind::Region
+    }
+    fn extract(&self, input: ExtractInput<'_>, ctx: &ExtractCtx<'_>) -> Result<Vec<Box<dyn Artifact>>> {
+        let (doc, page) = match input {
+            ExtractInput::DocumentRegion { doc, anchor } => match anchor {
+                SourceAnchor::Pdf { page, .. } => (doc, page),
+                _ => bail!("layout only handles PDF anchors"),
+            },
+            ExtractInput::Artifacts(_) => bail!("layout detects on a page, not artifacts"),
+        };
+        let mut cmd = self.cmd.clone();
+        if let Some(p) = &ctx.source_path {
+            cmd.push(p.display().to_string());
+        }
+        cmd.push(page.to_string());
+        let json = run_capture(&cmd)?;
+        Ok(regions_from_json(&json, doc, page, ctx.generation)?
+            .into_iter()
+            .map(|r| Box::new(r) as Box<dyn Artifact>)
+            .collect())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cloud table parsers — Reducto / LlamaParse: DocumentRegion → HtmlTable(s).
+// A generic cell-based contract; each parser's bridge converts its native output.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct CloudOut {
+    #[serde(default)]
+    tables: Vec<CloudTable>,
+}
+#[derive(Deserialize)]
+struct CloudTable {
+    page: u32,
+    bbox: [f32; 4],
+    n_rows: u32,
+    n_cols: u32,
+    cells: Vec<CloudCell>,
+}
+#[derive(Deserialize)]
+struct CloudCell {
+    row: u32,
+    col: u32,
+    text: String,
+    #[serde(default)]
+    bbox: Option<[f32; 4]>,
+    #[serde(default)]
+    is_header: bool,
+}
+
+/// Pure adapter: a cloud parser's `{tables:[{page,bbox,n_rows,n_cols,cells}]}`
+/// (cells with their own page-coord boxes) into HtmlTables.
+pub fn tables_from_json(json: &str, doc: DocHash, generation: Generation) -> Result<Vec<HtmlTable>> {
+    let co: CloudOut = serde_json::from_str(json).context("parsing cloud table JSON")?;
+    let mut out = Vec::new();
+    for t in co.tables {
+        let table_bbox = bbox4(t.bbox);
+        let cells: Vec<Cell> = t
+            .cells
+            .iter()
+            .map(|c| Cell {
+                row: c.row,
+                col: c.col,
+                text: c.text.clone(),
+                anchor: SourceAnchor::Pdf { doc, page: t.page, bbox: c.bbox.map(bbox4).unwrap_or(table_bbox) },
+                is_header: c.is_header,
+            })
+            .collect();
+        // dense grid + header rows for rendering
+        let mut grid = vec![vec![String::new(); t.n_cols as usize]; t.n_rows as usize];
+        let mut hdr = vec![false; t.n_rows as usize];
+        for c in &t.cells {
+            if (c.row as usize) < grid.len() && (c.col as usize) < t.n_cols as usize {
+                grid[c.row as usize][c.col as usize] = c.text.clone();
+                if c.is_header {
+                    hdr[c.row as usize] = true;
+                }
+            }
+        }
+        let header_rows = hdr.iter().take_while(|&&h| h).count();
+        let html = crate::grid::to_html(&grid, header_rows);
+        let content = DocHash::of(html.as_bytes());
+        out.push(HtmlTable {
+            meta: Meta {
+                id: ArtifactId::mint(&content, generation),
+                content_hash: content,
+                provenance: Provenance::Source(SourceAnchor::Pdf { doc, page: t.page, bbox: table_bbox }),
+                generation,
+                risk: RiskMarkers::default(),
+            },
+            n_rows: t.n_rows,
+            n_cols: t.n_cols,
+            cells,
+            html,
+        });
+    }
+    Ok(out)
+}
+
+pub struct TableSidecar {
+    /// Parser id (e.g. "reducto", "llamaparse").
+    pub parser: String,
+    pub cmd: Vec<String>,
+}
+
+impl TableSidecar {
+    /// Default invocation: a Python bridge for the named cloud parser, converting
+    /// its native output to the generic cell-based table contract.
+    pub fn parser(parser: &str) -> Self {
+        TableSidecar {
+            parser: parser.into(),
+            cmd: vec!["python3".into(), "scripts/cloud_parse.py".into(), parser.into()],
+        }
+    }
+}
+
+impl Extractor for TableSidecar {
+    fn id(&self) -> ExtractorId {
+        ExtractorId(self.parser.clone())
+    }
+    fn version(&self) -> Version {
+        Version(1)
+    }
+    fn cost_tier(&self) -> CostTier {
+        CostTier(3) // metered cloud APIs — the most expensive tier
+    }
+    fn op_kind(&self) -> OpKind {
+        OpKind::Extract
+    }
+    fn accepts(&self) -> &[InputKind] {
+        &DOC_ACCEPTS
+    }
+    fn produces(&self) -> ArtifactKind {
+        ArtifactKind::HtmlTable
+    }
+    fn extract(&self, input: ExtractInput<'_>, ctx: &ExtractCtx<'_>) -> Result<Vec<Box<dyn Artifact>>> {
+        let doc = match input {
+            ExtractInput::DocumentRegion { doc, .. } => doc,
+            ExtractInput::Artifacts(_) => bail!("{} parses the document, not artifacts", self.parser),
+        };
+        let mut cmd = self.cmd.clone();
+        if let Some(p) = &ctx.source_path {
+            cmd.push(p.display().to_string());
+        }
+        let json = run_capture(&cmd)?;
+        Ok(tables_from_json(&json, doc, ctx.generation)?
+            .into_iter()
+            .map(|t| Box::new(t) as Box<dyn Artifact>)
+            .collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,5 +532,58 @@ mod tests {
         let anchor = SourceAnchor::Pdf { doc: dh, page: 1, bbox: BBox::new(0.0, 0.0, 1.0, 1.0) };
         let s = DoclingSidecar { cmd: vec!["false".into()] }; // exits non-zero
         assert!(s.extract(ExtractInput::DocumentRegion { doc: dh, anchor }, &ctx(&doc)).is_err());
+    }
+
+    #[test]
+    fn layout_sidecar_detects_regions_on_a_page() {
+        let dh = DocHash::of(b"pdf");
+        let doc = QDoc { format: DocFormat::Pdf, pages: vec![] };
+        let anchor = SourceAnchor::Pdf { doc: dh, page: 2, bbox: BBox::new(0.0, 0.0, 600.0, 800.0) };
+        let s = LayoutSidecar { model: "yolo26".into(), cmd: echo("tests/data/sample.layout.json") };
+        let out = s.extract(ExtractInput::DocumentRegion { doc: dh, anchor }, &ctx(&doc)).unwrap();
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|a| a.kind() == ArtifactKind::Region));
+        let r = out[0].as_any().downcast_ref::<Region>().unwrap();
+        assert_eq!(r.label, "Table");
+        assert!((r.confidence - 0.97).abs() < 1e-3);
+        assert_eq!(s.op_kind(), OpKind::Layout);
+        assert_eq!(s.id(), ExtractorId("yolo26".into()));
+    }
+
+    #[test]
+    fn regions_adapter_places_each_region_on_its_page() {
+        let rs = regions_from_json(
+            include_str!("../tests/data/sample.layout.json"),
+            DocHash::of(b"d"),
+            2,
+            Generation(0),
+        )
+        .unwrap();
+        assert_eq!(rs.len(), 2);
+        assert_eq!(rs[0].bbox(), BBox::new(50.0, 100.0, 540.0, 300.0));
+        match rs[0].provenance().anchor() {
+            SourceAnchor::Pdf { page, .. } => assert_eq!(*page, 2),
+            _ => panic!("expected a PDF region anchor"),
+        }
+    }
+
+    #[test]
+    fn cloud_table_sidecar_makes_tables_the_detectors_accept() {
+        use crate::check::{CheckCtx, IntrinsicArithmetic, QualityCheck};
+        let dh = DocHash::of(b"pdf");
+        let doc = QDoc { format: DocFormat::Pdf, pages: vec![] };
+        let anchor = SourceAnchor::Pdf { doc: dh, page: 1, bbox: BBox::new(0.0, 0.0, 600.0, 800.0) };
+        let s = TableSidecar { parser: "reducto".into(), cmd: echo("tests/data/sample.cloudtable.json") };
+        let out = s.extract(ExtractInput::DocumentRegion { doc: dh, anchor }, &ctx(&doc)).unwrap();
+        assert_eq!(out.len(), 1);
+        let t = out[0].as_any().downcast_ref::<HtmlTable>().unwrap();
+        assert_eq!((t.n_rows, t.n_cols), (4, 2));
+        assert!(t.cell(0, 0).unwrap().is_header);
+        // the detector core runs on a cloud-sourced table just like any other:
+        // 100 + 220 == 320 reconciles, so no false flag.
+        let dummy = QDoc { format: DocFormat::Pdf, pages: vec![] };
+        let cctx = CheckCtx { source: &dummy };
+        assert!(!IntrinsicArithmetic::default().check(out[0].as_ref(), &cctx).is_flag());
+        assert_eq!(s.cost_tier(), CostTier(3), "metered cloud APIs are the top tier");
     }
 }

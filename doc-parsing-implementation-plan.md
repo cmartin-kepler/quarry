@@ -187,8 +187,11 @@ lands; add the new artifact kinds to the ground-truth diff.
   - **Docling** (`DoclingSidecar`, DocumentRegion → HtmlTable) reusing the proven
     `docling::artifacts_from_docling` adapter,
   - **LiteParse** (`LiteParseSidecar`, Region → TextGrid) + the pure
-    `textgrid_from_json` adapter; bridge scripts `scripts/{litparse_region,
-    docling_parse}.py`.
-  - **Remaining C:** layout-model sidecars (YOLO/DocLayout/Surya → Region), the
-    cloud parsers (Reducto/LlamaParse → HtmlTable — same JSON-tool shape as
-    Docling), and CLI/pipeline wiring so a tier maps to a sidecar.
+    `textgrid_from_json` adapter; bridges `scripts/{litparse_region,docling_parse}.py`.
+  - **Layout** (`LayoutSidecar`, page → Region(s)) + `regions_from_json`; bridge
+    `scripts/layout_detect.py` (reuses `yolo_layout.py`).
+  - **Cloud** (`TableSidecar`, page → HtmlTable) + `tables_from_json` — a generic
+    cell-based contract for Reducto/LlamaParse.
+  - All shell-out + adapt paths tested via a fixture-echoing stub (52 tests).
+  - **Remaining C:** CLI/pipeline wiring (run a named op/sidecar over a file with
+    `source_path`), and the cloud bridge `scripts/cloud_parse.py`.
