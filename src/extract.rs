@@ -35,6 +35,21 @@ pub enum ExtractInput<'a> {
     Artifacts(&'a [&'a dyn Artifact]),
 }
 
+/// The shape of an op in the artifact graph — descriptive metadata that makes the
+/// graph legible (it doesn't change dispatch). The arity is the point: `Layout`
+/// fans out (1→N), `Merge` fans in (N→1), `Extract`/`Transform` preserve arity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum OpKind {
+    /// Page → Region(s): segmentation/detection.
+    Layout,
+    /// Region (raw bytes) → an artifact: reparse a source representation.
+    Extract,
+    /// Artifact → artifact: consume the artifact's own content.
+    Transform,
+    /// [Artifact] → artifact: fan in (e.g. region-box agreement).
+    Merge,
+}
+
 /// Context handed to an extractor: the loaded source document and the running
 /// per-document generation counter.
 pub struct ExtractCtx<'a> {
@@ -46,6 +61,7 @@ pub trait Extractor: Send + Sync {
     fn id(&self) -> ExtractorId;
     fn version(&self) -> Version;
     fn cost_tier(&self) -> CostTier;
+    fn op_kind(&self) -> OpKind;
     fn accepts(&self) -> &[InputKind];
     fn produces(&self) -> ArtifactKind;
     fn extract(&self, input: ExtractInput<'_>, ctx: &ExtractCtx<'_>)
@@ -71,6 +87,9 @@ impl Extractor for PdfTextLayerReconstructor {
     }
     fn cost_tier(&self) -> CostTier {
         CostTier(0)
+    }
+    fn op_kind(&self) -> OpKind {
+        OpKind::Extract
     }
     fn accepts(&self) -> &[InputKind] {
         &ACCEPTS

@@ -29,5 +29,7 @@ pub mod docling;
 pub mod evidence;
 pub mod eval;
 pub mod extract;
+pub mod grid;
+pub mod ops;
 pub mod pipeline;
 pub mod store;

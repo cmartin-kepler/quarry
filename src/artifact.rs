@@ -12,6 +12,11 @@ use std::any::Any;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ArtifactKind {
     Text,
+    /// A located area on a page (a layout detection): the input to extraction.
+    Region,
+    /// Raw region text + word geometry, columns not yet committed (LiteParse-style
+    /// ASCII); `structure` turns it into an HtmlTable.
+    TextGrid,
     HtmlTable,
     DbTable,
     ChartData,
@@ -163,6 +168,96 @@ impl Artifact for HtmlTable {
     }
 }
 
+// ---- Region ---------------------------------------------------------------
+
+/// A located area on a page (a layout detection). Its resolved anchor IS its
+/// bbox, so it's both an artifact and the input a region-scoped extractor reads.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Region {
+    pub meta: Meta,
+    /// What the detector called it ("Table", "Figure", "Text", …).
+    pub label: String,
+    /// Detector / cross-model-agreement confidence in [0, 1].
+    pub confidence: f32,
+}
+
+impl Region {
+    /// The located bbox (the anchor's box).
+    pub fn bbox(&self) -> BBox {
+        match self.meta.provenance.anchor() {
+            SourceAnchor::Pdf { bbox, .. } => *bbox,
+            _ => BBox::new(0.0, 0.0, 0.0, 0.0),
+        }
+    }
+}
+
+impl Artifact for Region {
+    fn id(&self) -> ArtifactId {
+        self.meta.id.clone()
+    }
+    fn content_hash(&self) -> DocHash {
+        self.meta.content_hash
+    }
+    fn provenance(&self) -> &Provenance {
+        &self.meta.provenance
+    }
+    fn kind(&self) -> ArtifactKind {
+        ArtifactKind::Region
+    }
+    fn generation(&self) -> Generation {
+        self.meta.generation
+    }
+    fn risk(&self) -> &RiskMarkers {
+        &self.meta.risk
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+// ---- TextGrid -------------------------------------------------------------
+
+/// One positioned word (token) — the geometry `structure` clusters into columns.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Word {
+    pub text: String,
+    pub bbox: BBox,
+}
+
+/// A region's text as a faithful monospace block (`text`, for display) PLUS the
+/// word geometry (`words`, what `structure` actually clusters). Columns are not
+/// yet committed — this is the representation between a Region and an HtmlTable.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TextGrid {
+    pub meta: Meta,
+    pub text: String,
+    pub words: Vec<Word>,
+}
+
+impl Artifact for TextGrid {
+    fn id(&self) -> ArtifactId {
+        self.meta.id.clone()
+    }
+    fn content_hash(&self) -> DocHash {
+        self.meta.content_hash
+    }
+    fn provenance(&self) -> &Provenance {
+        &self.meta.provenance
+    }
+    fn kind(&self) -> ArtifactKind {
+        ArtifactKind::TextGrid
+    }
+    fn generation(&self) -> Generation {
+        self.meta.generation
+    }
+    fn risk(&self) -> &RiskMarkers {
+        &self.meta.risk
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 /// Serializable, kind-tagged envelope for persistence and round-tripping the
 /// open payload set through the flat store. The live pipeline uses
 /// `Box<dyn Artifact>`; the store speaks `StoredArtifact`.
@@ -170,16 +265,22 @@ impl Artifact for HtmlTable {
 #[serde(tag = "kind")]
 pub enum StoredArtifact {
     Text(ExtractedText),
+    Region(Region),
+    TextGrid(TextGrid),
     HtmlTable(HtmlTable),
 }
 
 impl StoredArtifact {
     pub fn from_dyn(a: &dyn Artifact) -> Option<StoredArtifact> {
-        if let Some(t) = a.as_any().downcast_ref::<ExtractedText>() {
+        let any = a.as_any();
+        if let Some(t) = any.downcast_ref::<ExtractedText>() {
             Some(StoredArtifact::Text(t.clone()))
+        } else if let Some(r) = any.downcast_ref::<Region>() {
+            Some(StoredArtifact::Region(r.clone()))
+        } else if let Some(g) = any.downcast_ref::<TextGrid>() {
+            Some(StoredArtifact::TextGrid(g.clone()))
         } else {
-            a.as_any()
-                .downcast_ref::<HtmlTable>()
+            any.downcast_ref::<HtmlTable>()
                 .map(|h| StoredArtifact::HtmlTable(h.clone()))
         }
     }
@@ -187,6 +288,8 @@ impl StoredArtifact {
     pub fn into_dyn(self) -> Box<dyn Artifact> {
         match self {
             StoredArtifact::Text(t) => Box::new(t),
+            StoredArtifact::Region(r) => Box::new(r),
+            StoredArtifact::TextGrid(g) => Box::new(g),
             StoredArtifact::HtmlTable(h) => Box::new(h),
         }
     }
@@ -194,6 +297,8 @@ impl StoredArtifact {
     pub fn meta(&self) -> &Meta {
         match self {
             StoredArtifact::Text(t) => &t.meta,
+            StoredArtifact::Region(r) => &r.meta,
+            StoredArtifact::TextGrid(g) => &g.meta,
             StoredArtifact::HtmlTable(h) => &h.meta,
         }
     }
