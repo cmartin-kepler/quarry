@@ -70,7 +70,7 @@ def _load_env():
 _load_env()
 DH = "0" * 64
 VISION_RATE, VISION_TIME = 0.02, 1.2
-BUILD = "cloud-page-27"  # bump on server changes; shown in the UI header to verify what's running
+BUILD = "cloud-bbox-28"  # bump on server changes; shown in the UI header to verify what's running
 
 INPUT_DIR = os.path.join(REPO, "input")
 # Friendlier display names for known files; any other PDF shows as its path under input/.
@@ -398,7 +398,9 @@ def _curl_json(args, timeout=180):
     return json.loads(r.stdout)
 
 
-def reducto_content(name, page):
+def reducto_parse(name, page):
+    """Full Reducto result for one page (cached). Its blocks carry accurate,
+    normalized bboxes — we use those rather than guessing from page text."""
     key = ("reducto", name, page)
     if key not in _provider:
         api = os.environ.get("REDUCTO_API_KEY")
@@ -408,9 +410,8 @@ def reducto_content(name, page):
         up = _curl_json(["-X", "POST", "https://platform.reducto.ai/upload",
                          "-H", f"Authorization: Bearer {api}", "-F", f"file=@{path}"])
         body = json.dumps({"document_url": up["file_id"], "options": {"chunking": {"chunk_mode": "page"}}})
-        d = _curl_json(["-X", "POST", "https://platform.reducto.ai/parse",
-                        "-H", f"Authorization: Bearer {api}", "-H", "Content-Type: application/json", "-d", body])
-        _provider[key] = "\n".join(c.get("content", "") for c in d.get("result", {}).get("chunks", []))
+        _provider[key] = _curl_json(["-X", "POST", "https://platform.reducto.ai/parse",
+                                     "-H", f"Authorization: Bearer {api}", "-H", "Content-Type: application/json", "-d", body])
     return _provider[key]
 
 
@@ -435,12 +436,27 @@ def llamaparse_content(name, page):
     return _provider[key]
 
 
-def _bbox_for_grid(grid, words):
-    """Derive a table's region from where its cell text sits on the PDF page —
-    robust across providers (Reducto gives normalized bboxes, LlamaParse none)."""
+def _table_element(grid, bbox, conf, page):
+    grid = [[c.strip() for c in row] for row in grid]
+    ev = explain_grid(grid, page)
+    try:
+        conf = round(float(conf), 3)           # some providers return "high"/"low"
+    except (TypeError, ValueError):
+        conf = 1.0
+    return {"label": "Table", "conf": conf, "bbox": bbox, "html": tt.to_html(grid),
+            "status": status_of(ev), "impression": ev.get("impression"), "signals": ev.get("signals", [])}
+
+
+def _bbox_from_words(grid, words, freq):
+    """Derive a table's bbox from where its cell text sits on the page. Anchor on
+    RARE tokens (≤2 occurrences) so common label words in surrounding prose don't
+    inflate the box; fall back to all matches if too few rare anchors."""
     cells = tokens(" ".join(c for row in grid for c in row))
-    pts = [w for w in words
-           if "".join(ch for ch in w["text"].lower() if ch.isalnum()) in cells]
+    def tok(w):
+        return "".join(ch for ch in w["text"].lower() if ch.isalnum())
+    pts = [w for w in words if tok(w) in cells and freq[tok(w)] <= 2]
+    if len(pts) < 3:
+        pts = [w for w in words if tok(w) in cells]
     if len(pts) < 3:
         return None
     return [min(w["x0"] for w in pts), min(w["top"] for w in pts),
@@ -448,20 +464,33 @@ def _bbox_for_grid(grid, words):
 
 
 def provider_layout(name, page, provider):
-    """Page-level parse: the cloud parser parses the whole page; we surface each
-    table as a Region carrying its already-parsed, validated HtmlTable (so clicking
-    it costs nothing more). Cost is one page-parse, charged once at this step."""
-    content = reducto_content(name, page) if provider == "reducto" else llamaparse_content(name, page)
-    words = pdf(name).pages[page-1].extract_words()
+    """Page-level parse: surface each table as a Region carrying its already-parsed,
+    validated HtmlTable (clicking it costs nothing more). Reducto gives accurate
+    per-block bboxes; for LlamaParse we derive the bbox from page text."""
+    pg = pdf(name).pages[page-1]
+    if provider == "reducto":
+        out = []
+        for ch in reducto_parse(name, page).get("result", {}).get("chunks", []):
+            for b in ch.get("blocks", []):
+                if b.get("type") != "Table":
+                    continue
+                grid, _ = rv.parse_html_grid(b.get("content", "") or "")
+                if not grid or len(grid) < 2:
+                    continue
+                bb = b["bbox"]
+                bbox = [bb["left"]*pg.width, bb["top"]*pg.height,
+                        (bb["left"]+bb["width"])*pg.width, (bb["top"]+bb["height"])*pg.height]
+                out.append(_table_element(grid, bbox, b.get("confidence", 1.0) or 1.0, page))
+        return out
+    # LlamaParse: markdown tables, bbox derived from page words (rare-anchored).
+    from collections import Counter
+    words = pg.extract_words()
+    freq = Counter("".join(ch for ch in w["text"].lower() if ch.isalnum()) for w in words)
     out = []
-    for g in grids_from_content(content):
-        bbox = _bbox_for_grid(g, words)
-        if not bbox:
-            continue
-        ev = explain_grid(g, page)
-        out.append({"label": "Table", "conf": 1.0, "bbox": bbox, "html": tt.to_html(g),
-                    "status": status_of(ev), "impression": ev.get("impression"),
-                    "signals": ev.get("signals", [])})
+    for g in grids_from_content(llamaparse_content(name, page)):
+        bbox = _bbox_from_words(g, words, freq)
+        if bbox:
+            out.append(_table_element(g, bbox, 1.0, page))
     return out
 
 
