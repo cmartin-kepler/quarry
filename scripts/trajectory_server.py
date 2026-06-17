@@ -71,7 +71,7 @@ def _load_env():
 _load_env()
 DH = "0" * 64
 VISION_RATE, VISION_TIME = 0.02, 1.2
-BUILD = "multihdr-35"  # bump on server changes; shown in the UI header to verify what's running
+BUILD = "multiindex-typed-36"  # bump on server changes; shown in the UI header to verify what's running
 
 INPUT_DIR = os.path.join(REPO, "input")
 # Friendlier display names for known files; any other PDF shows as its path under input/.
@@ -1066,7 +1066,7 @@ def _typed_payload(t):
     for c in t.columns:
         tf = Counter(x for cell in c.cells for x in cell.transforms)
         cols.append({"name": c.name, "dtype": c.dtype, "sql": _SQL[c.dtype],
-                     "nulls": sum(1 for v in c.values if v is None),
+                     "levels": c.levels, "nulls": sum(1 for v in c.values if v is None),
                      "transforms": dict(tf)})
     rows = [[(c.values[r] if r < len(c.values) else None) for c in t.columns]
             for r in range(min(t.n_rows, 60))]

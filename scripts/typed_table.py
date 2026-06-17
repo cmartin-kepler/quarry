@@ -154,10 +154,11 @@ class ProvCell:
 
 @dataclass
 class Column:
-    name: str
+    name: str                   # flattened name (the levels joined) — for SQL/display
     dtype: str                  # "int" | "float" | "percent" | "currency" | "label"
     values: list                # coerced to dtype (None = null)
     cells: list[ProvCell]
+    levels: list = field(default_factory=list)  # the multi-index path, e.g. ["2024", "Q1"]
 
 
 @dataclass
@@ -252,19 +253,22 @@ class TypedTable:
 # ---------------------------------------------------------------------------
 
 def _column_name(grid, header_rows, c, used):
-    parts = []
+    """Return (flattened name, levels). `levels` is the column's multi-index path —
+    the stacked header cells above it (deduped, top to bottom). The flat name is the
+    levels joined (uniquified), for SQL/display; the levels keep the hierarchy."""
+    levels = []
     for r in range(header_rows):
         if c < len(grid[r]):
             t = grid[r][c].strip()
-            if t and t not in parts:
-                parts.append(t)
-    name = " ".join(parts).strip() or f"col_{c}"
+            if t and t not in levels:
+                levels.append(t)
+    name = " ".join(levels).strip() or f"col_{c}"
     base, i = name, 2
     while name in used:
         name = f"{base}_{i}"
         i += 1
     used.add(name)
-    return name
+    return name, levels
 
 
 def materialize(grid: list[list[str]], header_rows: int = 1,
@@ -284,7 +288,7 @@ def materialize(grid: list[list[str]], header_rows: int = 1,
         nums = [i for i in meaningful if parsed[i] is not None]
 
         is_numeric = bool(nums) and len(nums) * 2 >= len(meaningful)  # majority parse
-        name = _column_name(grid, header_rows, c, used)
+        name, levels = _column_name(grid, header_rows, c, used)
 
         if is_numeric:
             is_percent = sum(1 for i in nums if parsed[i].percent) * 2 >= len(nums)
@@ -318,7 +322,7 @@ def materialize(grid: list[list[str]], header_rows: int = 1,
                 cells.append(ProvCell(v, s, p.transforms, box, ok=True))
                 values.append(v)
 
-        columns.append(Column(name, dtype, values, cells))
+        columns.append(Column(name, dtype, values, cells, levels=levels))
 
     return TypedTable(columns, source=source, violations=violations)
 

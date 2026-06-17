@@ -375,6 +375,26 @@ function renderNext(n){const r=n.result,nx=nextOps(n),isPage=r.atype==='page';
  return h;}
 
 const DT={int:'#1a5a40',float:'#1a5a40',currency:'#1a5a40',percent:'#7a4fa3',label:'#9aa39e'};
+// Multi-index header: one <tr> per level depth; a level shared by adjacent columns
+// (a spanning parent) collapses into a colspan; the leaf row carries the dtype.
+function typedHeader(cols){
+ const depth=Math.max(1,...cols.map(c=>(c.levels&&c.levels.length)||1));
+ let h='';
+ for(let lvl=0;lvl<depth;lvl++){
+   h+='<tr>';let i=0;
+   while(i<cols.length){
+     const lv=cols[i].levels||[];
+     const val=(lv.length?(lv[lvl]||''):(lvl===depth-1?cols[i].name:''));
+     let j=i+1;
+     while(j<cols.length && val!=='' && (((cols[j].levels||[])[lvl])||'')===val) j++;
+     const span=j-i, leaf=lvl===depth-1;
+     h+='<th'+(span>1?' colspan='+span:'')+'>'+(val||'')+
+        (leaf?'<div class="dt" style="color:'+(DT[cols[i].dtype]||'#888')+'">'+cols[i].dtype+'</div>':'')+'</th>';
+     i=j;
+   }
+   h+='</tr>';
+ }
+ return h;}
 function typedHtml(res,id){
  const tidy=!!tidyOn[id],view=tidy?res.tidy:res;
  let h='<div style="margin-top:10px">';
@@ -382,7 +402,7 @@ function typedHtml(res,id){
    '<button class="btn'+(tidy?'':' ghost')+'" onclick="tidyOn['+id+']=true;renderPanel()" title="one value per row, keyed by the label columns — the shape for analysis">tidy (melt)</button>'+
    (res.sections?'<span class="dim" style="margin-left:8px">▸ nested section headers promoted to a <b>Section</b> column</span>':'')+'</div>';
  h+='<div class="dim" style="margin-bottom:4px">⤓ typed table — '+(tidy?'tidy/long · ':'')+'materialized · '+view.n_rows+' rows · non-reversible (parent HtmlTable retained)</div>';
- h+='<div class="tbl"><table><tr>'+view.columns.map(c=>'<th>'+c.name+'<div class="dt" style="color:'+(DT[c.dtype]||'#888')+'">'+c.dtype+'</div></th>').join('')+'</tr>';
+ h+='<div class="tbl"><table>'+typedHeader(view.columns);
  view.rows.forEach(row=>{h+='<tr>'+row.map(v=>'<td class="'+(typeof v==='number'?'num':'')+'">'+(v===null?'<span class="dim">·</span>':v)+'</td>').join('')+'</tr>';});
  h+='</table></div>';
  const chips=view.columns.filter(c=>Object.keys(c.transforms).length).map(c=>'<b>'+c.name+'</b>: '+Object.entries(c.transforms).map(t=>t[0]+'×'+t[1]).join(', '));
