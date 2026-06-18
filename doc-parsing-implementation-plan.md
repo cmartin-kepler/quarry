@@ -215,6 +215,11 @@ lands; add the new artifact kinds to the ground-truth diff.
   every generation so the whole DAG lands in the registry. CLI `quarry chain <file>
   --ops regions,text-grid,structure,sign-fix` runs the native op graph end to end
   (verified: 68 artifacts / 51 lineage edges).
-  - **Remaining E:** the `route()` escalation policy (pick the next op when an
-    artifact is flagged — demand-driven, not a fixed chain), lazy staleness (brief
-    §7), and repointing the thin Python test UI at the Rust core.
+  - **route() escalation done:** `route.rs` — `route(flags, html, tried)` picks the
+    next op best-first (cheap targeted fix → re-parse), and `escalate(...)` applies
+    it, re-checks, and keeps the result only if it cuts the error count, up to a
+    budget. The extractor resolver is injected (tests use stubs); a candidate whose
+    sidecar tool is missing is skipped, not fatal. CLI `parse --escalate` (verified:
+    +4 escalated attempts on the corpus, docling gracefully skipped).
+  - **Remaining E:** lazy staleness (brief §7 — needs a job queue) and repointing
+    the thin Python test UI at the Rust core (wants your steer on how thin).
