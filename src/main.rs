@@ -35,6 +35,9 @@ enum Command {
         tier: u8,
         #[arg(long)]
         source: Option<PathBuf>,
+        /// Demand-driven: re-parse/repair tables that fail their checks.
+        #[arg(long)]
+        escalate: bool,
         #[arg(long)]
         out: PathBuf,
     },
@@ -91,8 +94,8 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Command::Parse { file, op, tier, source, out } => {
-            cmd_parse(&file, op.as_deref(), tier, source.as_deref(), &out)
+        Command::Parse { file, op, tier, source, escalate, out } => {
+            cmd_parse(&file, op.as_deref(), tier, source.as_deref(), escalate, &out)
         }
         Command::Chain { file, ops, source, out } => {
             cmd_chain(&file, &ops, source.as_deref(), &out)
@@ -294,6 +297,7 @@ fn cmd_parse(
     op: Option<&str>,
     tier: u8,
     source: Option<&Path>,
+    escalate: bool,
     out: &Path,
 ) -> Result<()> {
     let (doc, doc_hash) = load_doc(file)?;
@@ -305,20 +309,40 @@ fn cmd_parse(
             .ok_or_else(|| anyhow::anyhow!("unknown op `{id}`"))?,
         None => pipeline::extractor_for(doc.format, tier)?,
     };
-    let artifacts = pipeline::run_document_extractor(
+    let mut artifacts = pipeline::run_document_extractor(
         &doc,
         doc_hash,
-        source_path,
+        source_path.clone(),
         quarry::core::Generation(0),
         extractor.as_ref(),
     )?;
+
+    let mut escalated = 0usize;
+    if escalate {
+        let arith = IntrinsicArithmetic::default();
+        let structural = StructuralValidity;
+        let checks: Vec<&dyn QualityCheck> = vec![&arith, &structural];
+        let extra = quarry::route::escalate(
+            &doc,
+            doc_hash,
+            source_path,
+            &artifacts,
+            &checks,
+            3,
+            &|id| pipeline::extractor_by_id(id),
+        )?;
+        escalated = extra.len();
+        artifacts.extend(extra);
+    }
+
     let n_tables = adjudicate_and_store(&artifacts, doc_hash, out)?;
     println!(
-        "parsed {} with `{}` (doc {}) → {} artifact(s), {} table(s) → {}",
+        "parsed {} with `{}` (doc {}) → {} artifact(s){}, {} table(s) → {}",
         file.display(),
         op.unwrap_or("pdf-text"),
         doc_hash.short(),
         artifacts.len(),
+        if escalate { format!(" (+{escalated} escalated)") } else { String::new() },
         n_tables,
         out.display()
     );

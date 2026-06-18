@@ -32,5 +32,6 @@ pub mod extract;
 pub mod grid;
 pub mod ops;
 pub mod pipeline;
+pub mod route;
 pub mod sidecar;
 pub mod store;
