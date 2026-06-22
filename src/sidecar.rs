@@ -207,6 +207,114 @@ impl Extractor for LiteParseSidecar {
 }
 
 // ---------------------------------------------------------------------------
+// Docling-on-crop — region-scoped escalation: Region{Table} → HtmlTable.
+// (Build-plan Step C-docling: crop the table, run Docling only on it, translate
+// the crop-relative result back to page coords. Docling reports a crop as its own
+// 1-page document — confirmed empirically — so coordinate map #2 applies.)
+// ---------------------------------------------------------------------------
+
+/// Translate docling-on-crop tables from crop-relative coordinates back to page
+/// coordinates (coordinate map #2): every cell anchor and the table's own anchor
+/// shift by the crop origin (`x0`, `y0`) and re-anchor to the real `page`. Without
+/// this the anchors point at the crop, not the source page.
+fn rebase_crop_tables(
+    tables: Vec<Box<dyn Artifact>>,
+    doc: DocHash,
+    page: u32,
+    x0: f32,
+    y0: f32,
+) -> Vec<Box<dyn Artifact>> {
+    use crate::coords::crop_to_page;
+    tables
+        .into_iter()
+        .map(|a| match a.as_any().downcast_ref::<HtmlTable>() {
+            Some(t) => {
+                let mut t = t.clone();
+                if let SourceAnchor::Pdf { bbox, .. } = *t.meta.provenance.anchor() {
+                    t.meta.provenance = Provenance::Source(SourceAnchor::Pdf {
+                        doc,
+                        page,
+                        bbox: crop_to_page(bbox, x0, y0),
+                    });
+                }
+                for c in &mut t.cells {
+                    if let SourceAnchor::Pdf { bbox, .. } = c.anchor {
+                        c.anchor = SourceAnchor::Pdf { doc, page, bbox: crop_to_page(bbox, x0, y0) };
+                    }
+                }
+                Box::new(t) as Box<dyn Artifact>
+            }
+            None => a,
+        })
+        .collect()
+}
+
+/// Region-scoped Docling (build-plan Step C-docling): crop a `Region{Table}` and
+/// run Docling only on it (escalation, not whole-page), then translate the
+/// crop-relative result back to page coordinates. The resulting `HtmlTable`
+/// competes for the same source slot as the cheap parse — what `cross_tier` /
+/// `resolve` arbitrate between.
+pub struct DoclingCropSidecar {
+    pub cmd: Vec<String>,
+}
+
+impl DoclingCropSidecar {
+    pub fn default_cmd() -> Self {
+        DoclingCropSidecar {
+            cmd: vec!["uv".into(), "run".into(), "scripts/docling_crop.py".into()],
+        }
+    }
+}
+
+const DOCLING_CROP_ACCEPTS: [InputKind; 1] = [InputKind::Artifact(ArtifactKind::Region)];
+
+impl Extractor for DoclingCropSidecar {
+    fn id(&self) -> ExtractorId {
+        ExtractorId("docling-crop".into())
+    }
+    fn version(&self) -> Version {
+        Version(1)
+    }
+    fn cost_tier(&self) -> CostTier {
+        CostTier(2)
+    }
+    fn op_kind(&self) -> OpKind {
+        OpKind::Extract
+    }
+    fn accepts(&self) -> &[InputKind] {
+        &DOCLING_CROP_ACCEPTS
+    }
+    fn produces(&self) -> ArtifactKind {
+        ArtifactKind::HtmlTable
+    }
+    fn extract(&self, input: ExtractInput<'_>, ctx: &ExtractCtx<'_>) -> Result<Vec<Box<dyn Artifact>>> {
+        let arts = match input {
+            ExtractInput::Artifacts(a) => a,
+            ExtractInput::DocumentRegion { .. } => bail!("docling-crop consumes a Region artifact"),
+        };
+        let region = arts
+            .iter()
+            .find_map(|a| a.as_any().downcast_ref::<Region>())
+            .ok_or_else(|| anyhow::anyhow!("docling-crop expects a Region input"))?;
+        let (doc, page, bbox) = match region.provenance().anchor() {
+            SourceAnchor::Pdf { doc, page, bbox } => (*doc, *page, *bbox),
+            _ => bail!("docling-crop only handles PDF regions"),
+        };
+        let mut cmd = self.cmd.clone();
+        if let Some(p) = &ctx.source_path {
+            cmd.push(p.display().to_string());
+        }
+        cmd.push(page.to_string());
+        for v in [bbox.x0, bbox.y0, bbox.x1, bbox.y1] {
+            cmd.push(v.to_string());
+        }
+        let json = run_capture(&cmd)?;
+        let tables = artifacts_from_docling(&json, doc, ctx.generation)?;
+        Ok(rebase_crop_tables(tables, doc, page, bbox.x0, bbox.y0))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Layout models — detect regions: DocumentRegion(page) → Region(s).
 // (YOLO / DocLayout-YOLO / Surya, each a `LayoutSidecar` with its own command.)
 // ---------------------------------------------------------------------------
@@ -601,6 +709,47 @@ mod tests {
         assert_eq!(rs.len(), 1);
         assert_eq!(rs[0].bbox(), BBox::new(50.0, 100.0, 540.0, 300.0), "pixels/2 = points");
         assert_eq!(rs[0].role(), crate::artifact::RegionRole::Table);
+    }
+
+    #[test]
+    fn docling_crop_rebases_cells_to_page_coords() {
+        // Real Docling-on-crop output (sample.docling_crop.json was produced by
+        // docling_crop.py on corpus/synthetic.pdf table 0 at page top-left 78,149.2).
+        // Docling reported it as its own 360x108 page in CROP coords; the sidecar
+        // must translate cells back to PAGE coords and re-anchor to the real page.
+        let dh = DocHash::of(b"pdf");
+        let doc = QDoc { format: DocFormat::Pdf, pages: vec![] };
+        let region = Region {
+            meta: Meta {
+                id: ArtifactId::mint(&dh, Generation(0)),
+                content_hash: dh,
+                provenance: Provenance::Source(SourceAnchor::Pdf {
+                    doc: dh,
+                    page: 3,
+                    bbox: BBox::new(78.0, 149.2, 438.0, 257.2),
+                }),
+                generation: Generation(0),
+                risk: RiskMarkers::default(),
+                origin: Origin::default(),
+            },
+            label: "Table".into(),
+            confidence: 1.0,
+        };
+        let s = DoclingCropSidecar { cmd: echo("tests/data/sample.docling_crop.json") };
+        let out = s.extract(ExtractInput::Artifacts(&[&region]), &ctx(&doc)).unwrap();
+        let t = out[0].as_any().downcast_ref::<HtmlTable>().expect("an HtmlTable");
+        assert!(!t.cells.is_empty(), "docling found cells");
+        // every cell re-anchored to the region's REAL page (3), not the crop's page 1
+        assert!(t.cells.iter().all(|c| matches!(c.anchor, SourceAnchor::Pdf { page: 3, .. })));
+        // "Line item" was at crop top-left (6, 5.8); rebased it sits inside the region
+        let cell = t.cells.iter().find(|c| c.text.contains("Line")).expect("the 'Line item' cell");
+        match cell.anchor {
+            SourceAnchor::Pdf { bbox, .. } => {
+                assert!((78.0..120.0).contains(&bbox.x0), "x0={} ~ page 84 expected", bbox.x0);
+                assert!((149.0..175.0).contains(&bbox.y0), "y0={} ~ page 155 expected", bbox.y0);
+            }
+            _ => panic!("expected a PDF anchor"),
+        }
     }
 
     #[test]
