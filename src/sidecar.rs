@@ -219,6 +219,12 @@ fn bbox4(a: [f32; 4]) -> BBox {
 struct LayoutOut {
     #[serde(default)]
     regions: Vec<LayoutRegion>,
+    /// Render scale (pixels-per-point) when the model reported bboxes in image
+    /// PIXELS (e.g. YOLO over a rendered page). Absent/1.0 ⇒ bboxes are already in
+    /// PDF points. The adapter owns coordinate map #1 (build-plan §3), so the
+    /// conversion is pinned in tested Rust rather than trusted to the sidecar.
+    #[serde(default)]
+    scale: Option<f32>,
 }
 #[derive(Deserialize)]
 struct LayoutRegion {
@@ -239,12 +245,19 @@ fn one() -> f32 {
 /// top-left coords) into Region artifacts on `page`.
 pub fn regions_from_json(json: &str, doc: DocHash, page: u32, generation: Generation) -> Result<Vec<Region>> {
     let lo: LayoutOut = serde_json::from_str(json).context("parsing layout JSON")?;
+    let scale = lo.scale.unwrap_or(1.0);
     Ok(lo
         .regions
         .into_iter()
         .enumerate()
         .map(|(i, r)| {
-            let bbox = bbox4(r.bbox);
+            // coordinate map #1: pixels → points when the model rendered at `scale`;
+            // scale 1.0 means the boxes are already in points (back-compat).
+            let bbox = if scale != 1.0 {
+                crate::coords::pixels_to_points(bbox4(r.bbox), scale)
+            } else {
+                bbox4(r.bbox)
+            };
             let content = DocHash::of(format!("layout:{page}:{i}:{}:{bbox:?}", r.label).as_bytes());
             Region {
                 meta: Meta {
@@ -569,6 +582,18 @@ mod tests {
             SourceAnchor::Pdf { page, .. } => assert_eq!(*page, 2),
             _ => panic!("expected a PDF region anchor"),
         }
+    }
+
+    #[test]
+    fn regions_adapter_converts_pixel_boxes_at_scale() {
+        // coordinate map #1: a model reporting pixels at 2x render scale → the
+        // adapter halves them into PDF points. Without `scale` (prior test) the
+        // boxes are taken as points unchanged.
+        let json = r#"{"scale":2.0,"regions":[{"label":"Table","bbox":[100.0,200.0,1080.0,600.0]}]}"#;
+        let rs = regions_from_json(json, DocHash::of(b"d"), 1, Generation(0)).unwrap();
+        assert_eq!(rs.len(), 1);
+        assert_eq!(rs[0].bbox(), BBox::new(50.0, 100.0, 540.0, 300.0), "pixels/2 = points");
+        assert_eq!(rs[0].role(), crate::artifact::RegionRole::Table);
     }
 
     #[test]
