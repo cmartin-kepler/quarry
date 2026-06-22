@@ -29,9 +29,9 @@ PDF page
   │                               (skip docling's table-model waste now; OCR later)
   │
   ├─ STAGE 1 — parse (text pages) ─────────────────────────────────────
-  │    docling whole-page  → HtmlTable(s) + clean table bboxes   (PRIMARY)
-  │    litparse            → TextGrid (faithful text-layer tokens) (cross-check)
-  │    [YOLO optional: independent table/region cross-check + anchor]
+  │    docling whole-page  → HtmlTable(s) + clean table bboxes   (PRIMARY; finds tables itself)
+  │    litparse (docling's bbox) → TextGrid (faithful text-layer tokens) (cross-check)
+  │    [no external layout model — see below]
   │
   ├─ STAGE 2 — repair the HTML "until it makes sense" ─────────────────
   │    detectors define "makes sense": StructuralValidity, IntrinsicArithmetic,
@@ -87,11 +87,17 @@ On a text page, run **both**:
 - **litparse → `TextGrid`** (faithful text-layer tokens + geometry): the
   value-fidelity reference, cross-checked against the HTML.
 
-**YOLO's role has narrowed** to an *optional* independent table/region cross-check
-(does docling's detection agree?) and region anchoring. It is **not** a docling
-speed gate (gating doesn't save) and **not** the "worth parsing" gate (Stage 0's
-cheap triage is cheaper and does that without a model). Use yolo26n if used at all
-(~80ms/page; doclayout was ~5× slower for no quality gain).
+**No external layout model — YOLO is removed.** Every job we once assigned it is
+now covered without it: the "worth parsing" gate is Stage 0 (cheaper, no model),
+and table detection + clean bboxes come from docling's own internal layout (which
+was the reference parse in the probe). Removing YOLO also drops its env
+(torch/ultralytics/doclayout-yolo), the layout sidecar, and **coordinate map #1**
+(pixel→point — only existed to place YOLO's pixel boxes; docling reports points).
+If we ever want an *independent* "did docling miss or mis-bound a table" check, it
+is the **model-free geometry already built** — ruling-lines/vector graphics,
+whitespace XY-cut segmentation, and column-alignment over the PDF text layer — which
+is cheaper than YOLO, decorrelated, and needs no render or GPU. Add it only if
+measurements show docling missing tables; until then docling's detection stands.
 
 ## Stage 2 — repair the HTML
 
@@ -143,10 +149,14 @@ The repair loop *is* the append-only substrate, already in place:
 ## Build status
 
 - **Done:** the substrate (§A: append-only, `Origin`, `resolve`, `element_id`),
-  region-quality checks + XY-cut segmenter + column-alignment, coordinate adapters,
-  reading-order structured text, `ImageRef`/figure markers, region-scoped docling +
-  rebase, the model env (docling/yolo26n/litparse via `uv`), and the measurement
-  harnesses (probe, corpus cost, stage cost, blank discriminator).
+  reading-order structured text, `ImageRef`/figure markers, the docling/litparse
+  sidecars + env via `uv`, and the measurement harnesses (probe, corpus cost, stage
+  cost, blank discriminator).
+- **Built but now OPTIONAL / not core** (consequence of removing YOLO): the
+  region-quality checks + XY-cut segmenter + column-alignment become the *optional*
+  model-free "did docling miss a table" cross-check; coordinate map #1 (pixel→point)
+  and the layout sidecar are dropped; region-scoped docling + crop→page (map #2) are
+  unused in the whole-page-default path (kept for a possible future crop/escalation).
 - **To build, in order:**
   1. **Stage 0 triage** (word-count + image-area + thumbnail-stddev → text / blank /
      image-content), emitting `ImageRef{ocr: deferred}` for content image pages.
