@@ -24,6 +24,7 @@ pub mod analysis;
 pub mod artifact;
 pub mod check;
 pub mod columns;
+pub mod coords;
 pub mod core;
 pub mod doc;
 pub mod docling;

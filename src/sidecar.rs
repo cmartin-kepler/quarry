@@ -263,7 +263,7 @@ pub fn regions_from_json(json: &str, doc: DocHash, page: u32, generation: Genera
 }
 
 pub struct LayoutSidecar {
-    /// Model id (e.g. "yolo26", "surya"); becomes the ExtractorId.
+    /// Model id (e.g. "yolo26n", "surya"); becomes the ExtractorId.
     pub model: String,
     pub cmd: Vec<String>,
 }
@@ -543,7 +543,7 @@ mod tests {
         let dh = DocHash::of(b"pdf");
         let doc = QDoc { format: DocFormat::Pdf, pages: vec![] };
         let anchor = SourceAnchor::Pdf { doc: dh, page: 2, bbox: BBox::new(0.0, 0.0, 600.0, 800.0) };
-        let s = LayoutSidecar { model: "yolo26".into(), cmd: echo("tests/data/sample.layout.json") };
+        let s = LayoutSidecar { model: "yolo26n".into(), cmd: echo("tests/data/sample.layout.json") };
         let out = s.extract(ExtractInput::DocumentRegion { doc: dh, anchor }, &ctx(&doc)).unwrap();
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|a| a.kind() == ArtifactKind::Region));
@@ -551,7 +551,7 @@ mod tests {
         assert_eq!(r.label, "Table");
         assert!((r.confidence - 0.97).abs() < 1e-3);
         assert_eq!(s.op_kind(), OpKind::Layout);
-        assert_eq!(s.id(), ExtractorId("yolo26".into()));
+        assert_eq!(s.id(), ExtractorId("yolo26n".into()));
     }
 
     #[test]

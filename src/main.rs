@@ -28,7 +28,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run an extractor and emit artifacts (HTML + manifest) to <out>. Choose a
-    /// named op with `--op` (e.g. pdf-text, docling, reducto, yolo26) or a tier;
+    /// named op with `--op` (e.g. pdf-text, docling, reducto, yolo26n) or a tier;
     /// sidecars run on `--source` (the original file) if it isn't `file` itself.
     Parse {
         file: PathBuf,
@@ -96,6 +96,11 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Segment a page from its word boxes: read JSON `[{text,x0,y0,x1,y1}]`, run the
+    /// model-free XY-cut segmenter (build-plan B′'s independent region source) plus
+    /// column-alignment, and print the discovered blocks. Exercises region quality
+    /// on real pdfplumber word boxes — no YOLO required.
+    Regions { words: PathBuf },
 }
 
 fn main() -> Result<()> {
@@ -122,7 +127,40 @@ fn main() -> Result<()> {
         Command::Explain { artifact_dir, suspect_only, json } => {
             cmd_explain(&artifact_dir, suspect_only, json)
         }
+        Command::Regions { words } => cmd_regions(&words),
     }
+}
+
+/// Run the model-free region machinery on a page's word boxes (build-plan B′):
+/// XY-cut segmentation + per-block column-alignment. A dev/inspection tool that
+/// exercises `segment` and `columns` on real spans without a layout model.
+fn cmd_regions(words: &Path) -> Result<()> {
+    use quarry::artifact::Word;
+    use quarry::columns::{column_count, COLUMN_GUTTER};
+    use quarry::core::BBox;
+    use quarry::segment::{xy_cut, CutParams};
+
+    #[derive(serde::Deserialize)]
+    struct WordIn { text: String, x0: f32, y0: f32, x1: f32, y1: f32 }
+
+    let ins: Vec<WordIn> = serde_json::from_slice(&std::fs::read(words)?)?;
+    let spans: Vec<Word> = ins
+        .iter()
+        .map(|w| Word { text: w.text.clone(), bbox: BBox::new(w.x0, w.y0, w.x1, w.y1) })
+        .collect();
+
+    let blocks = xy_cut(&spans, &CutParams::default());
+    println!("{} spans → {} blocks (XY-cut, model-free)", spans.len(), blocks.len());
+    for (i, b) in blocks.iter().enumerate() {
+        let inside: Vec<Word> = spans.iter().filter(|w| b.contains_center(&w.bbox)).cloned().collect();
+        let cols = column_count(&inside, COLUMN_GUTTER);
+        let preview: String = inside.iter().take(10).map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
+        println!(
+            "  block {i}: ({:.0},{:.0})-({:.0},{:.0})  words={:<4} cols={}  | {}",
+            b.x0, b.y0, b.x1, b.y1, inside.len(), cols, preview
+        );
+    }
+    Ok(())
 }
 
 fn cmd_explain(artifact_dir: &Path, suspect_only: bool, json: bool) -> Result<()> {
