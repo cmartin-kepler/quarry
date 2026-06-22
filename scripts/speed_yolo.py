@@ -26,7 +26,7 @@ ap.add_argument("--model", default="doclayout")
 ap.add_argument("--out", required=True)
 a = ap.parse_args()
 
-pages = [int(x) for x in a.pages.split(",")]
+pages = [int(x) for x in a.pages.split(",") if x.strip()]
 doc = pdfium.PdfDocument(a.pdf)
 SCALE = 2.0
 
