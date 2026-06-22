@@ -104,6 +104,10 @@ The **MVP vertical slice** to prove the whole thing end-to-end early:
 DbTable loads as a dataframe`. Then thicken with the litparse cross-check (2.2),
 repair (Phase 3), and the normalizers (4.3/4.4).
 
+**MVP cell handling is trivial:** just clean cell strings — strip dot-leaders and
+whitespace (`13......` → `13`), normalize empties. No multi-index, no
+section-promotion, no repair loop yet — those are the post-MVP thickening.
+
 Rationale: Phase 1 is independent, cheap, and immediately useful (and is the only
 real cost win). Phase 2 is the core parse and is mostly wiring sidecars that already
 exist. Phase 4 is the payoff and only needs Phase 2's `HtmlTable`. Phase 3 needs

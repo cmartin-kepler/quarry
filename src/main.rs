@@ -112,6 +112,10 @@ enum Command {
         #[arg(long)]
         words: PathBuf,
     },
+    /// Stage-0 page triage: classify every page (text / image_content / blank) via
+    /// scripts/triage.py and report. The cheap gate that keeps image/blank pages
+    /// out of docling (where the table-structure model wastes ~950ms on an image).
+    Triage { pdf: PathBuf },
 }
 
 fn main() -> Result<()> {
@@ -140,7 +144,31 @@ fn main() -> Result<()> {
         }
         Command::Regions { words } => cmd_regions(&words),
         Command::RegionCheck { regions, words } => cmd_region_check(&regions, &words),
+        Command::Triage { pdf } => cmd_triage(&pdf),
     }
+}
+
+/// Stage-0 triage: run scripts/triage.py via uv, classify pages, report.
+fn cmd_triage(pdf: &Path) -> Result<()> {
+    use quarry::triage::{counts, parse};
+    let out = std::process::Command::new("uv")
+        .args(["run", "scripts/triage.py", &pdf.display().to_string()])
+        .output()
+        .with_context(|| "running scripts/triage.py via uv")?;
+    if !out.status.success() {
+        anyhow::bail!("triage.py failed: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    let pages = parse(&String::from_utf8_lossy(&out.stdout))?;
+    let (t, i, b) = counts(&pages);
+    println!("{} pages: {t} text, {i} image_content (OCR-deferred), {b} blank", pages.len());
+    for p in &pages {
+        let sd = p.stddev.map(|s| format!("{s:.1}")).unwrap_or_else(|| "-".into());
+        println!(
+            "  p{:<4} {:?}  words={} img={:.2} stddev={}",
+            p.page, p.klass, p.words, p.image_frac, sd
+        );
+    }
+    Ok(())
 }
 
 /// Run the full Step B′ region-quality check on a layout model's regions vs a

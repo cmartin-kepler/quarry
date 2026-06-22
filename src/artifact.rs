@@ -253,9 +253,22 @@ impl Region {
 /// with extraction *deferred* — never an empty hole someone mistakes for a bug. A
 /// future figure/chart extractor is a competing artifact on the same `element_id`
 /// (additive, invariant 9).
+/// Why an image area was recorded but not parsed (invariant 11: no silent gaps).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImageStatus {
+    /// A figure region; pixel extraction deferred.
+    #[default]
+    Figure,
+    /// A whole page that is image content with no text layer; OCR deferred
+    /// (Stage-0 triage flagged it `image_content` — a future OCR target).
+    OcrDeferred,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ImageRef {
     pub meta: Meta,
+    #[serde(default)]
+    pub status: ImageStatus,
     /// Path to a rendered crop of the image, if one was produced (None until
     /// rendering lands; the marker is useful without it).
     #[serde(default)]
@@ -279,6 +292,25 @@ impl ImageRef {
                 risk: RiskMarkers::default(),
                 origin: Origin::default(),
             },
+            status: ImageStatus::Figure,
+            crop: None,
+        }
+    }
+
+    /// Build the OCR-deferred marker for a whole image-content page (Stage-0 triage).
+    /// The anchor is the full page; a future OCR pass targets exactly these.
+    pub fn ocr_deferred(doc: DocHash, page: u32, bbox: BBox) -> ImageRef {
+        let content = DocHash::of(format!("ocrpage:{}:{page}", doc.hex()).as_bytes());
+        ImageRef {
+            meta: Meta {
+                id: ArtifactId::mint(&content, Generation(0)),
+                content_hash: content,
+                provenance: Provenance::Source(SourceAnchor::Pdf { doc, page, bbox }),
+                generation: Generation(0),
+                risk: RiskMarkers::default(),
+                origin: Origin::default(),
+            },
+            status: ImageStatus::OcrDeferred,
             crop: None,
         }
     }
