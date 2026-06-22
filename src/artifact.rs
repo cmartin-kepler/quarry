@@ -14,6 +14,9 @@ pub enum ArtifactKind {
     Text,
     /// A located area on a page (a layout detection): the input to extraction.
     Region,
+    /// A recorded image region whose extraction is deferred (invariant 11: no
+    /// silent gaps — the area is a known image, not an empty hole).
+    Image,
     /// Raw region text + word geometry, columns not yet committed (LiteParse-style
     /// ASCII); `structure` turns it into an HtmlTable.
     TextGrid,
@@ -236,6 +239,87 @@ impl Region {
     }
 }
 
+// ---- ImageRef -------------------------------------------------------------
+
+/// A recorded-but-not-extracted image region (invariant 11: no silent gaps).
+/// A `Figure` region yields one of these, so downstream knows the area IS an image
+/// with extraction *deferred* — never an empty hole someone mistakes for a bug. A
+/// future figure/chart extractor is a competing artifact on the same `element_id`
+/// (additive, invariant 9).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ImageRef {
+    pub meta: Meta,
+    /// Path to a rendered crop of the image, if one was produced (None until
+    /// rendering lands; the marker is useful without it).
+    #[serde(default)]
+    pub crop: Option<String>,
+}
+
+impl ImageRef {
+    /// Build the deferred-extraction marker for a region (intended for `Figure`).
+    /// Derived from the region (its bbox is the anchor), with a deterministic id.
+    pub fn from_region(region: &Region) -> ImageRef {
+        let content = DocHash::of(format!("image:{}", region.id()).as_bytes());
+        ImageRef {
+            meta: Meta {
+                id: ArtifactId::mint(&content, region.generation()),
+                content_hash: content,
+                provenance: Provenance::Derived {
+                    parents: vec![region.id()],
+                    anchor: region.provenance().anchor().clone(),
+                },
+                generation: region.generation(),
+                risk: RiskMarkers::default(),
+                origin: Origin::default(),
+            },
+            crop: None,
+        }
+    }
+
+    /// The image's located bbox (the anchor's box).
+    pub fn bbox(&self) -> BBox {
+        match self.meta.provenance.anchor() {
+            SourceAnchor::Pdf { bbox, .. } => *bbox,
+            _ => BBox::new(0.0, 0.0, 0.0, 0.0),
+        }
+    }
+}
+
+impl Artifact for ImageRef {
+    fn id(&self) -> ArtifactId {
+        self.meta.id.clone()
+    }
+    fn content_hash(&self) -> DocHash {
+        self.meta.content_hash
+    }
+    fn provenance(&self) -> &Provenance {
+        &self.meta.provenance
+    }
+    fn kind(&self) -> ArtifactKind {
+        ArtifactKind::Image
+    }
+    fn generation(&self) -> Generation {
+        self.meta.generation
+    }
+    fn risk(&self) -> &RiskMarkers {
+        &self.meta.risk
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// The `FigureMarker` op (build-plan Step C): turn every `Figure` region into a
+/// recorded `ImageRef` (invariant 11). Non-figure regions are left for their own
+/// extractors; figures are recorded, not dropped.
+pub fn figure_markers(regions: &[Region]) -> Vec<ImageRef> {
+    regions
+        .iter()
+        .filter(|r| r.role() == RegionRole::Figure)
+        .map(ImageRef::from_region)
+        .collect()
+}
+
 impl Artifact for Region {
     fn id(&self) -> ArtifactId {
         self.meta.id.clone()
@@ -313,6 +397,7 @@ pub enum StoredArtifact {
     Region(Region),
     TextGrid(TextGrid),
     HtmlTable(HtmlTable),
+    Image(ImageRef),
 }
 
 impl StoredArtifact {
@@ -324,6 +409,8 @@ impl StoredArtifact {
             Some(StoredArtifact::Region(r.clone()))
         } else if let Some(g) = any.downcast_ref::<TextGrid>() {
             Some(StoredArtifact::TextGrid(g.clone()))
+        } else if let Some(i) = any.downcast_ref::<ImageRef>() {
+            Some(StoredArtifact::Image(i.clone()))
         } else {
             any.downcast_ref::<HtmlTable>()
                 .map(|h| StoredArtifact::HtmlTable(h.clone()))
@@ -336,6 +423,7 @@ impl StoredArtifact {
             StoredArtifact::Region(r) => Box::new(r),
             StoredArtifact::TextGrid(g) => Box::new(g),
             StoredArtifact::HtmlTable(h) => Box::new(h),
+            StoredArtifact::Image(i) => Box::new(i),
         }
     }
 
@@ -345,6 +433,64 @@ impl StoredArtifact {
             StoredArtifact::Region(r) => &r.meta,
             StoredArtifact::TextGrid(g) => &g.meta,
             StoredArtifact::HtmlTable(h) => &h.meta,
+            StoredArtifact::Image(i) => &i.meta,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn region(label: &str, bbox: BBox) -> Region {
+        let dh = DocHash::of(label.as_bytes());
+        Region {
+            meta: Meta {
+                id: ArtifactId::mint(&dh, Generation(0)),
+                content_hash: dh,
+                provenance: Provenance::Source(SourceAnchor::Pdf { doc: dh, page: 2, bbox }),
+                generation: Generation(0),
+                risk: RiskMarkers::default(),
+                origin: Origin::default(),
+            },
+            label: label.into(),
+            confidence: 1.0,
+        }
+    }
+
+    #[test]
+    fn region_role_maps_common_layout_labels() {
+        assert_eq!(RegionRole::from_label("Table"), RegionRole::Table);
+        assert_eq!(RegionRole::from_label("picture"), RegionRole::Figure);
+        assert_eq!(RegionRole::from_label("Section-Header"), RegionRole::Text);
+        assert_eq!(RegionRole::from_label("widget"), RegionRole::Other);
+        assert!(RegionRole::Figure.extraction_deferred());
+        assert!(!RegionRole::Table.extraction_deferred());
+    }
+
+    #[test]
+    fn figure_markers_records_only_figures_with_extraction_deferred() {
+        let regions = vec![
+            region("Figure", BBox::new(0.0, 0.0, 100.0, 100.0)),
+            region("Table", BBox::new(0.0, 200.0, 100.0, 300.0)),
+            region("Text", BBox::new(0.0, 400.0, 100.0, 500.0)),
+        ];
+        let imgs = figure_markers(&regions);
+        assert_eq!(imgs.len(), 1, "only the Figure becomes an ImageRef");
+        let img = &imgs[0];
+        assert_eq!(img.kind(), ArtifactKind::Image);
+        assert_eq!(img.bbox(), BBox::new(0.0, 0.0, 100.0, 100.0), "keeps the region bbox");
+        assert!(img.crop.is_none(), "extraction deferred — no crop yet");
+        assert!(matches!(img.provenance(), Provenance::Derived { .. }), "derived from its region");
+    }
+
+    #[test]
+    fn image_ref_round_trips_through_the_store_envelope() {
+        let img = ImageRef::from_region(&region("Figure", BBox::new(1.0, 2.0, 3.0, 4.0)));
+        let stored = StoredArtifact::from_dyn(&img).expect("downcasts to Image");
+        assert!(matches!(stored, StoredArtifact::Image(_)));
+        let back = stored.into_dyn();
+        assert_eq!(back.kind(), ArtifactKind::Image);
+        assert_eq!(back.id(), img.id());
     }
 }
