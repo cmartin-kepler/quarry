@@ -37,5 +37,6 @@ pub mod pipeline;
 pub mod region_check;
 pub mod route;
 pub mod segment;
+pub mod structure;
 pub mod sidecar;
 pub mod store;
