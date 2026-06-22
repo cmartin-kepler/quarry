@@ -101,6 +101,17 @@ enum Command {
     /// column-alignment, and print the discovered blocks. Exercises region quality
     /// on real pdfplumber word boxes — no YOLO required.
     Regions { words: PathBuf },
+    /// Full Step B′ region-quality check on a layout model's regions vs a page's
+    /// words: typed roles, coverage diagnostic, table-overlap gate, and agreement
+    /// with the model-free XY-cut source (the decorrelated cross-check), plus figure
+    /// markers. `--regions` = `{regions:[{label,confidence,bbox}]}` (e.g. from
+    /// `layout_detect.py`); `--words` = `[{text,x0,y0,x1,y1}]`.
+    RegionCheck {
+        #[arg(long)]
+        regions: PathBuf,
+        #[arg(long)]
+        words: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -128,7 +139,78 @@ fn main() -> Result<()> {
             cmd_explain(&artifact_dir, suspect_only, json)
         }
         Command::Regions { words } => cmd_regions(&words),
+        Command::RegionCheck { regions, words } => cmd_region_check(&regions, &words),
     }
+}
+
+/// Run the full Step B′ region-quality check on a layout model's regions vs a
+/// page's words: coverage diagnostic, table-overlap gate, and agreement with the
+/// decorrelated XY-cut source. Exercises region_check/segment/figure_markers on
+/// real layout output.
+fn cmd_region_check(regions_path: &Path, words_path: &Path) -> Result<()> {
+    use quarry::artifact::{figure_markers, Word};
+    use quarry::core::{BBox, DocHash, Generation};
+    use quarry::region_check::{
+        boundary_agreement, disagreeing_regions, overlapping_table_pairs, passes_agreement_bar,
+        passes_overlap_bar, typed_orphans, AGREEMENT_IOU,
+    };
+    use quarry::segment::{xy_cut, CutParams};
+    use quarry::sidecar::regions_from_json;
+    use std::collections::BTreeMap;
+
+    #[derive(serde::Deserialize)]
+    struct WordIn { text: String, x0: f32, y0: f32, x1: f32, y1: f32 }
+
+    let regions = regions_from_json(
+        &std::fs::read_to_string(regions_path)?,
+        DocHash::of(b"region-check"),
+        1,
+        Generation(0),
+    )?;
+    let wins: Vec<WordIn> = serde_json::from_slice(&std::fs::read(words_path)?)?;
+    let words: Vec<Word> = wins
+        .iter()
+        .map(|w| Word { text: w.text.clone(), bbox: BBox::new(w.x0, w.y0, w.x1, w.y1) })
+        .collect();
+
+    println!("{} regions, {} words", regions.len(), words.len());
+    let mut roles: BTreeMap<String, usize> = BTreeMap::new();
+    for r in &regions {
+        *roles.entry(format!("{:?}", r.role())).or_default() += 1;
+    }
+    println!("  roles: {roles:?}");
+
+    let orphans = typed_orphans(&regions, &words);
+    println!(
+        "  coverage (diagnostic): {} typed-orphan spans — expect page furniture; \
+         body-content orphans mean a missed box",
+        orphans.len()
+    );
+
+    let pairs = overlapping_table_pairs(&regions);
+    println!(
+        "  overlap gate: {} ({} offending table pair(s))",
+        if passes_overlap_bar(&regions) { "PASS" } else { "FAIL" },
+        pairs.len()
+    );
+
+    let indep = xy_cut(&words, &CutParams::default());
+    let yolo: Vec<BBox> = regions.iter().map(|r| r.bbox()).collect();
+    let agree = boundary_agreement(&yolo, &indep, AGREEMENT_IOU);
+    println!(
+        "  agreement vs XY-cut: {} blocks, {:.0}% of regions match (bar 90%) — {}",
+        indep.len(),
+        agree * 100.0,
+        if passes_agreement_bar(&yolo, &indep) { "PASS" } else { "FAIL" }
+    );
+    let dis = disagreeing_regions(&yolo, &indep);
+    if !dis.is_empty() {
+        println!("    {} region(s) with no independent match (flag for review): {dis:?}", dis.len());
+    }
+
+    let figs = figure_markers(&regions);
+    println!("  figure markers: {} ImageRef(s) recorded (extraction deferred)", figs.len());
+    Ok(())
 }
 
 /// Run the model-free region machinery on a page's word boxes (build-plan B′):

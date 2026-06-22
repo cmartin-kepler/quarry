@@ -199,9 +199,16 @@ impl RegionRole {
         match label.trim().to_ascii_lowercase().as_str() {
             "table" => RegionRole::Table,
             "figure" | "image" | "picture" | "chart" => RegionRole::Figure,
-            "caption" | "table-caption" | "figure-caption" => RegionRole::Caption,
-            "text" | "paragraph" | "title" | "section-header" | "list" | "page-header"
-            | "page-footer" | "footnote" => RegionRole::Text,
+            // captions/footnotes (hyphen + DocLayout-YOLO underscore vocabularies)
+            "caption" | "table-caption" | "table_caption" | "figure-caption"
+            | "figure_caption" | "table_footnote" | "formula_caption" => RegionRole::Caption,
+            // body/heading/furniture text. "plain text" + "abandon" are DocLayout-YOLO's
+            // (abandon = its throwaway class for running headers/footers/page numbers —
+            // mapped to Text so that furniture is "covered", not a false body-orphan).
+            "text" | "plain text" | "plain-text" | "paragraph" | "title" | "section-header"
+            | "section_header" | "list" | "page-header" | "page-footer" | "footnote"
+            | "abandon" => RegionRole::Text,
+            // e.g. DocLayout-YOLO "isolate_formula" — recorded, not mapped (no silent drop)
             _ => RegionRole::Other,
         }
     }
@@ -463,6 +470,11 @@ mod tests {
         assert_eq!(RegionRole::from_label("Table"), RegionRole::Table);
         assert_eq!(RegionRole::from_label("picture"), RegionRole::Figure);
         assert_eq!(RegionRole::from_label("Section-Header"), RegionRole::Text);
+        // DocLayout-YOLO's real vocabulary (seen on the sample page)
+        assert_eq!(RegionRole::from_label("plain text"), RegionRole::Text);
+        assert_eq!(RegionRole::from_label("abandon"), RegionRole::Text);
+        assert_eq!(RegionRole::from_label("table_caption"), RegionRole::Caption);
+        assert_eq!(RegionRole::from_label("isolate_formula"), RegionRole::Other);
         assert_eq!(RegionRole::from_label("widget"), RegionRole::Other);
         assert!(RegionRole::Figure.extraction_deferred());
         assert!(!RegionRole::Table.extraction_deferred());

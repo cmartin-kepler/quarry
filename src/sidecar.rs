@@ -49,7 +49,7 @@ impl DoclingSidecar {
     /// Default invocation: a thin Python bridge that runs Docling and prints its
     /// `DoclingDocument` JSON to stdout.
     pub fn default_cmd() -> Self {
-        DoclingSidecar { cmd: vec!["python3".into(), "scripts/run_docling.py".into()] }
+        DoclingSidecar { cmd: vec!["uv".into(), "run".into(), "scripts/run_docling.py".into()] }
     }
 }
 
@@ -153,7 +153,7 @@ impl LiteParseSidecar {
     /// Default invocation: a Python bridge that crops the PDF to the region bbox
     /// and runs `lit`, emitting `{text, words}`.
     pub fn default_cmd() -> Self {
-        LiteParseSidecar { cmd: vec!["python3".into(), "scripts/litparse_region.py".into()] }
+        LiteParseSidecar { cmd: vec!["uv".into(), "run".into(), "scripts/litparse_region.py".into()] }
     }
 }
 
@@ -282,12 +282,19 @@ pub struct LayoutSidecar {
 }
 
 impl LayoutSidecar {
-    /// Default invocation: a Python bridge that renders the page and runs the
-    /// named layout model. The source path + page number are appended at run time.
+    /// Default invocation: the `layout_detect.py` bridge run through `uv` (PEP 723
+    /// per-script env — ultralytics/doclayout-yolo, isolated from docling's env). It
+    /// renders the page and runs the named model. Source path + page number are
+    /// appended at run time. Output bboxes are in PDF points (the bridge converts).
     pub fn model(model: &str) -> Self {
         LayoutSidecar {
             model: model.into(),
-            cmd: vec!["python3".into(), "scripts/layout_detect.py".into(), model.into()],
+            cmd: vec![
+                "uv".into(),
+                "run".into(),
+                "scripts/layout_detect.py".into(),
+                model.into(),
+            ],
         }
     }
 }
