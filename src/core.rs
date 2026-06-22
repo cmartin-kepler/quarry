@@ -92,6 +92,33 @@ impl fmt::Display for ArtifactId {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ExtractorId(pub String);
 
+/// Who or what produced an artifact (invariant 5: everything is attributable).
+/// `Parser` is the default — the machine extractors. `Manual` (a correction) and
+/// future judge origins slot in without a schema change; resolution prefers
+/// `Manual` over `Parser` (a correction beats a parse).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum Origin {
+    Parser { extractor: ExtractorId, version: Version },
+    Manual { author: String },
+}
+
+impl Default for Origin {
+    /// Parser of unknown provenance — the safe default for artifacts minted before
+    /// an extractor threads its own id through. Real extractors should set this.
+    fn default() -> Self {
+        Origin::Parser { extractor: ExtractorId("unknown".into()), version: Version(0) }
+    }
+}
+
+impl Origin {
+    pub fn parser(extractor: impl Into<String>, version: u32) -> Self {
+        Origin::Parser { extractor: ExtractorId(extractor.into()), version: Version(version) }
+    }
+    pub fn is_manual(&self) -> bool {
+        matches!(self, Origin::Manual { .. })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CheckId(pub String);
 

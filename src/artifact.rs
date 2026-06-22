@@ -31,6 +31,10 @@ pub struct Meta {
     pub provenance: Provenance,
     pub generation: Generation,
     pub risk: RiskMarkers,
+    /// Who/what produced this artifact (invariant 5). Defaults to `Parser` so
+    /// existing stored rows and literals deserialize unchanged.
+    #[serde(default)]
+    pub origin: Origin,
 }
 
 /// Object-safe core trait. Everything shared lives here; payload accessors live
@@ -170,6 +174,42 @@ impl Artifact for HtmlTable {
 
 // ---- Region ---------------------------------------------------------------
 
+/// Typed region classification (the layout roles). The detector's raw string
+/// lives in `Region::label`; `RegionRole` is the canonical typed view, *derived*
+/// from the label so it stays a deterministic function of stored data — adding a
+/// stored field later is additive, never a migration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RegionRole {
+    Table,
+    Text,
+    Figure,
+    Caption,
+    /// The detector said something we don't map. Kept explicit, never dropped:
+    /// an unclassified region is still a recorded slot (no silent gaps).
+    Other,
+}
+
+impl RegionRole {
+    /// Map a detector's free-text label to a typed role. Case-insensitive; covers
+    /// the common layout vocabularies (YOLO / docling / pdfplumber).
+    pub fn from_label(label: &str) -> RegionRole {
+        match label.trim().to_ascii_lowercase().as_str() {
+            "table" => RegionRole::Table,
+            "figure" | "image" | "picture" | "chart" => RegionRole::Figure,
+            "caption" | "table-caption" | "figure-caption" => RegionRole::Caption,
+            "text" | "paragraph" | "title" | "section-header" | "list" | "page-header"
+            | "page-footer" | "footnote" => RegionRole::Text,
+            _ => RegionRole::Other,
+        }
+    }
+
+    /// Whether extraction is deferred for this role: figures are recorded as image
+    /// markers (an `ImageRef`), not parsed — so the region is never a silent gap.
+    pub fn extraction_deferred(self) -> bool {
+        matches!(self, RegionRole::Figure)
+    }
+}
+
 /// A located area on a page (a layout detection). Its resolved anchor IS its
 /// bbox, so it's both an artifact and the input a region-scoped extractor reads.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -188,6 +228,11 @@ impl Region {
             SourceAnchor::Pdf { bbox, .. } => *bbox,
             _ => BBox::new(0.0, 0.0, 0.0, 0.0),
         }
+    }
+
+    /// Typed classification of this region (see [`RegionRole`]).
+    pub fn role(&self) -> RegionRole {
+        RegionRole::from_label(&self.label)
     }
 }
 

@@ -150,6 +150,7 @@ pub fn artifacts_from_docling(
                 }),
                 generation,
                 risk,
+                origin: Origin::default(),
             },
             n_rows,
             n_cols,

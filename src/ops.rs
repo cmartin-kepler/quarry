@@ -21,7 +21,7 @@ use crate::grid;
 use anyhow::{Result, bail};
 
 fn meta(content: DocHash, prov: Provenance, generation: Generation, risk: RiskMarkers) -> Meta {
-    Meta { id: ArtifactId::mint(&content, generation), content_hash: content, provenance: prov, generation, risk }
+    Meta { id: ArtifactId::mint(&content, generation), content_hash: content, provenance: prov, generation, risk, origin: Origin::default() }
 }
 
 fn hash_str(s: &str) -> DocHash {

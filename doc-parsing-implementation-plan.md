@@ -187,7 +187,7 @@ lands; add the new artifact kinds to the ground-truth diff.
   - **Docling** (`DoclingSidecar`, DocumentRegion → HtmlTable) reusing the proven
     `docling::artifacts_from_docling` adapter,
   - **LiteParse** (`LiteParseSidecar`, Region → TextGrid) + the pure
-    `textgrid_from_json` adapter; bridges `scripts/{litparse_region,docling_parse}.py`.
+    `textgrid_from_json` adapter; bridges `scripts/{litparse_region,run_docling}.py`.
   - **Layout** (`LayoutSidecar`, page → Region(s)) + `regions_from_json`; bridge
     `scripts/layout_detect.py` (reuses `yolo_layout.py`).
   - **Cloud** (`TableSidecar`, page → HtmlTable) + `tables_from_json` — a generic

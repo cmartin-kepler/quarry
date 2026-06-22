@@ -4,8 +4,11 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use quarry::adjudicate::{Adjudicator, DefaultAdjudicator};
 use quarry::artifact::{Artifact, ArtifactKind, HtmlTable};
-use quarry::check::{CheckCtx, CheckOutcome, IntrinsicArithmetic, QualityCheck, StructuralValidity};
-use quarry::core::{SourceAnchor, Severity};
+use quarry::check::{
+    cross_tier_agreement, CheckCtx, CheckOutcome, IntrinsicArithmetic, QualityCheck,
+    ReconstructionError, StructuralValidity,
+};
+use quarry::core::{Origin, SourceAnchor, Severity};
 use quarry::doc::QDoc;
 use quarry::eval::{CatchReport, GroundTruth, run_eval};
 use quarry::pipeline;
@@ -53,6 +56,10 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Judge raw grids: read JSON `[{id, grid, header_rows}]`, run the detectors
+    /// on each, and emit `[{id, html, flagged, signals}]` to stdout. The eval-
+    /// harness entry point — same detectors that run in the pipeline, on any table.
+    Judge { input: PathBuf },
     /// Run all applicable quality checks over a parsed artifact directory.
     Check { artifact_dir: PathBuf },
     /// THE first deliverable: measure the silent-failure catch rate vs truth.
@@ -100,6 +107,7 @@ fn main() -> Result<()> {
         Command::Chain { file, ops, source, out } => {
             cmd_chain(&file, &ops, source.as_deref(), &out)
         }
+        Command::Judge { input } => cmd_judge(&input),
         Command::Check { artifact_dir } => cmd_check(&artifact_dir),
         Command::Eval {
             file,
@@ -272,6 +280,157 @@ fn load_doc(file: &Path) -> Result<(QDoc, quarry::core::DocHash)> {
             Ok((QDoc { format: quarry::doc::DocFormat::Pdf, pages: vec![] }, quarry::core::DocHash::of(&bytes)))
         }
     }
+}
+
+fn cmd_judge(input: &Path) -> Result<()> {
+    use quarry::artifact::{Cell, HtmlTable, Meta};
+    use quarry::core::{ArtifactId, BBox, DocHash, Generation, Provenance};
+    use quarry::doc::{DocFormat, Page, Span};
+    use quarry::grid::to_html;
+
+    #[derive(serde::Deserialize)]
+    struct Word {
+        text: String,
+        bbox: [f32; 4],
+    }
+    #[derive(serde::Deserialize)]
+    struct In {
+        id: String,
+        grid: Vec<Vec<String>>,
+        #[serde(default = "one")]
+        header_rows: usize,
+        #[serde(default)]
+        source: String,
+        // Optional source geometry; when all three are present the
+        // reconstruction-error detector runs (else it no-ops, as for synthetic).
+        #[serde(default)]
+        page: u32,
+        #[serde(default)]
+        cell_boxes: Vec<Vec<[f32; 4]>>, // parallel to `grid`: bbox per cell
+        #[serde(default)]
+        source_words: Vec<Word>, // words in the table's region
+        #[serde(default)]
+        region: Option<[f32; 4]>, // detected table region (provenance bbox)
+        // An independent second-tier parse of the same region; when present, the
+        // cross-tier-agreement detector compares the two.
+        #[serde(default)]
+        alt_grid: Vec<Vec<String>>,
+        #[serde(default = "one")]
+        alt_header_rows: usize,
+        #[serde(default)]
+        alt_cell_boxes: Vec<Vec<[f32; 4]>>, // parallel to `alt_grid`: bbox per cell
+        #[serde(default)]
+        alt_page: u32,
+    }
+    fn one() -> usize { 1 }
+    #[derive(serde::Serialize)]
+    struct Sig { check: String, severity: String, reason: String }
+    #[derive(serde::Serialize)]
+    struct Out { id: String, source: String, html: String, flagged: bool, signals: Vec<Sig> }
+
+    let ins: Vec<In> = serde_json::from_slice(&std::fs::read(input).with_context(|| format!("reading {}", input.display()))?)?;
+    let arith = IntrinsicArithmetic::default();
+    let structural = StructuralValidity;
+    let recon = ReconstructionError::default();
+    let checks: [(&str, &dyn QualityCheck); 3] = [
+        ("intrinsic_arithmetic", &arith),
+        ("structural_validity", &structural),
+        ("reconstruction_error", &recon),
+    ];
+
+    let mut outs = Vec::new();
+    for it in ins {
+        let dh = DocHash::of(it.id.as_bytes());
+        let dummy = SourceAnchor::Pdf { doc: dh, page: 1, bbox: BBox::new(0.0, 0.0, 1.0, 1.0) };
+        // Cell geometry (for reconstruction + cross-tier) is independent of source
+        // words (for reconstruction's region scan): cross-tier needs boxes but no
+        // source words; reconstruction needs both.
+        let ext_geo = it.page > 0 && !it.cell_boxes.is_empty();
+        let prov = match (ext_geo, it.region) {
+            (true, Some(r)) => SourceAnchor::Pdf { doc: dh, page: it.page, bbox: BBox::new(r[0], r[1], r[2], r[3]) },
+            _ => dummy.clone(),
+        };
+        let n_rows = it.grid.len() as u32;
+        let n_cols = it.grid.iter().map(|r| r.len()).max().unwrap_or(0) as u32;
+        let mk_cells = |grid: &[Vec<String>], boxes: &[Vec<[f32; 4]>], page: u32, hdr: usize| {
+            let mut cells = Vec::new();
+            for (r, row) in grid.iter().enumerate() {
+                for (c, t) in row.iter().enumerate() {
+                    let anchor = match boxes.get(r).and_then(|rr| rr.get(c)) {
+                        Some(b) if page > 0 => SourceAnchor::Pdf { doc: dh, page, bbox: BBox::new(b[0], b[1], b[2], b[3]) },
+                        _ => dummy.clone(),
+                    };
+                    cells.push(Cell { row: r as u32, col: c as u32, text: t.clone(), anchor, is_header: r < hdr });
+                }
+            }
+            cells
+        };
+        let cells = mk_cells(&it.grid, &it.cell_boxes, it.page, it.header_rows);
+        let html = to_html(&it.grid, it.header_rows);
+        let table = HtmlTable {
+            meta: Meta {
+                id: ArtifactId::mint(&dh, Generation(0)),
+                content_hash: dh,
+                provenance: Provenance::Source(prov.clone()),
+                generation: Generation(0),
+                risk: Default::default(),
+                origin: Origin::default(),
+            },
+            n_rows,
+            n_cols,
+            cells,
+            html: html.clone(),
+        };
+        // Real region words when supplied, else an empty doc so the reconstruction
+        // detector no-ops on grid-only input.
+        let source = if !it.source_words.is_empty() {
+            QDoc {
+                format: DocFormat::Pdf,
+                pages: vec![Page {
+                    page: it.page,
+                    width: 10_000.0,
+                    height: 10_000.0,
+                    spans: it.source_words.iter().map(|w| Span {
+                        text: w.text.clone(), bbox: w.bbox, confidence: 1.0, rotated: false,
+                    }).collect(),
+                    table_regions: vec![],
+                }],
+            }
+        } else {
+            QDoc { format: DocFormat::Pdf, pages: vec![] }
+        };
+        let cctx = CheckCtx { source: &source };
+        let mut signals = Vec::new();
+        for (cid, chk) in &checks {
+            if let CheckOutcome::Flag { reason, severity } = chk.check(&table, &cctx) {
+                signals.push(Sig { check: cid.to_string(), severity: format!("{severity:?}"), reason });
+            }
+        }
+        // Cross-tier agreement (compares two parses, so it isn't a QualityCheck).
+        // Geometry-keyed, so the alt parse needs its own cell boxes + page.
+        if !it.alt_grid.is_empty() {
+            let alt = HtmlTable {
+                meta: Meta {
+                    id: ArtifactId::mint(&dh, Generation(0)),
+                    content_hash: dh,
+                    provenance: Provenance::Source(dummy.clone()),
+                    generation: Generation(0),
+                    risk: Default::default(),
+                    origin: Origin::default(),
+                },
+                n_rows: it.alt_grid.len() as u32,
+                n_cols: it.alt_grid.iter().map(|r| r.len()).max().unwrap_or(0) as u32,
+                cells: mk_cells(&it.alt_grid, &it.alt_cell_boxes, it.alt_page, it.alt_header_rows),
+                html: String::new(),
+            };
+            if let CheckOutcome::Flag { reason, severity } = cross_tier_agreement(&table, &alt) {
+                signals.push(Sig { check: "cross_tier_agreement".into(), severity: format!("{severity:?}"), reason });
+            }
+        }
+        outs.push(Out { id: it.id, source: it.source, html, flagged: !signals.is_empty(), signals });
+    }
+    println!("{}", serde_json::to_string(&outs)?);
+    Ok(())
 }
 
 fn cmd_chain(file: &Path, ops: &str, source: Option<&Path>, out: &Path) -> Result<()> {

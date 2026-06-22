@@ -9,7 +9,11 @@ Run Docling on a PDF and print the `DoclingDocument` JSON to stdout — the sche
 the crate's `docling::artifacts_from_docling` adapter consumes (pages with sizes,
 tables with prov + data.table_cells, bottom-left bboxes).
 
-Usage: docling_parse.py <pdf>
+Named run_docling.py (NOT docling_parse.py) deliberately: `docling_parse` is one
+of docling's own dependencies, so a same-named script on sys.path shadows the
+package and triggers a circular import.
+
+Usage: run_docling.py <pdf>
 """
 import sys
 

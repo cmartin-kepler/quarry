@@ -197,6 +197,7 @@ fn extract_text(doc: DocHash, page: &Page, generation: Generation) -> ExtractedT
             provenance: Provenance::Source(anchor),
             generation,
             risk,
+            origin: Origin::default(),
         },
         spans,
     }
@@ -367,6 +368,7 @@ fn reconstruct_table(
             provenance: Provenance::Source(anchor),
             generation,
             risk,
+            origin: Origin::default(),
         },
         n_rows,
         n_cols,

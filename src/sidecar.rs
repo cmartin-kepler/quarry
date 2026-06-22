@@ -49,7 +49,7 @@ impl DoclingSidecar {
     /// Default invocation: a thin Python bridge that runs Docling and prints its
     /// `DoclingDocument` JSON to stdout.
     pub fn default_cmd() -> Self {
-        DoclingSidecar { cmd: vec!["python3".into(), "scripts/docling_parse.py".into()] }
+        DoclingSidecar { cmd: vec!["python3".into(), "scripts/run_docling.py".into()] }
     }
 }
 
@@ -138,6 +138,7 @@ pub fn textgrid_from_json(
             },
             generation,
             risk: RiskMarkers::default(),
+            origin: Origin::default(),
         },
         text: lo.text,
         words,
@@ -252,6 +253,7 @@ pub fn regions_from_json(json: &str, doc: DocHash, page: u32, generation: Genera
                     provenance: Provenance::Source(SourceAnchor::Pdf { doc, page, bbox }),
                     generation,
                     risk: RiskMarkers::default(),
+                    origin: Origin::default(),
                 },
                 label: r.label,
                 confidence: r.confidence,
@@ -385,6 +387,7 @@ pub fn tables_from_json(json: &str, doc: DocHash, generation: Generation) -> Res
                 provenance: Provenance::Source(SourceAnchor::Pdf { doc, page: t.page, bbox: table_bbox }),
                 generation,
                 risk: RiskMarkers::default(),
+                origin: Origin::default(),
             },
             n_rows: t.n_rows,
             n_cols: t.n_cols,
@@ -512,6 +515,7 @@ mod tests {
                 provenance: Provenance::Source(anchor),
                 generation: Generation(0),
                 risk: RiskMarkers::default(),
+                origin: Origin::default(),
             },
             label: "Table".into(),
             confidence: 1.0,
