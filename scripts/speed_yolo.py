@@ -22,7 +22,7 @@ import yolo_layout  # noqa: E402
 ap = argparse.ArgumentParser()
 ap.add_argument("--pdf", required=True)
 ap.add_argument("--pages", required=True)
-ap.add_argument("--model", default="doclayout")
+ap.add_argument("--model", default="yolo26n")
 ap.add_argument("--out", required=True)
 a = ap.parse_args()
 

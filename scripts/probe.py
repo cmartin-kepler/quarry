@@ -43,7 +43,7 @@ from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from pypdf import PdfReader, PdfWriter
 
-YOLO_MODEL = "doclayout"
+YOLO_MODEL = "yolo26n"
 
 
 # ---- numeric claim ---------------------------------------------------------
