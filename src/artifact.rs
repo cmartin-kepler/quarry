@@ -17,6 +17,9 @@ pub enum ArtifactKind {
     /// A recorded image region whose extraction is deferred (invariant 11: no
     /// silent gaps — the area is a known image, not an empty hole).
     Image,
+    /// A page/document's structured text (sections, paragraphs, captions) in
+    /// reading order — the prose spine that places the tables.
+    Document,
     /// Raw region text + word geometry, columns not yet committed (LiteParse-style
     /// ASCII); `structure` turns it into an HtmlTable.
     TextGrid,
@@ -426,6 +429,80 @@ impl Artifact for TextGrid {
     }
 }
 
+// ---- StructuredDoc --------------------------------------------------------
+
+/// The role of a document text element — taken from docling's own labels (no
+/// font heuristics needed). Sections are runs delimited by `Title`/`Heading`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DocRole {
+    Title,
+    Heading,
+    Paragraph,
+    Caption,
+    ListItem,
+    Other,
+}
+
+/// One reading-order element of the structured document.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DocElement {
+    pub role: DocRole,
+    pub text: String,
+    pub anchor: SourceAnchor,
+}
+
+/// A document's text content in reading order, labelled by role — the "sections
+/// and the like." Tables and figures are their own artifacts; this is the prose
+/// spine that places them.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StructuredDoc {
+    pub meta: Meta,
+    pub elements: Vec<DocElement>,
+}
+
+impl StructuredDoc {
+    /// Group into `(heading, body)` sections. Elements before the first heading
+    /// form a leading section with `None` heading.
+    pub fn sections(&self) -> Vec<(Option<&DocElement>, Vec<&DocElement>)> {
+        let mut out: Vec<(Option<&DocElement>, Vec<&DocElement>)> = Vec::new();
+        for el in &self.elements {
+            if matches!(el.role, DocRole::Heading | DocRole::Title) {
+                out.push((Some(el), Vec::new()));
+            } else {
+                if out.is_empty() {
+                    out.push((None, Vec::new()));
+                }
+                out.last_mut().unwrap().1.push(el);
+            }
+        }
+        out
+    }
+}
+
+impl Artifact for StructuredDoc {
+    fn id(&self) -> ArtifactId {
+        self.meta.id.clone()
+    }
+    fn content_hash(&self) -> DocHash {
+        self.meta.content_hash
+    }
+    fn provenance(&self) -> &Provenance {
+        &self.meta.provenance
+    }
+    fn kind(&self) -> ArtifactKind {
+        ArtifactKind::Document
+    }
+    fn generation(&self) -> Generation {
+        self.meta.generation
+    }
+    fn risk(&self) -> &RiskMarkers {
+        &self.meta.risk
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 /// Serializable, kind-tagged envelope for persistence and round-tripping the
 /// open payload set through the flat store. The live pipeline uses
 /// `Box<dyn Artifact>`; the store speaks `StoredArtifact`.
@@ -437,6 +514,7 @@ pub enum StoredArtifact {
     TextGrid(TextGrid),
     HtmlTable(HtmlTable),
     Image(ImageRef),
+    Document(StructuredDoc),
 }
 
 impl StoredArtifact {
@@ -450,6 +528,8 @@ impl StoredArtifact {
             Some(StoredArtifact::TextGrid(g.clone()))
         } else if let Some(i) = any.downcast_ref::<ImageRef>() {
             Some(StoredArtifact::Image(i.clone()))
+        } else if let Some(d) = any.downcast_ref::<StructuredDoc>() {
+            Some(StoredArtifact::Document(d.clone()))
         } else {
             any.downcast_ref::<HtmlTable>()
                 .map(|h| StoredArtifact::HtmlTable(h.clone()))
@@ -463,6 +543,7 @@ impl StoredArtifact {
             StoredArtifact::TextGrid(g) => Box::new(g),
             StoredArtifact::HtmlTable(h) => Box::new(h),
             StoredArtifact::Image(i) => Box::new(i),
+            StoredArtifact::Document(d) => Box::new(d),
         }
     }
 
@@ -473,6 +554,7 @@ impl StoredArtifact {
             StoredArtifact::TextGrid(g) => &g.meta,
             StoredArtifact::HtmlTable(h) => &h.meta,
             StoredArtifact::Image(i) => &i.meta,
+            StoredArtifact::Document(d) => &d.meta,
         }
     }
 }

@@ -25,6 +25,34 @@ struct DoclingDoc {
     pages: HashMap<String, DPage>,
     #[serde(default)]
     tables: Vec<DTable>,
+    #[serde(default)]
+    texts: Vec<DText>,
+    #[serde(default)]
+    body: DBody,
+}
+
+#[derive(Deserialize)]
+struct DText {
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    prov: Vec<DProv>,
+}
+
+/// The document body: its `children` are refs (`#/texts/0`, `#/tables/0`, …) in
+/// READING ORDER — docling's own linear document structure.
+#[derive(Deserialize, Default)]
+struct DBody {
+    #[serde(default)]
+    children: Vec<DRef>,
+}
+
+#[derive(Deserialize)]
+struct DRef {
+    #[serde(default, alias = "$ref")]
+    cref: String,
 }
 
 #[derive(Deserialize)]
@@ -162,6 +190,66 @@ pub fn artifacts_from_docling(
     Ok(out)
 }
 
+fn doc_role(label: &str) -> DocRole {
+    match label {
+        "title" => DocRole::Title,
+        "section_header" => DocRole::Heading,
+        "text" | "paragraph" => DocRole::Paragraph,
+        "caption" => DocRole::Caption,
+        "list_item" => DocRole::ListItem,
+        _ => DocRole::Other,
+    }
+}
+
+/// Extract the structured text — sections / paragraphs / captions in reading
+/// order — from Docling JSON, using docling's own element labels (no font
+/// heuristics) and its `body.children` reading order. Tables are separate
+/// `HtmlTable` artifacts (`artifacts_from_docling`); this is the prose spine.
+pub fn structured_doc_from_docling(
+    json: &str,
+    doc: DocHash,
+    generation: Generation,
+) -> Result<StructuredDoc> {
+    let dd: DoclingDoc = serde_json::from_str(json).context("parsing Docling JSON")?;
+    let mut elements = Vec::new();
+    for child in &dd.body.children {
+        let Some(idx) = child.cref.strip_prefix("#/texts/").and_then(|s| s.parse::<usize>().ok())
+        else {
+            continue; // tables/pictures are their own artifacts
+        };
+        let Some(t) = dd.texts.get(idx) else { continue };
+        if t.text.trim().is_empty() {
+            continue;
+        }
+        let prov = t.prov.first();
+        let page = prov.map(|p| p.page_no).unwrap_or(1);
+        let page_h = dd.pages.get(&page.to_string()).map(|p| p.size.height).unwrap_or(792.0);
+        let bbox = prov.map(|p| p.bbox.to_topleft(page_h)).unwrap_or(BBox::new(0.0, 0.0, 0.0, 0.0));
+        elements.push(DocElement {
+            role: doc_role(&t.label),
+            text: t.text.clone(),
+            anchor: SourceAnchor::Pdf { doc, page, bbox },
+        });
+    }
+    let joined: String = elements.iter().map(|e| e.text.as_str()).collect();
+    let content = DocHash::of(format!("structdoc:{joined}").as_bytes());
+    let anchor = elements
+        .first()
+        .map(|e| e.anchor.clone())
+        .unwrap_or(SourceAnchor::Pdf { doc, page: 1, bbox: BBox::new(0.0, 0.0, 0.0, 0.0) });
+    Ok(StructuredDoc {
+        meta: Meta {
+            id: ArtifactId::mint(&content, generation),
+            content_hash: content,
+            provenance: Provenance::Source(anchor),
+            generation,
+            risk: RiskMarkers::default(),
+            origin: Origin::default(),
+        },
+        elements,
+    })
+}
+
 /// Risk markers consistent with the cheap reconstructor's, computed from the
 /// placed grid — so `StructuralValidity` behaves identically regardless of which
 /// extractor produced the table. A clean parser yields near-zero markers.
@@ -219,6 +307,26 @@ mod tests {
     use crate::doc::{DocFormat, QDoc};
 
     const SAMPLE: &str = include_str!("../tests/data/sample.docling.json");
+    const FULL: &str = include_str!("../tests/data/sample.docling_full.json");
+
+    #[test]
+    fn extracts_structured_text_and_sections() {
+        let sd = structured_doc_from_docling(FULL, DocHash::of(b"pdf"), Generation(0)).unwrap();
+        assert!(!sd.elements.is_empty(), "extracted text elements");
+        // docling labelled three section headers in this fixture
+        let headings: Vec<&str> = sd
+            .elements
+            .iter()
+            .filter(|e| e.role == DocRole::Heading)
+            .map(|e| e.text.as_str())
+            .collect();
+        assert!(headings.len() >= 3, "headings = {headings:?}");
+        assert!(headings.iter().any(|h| h.contains("Statement of Operations")));
+        // elements are anchored to the source page
+        assert!(matches!(sd.elements[0].anchor, SourceAnchor::Pdf { page: 1, .. }));
+        // sections() groups body under headings
+        assert!(sd.sections().len() >= 3, "grouped into sections");
+    }
 
     #[test]
     fn adapts_docling_tables_into_artifacts() {
