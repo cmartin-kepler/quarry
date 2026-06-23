@@ -149,6 +149,14 @@ enum Command {
     /// List the artifacts currently in a store — kind, id, generation, lineage, and
     /// a one-line preview. Shows the append-only artifact graph.
     Ls { store: PathBuf },
+    /// Start a local web server: browse the PDFs under <dir>, click one to run the
+    /// full pipeline (triage → docling → materialize, + OCR) and view the result.
+    Serve {
+        #[arg(default_value = "input")]
+        dir: PathBuf,
+        #[arg(long, default_value_t = 8765)]
+        port: u16,
+    },
     /// Actually OCR the store's OcrDeferred image regions (whole image pages +
     /// text-less embedded figures) and append the recovered text as derived
     /// artifacts. Needs the original --pdf.
@@ -261,7 +269,98 @@ fn main() -> Result<()> {
         Command::Ls { store } => cmd_ls(&store),
         Command::View { store, out, pdf } => cmd_view(&store, out.as_deref(), pdf.as_deref()),
         Command::Ocr { store, pdf } => cmd_ocr(&store, &pdf),
+        Command::Serve { dir, port } => cmd_serve(&dir, port),
     }
+}
+
+/// Collect *.pdf paths under `dir` (recursive, depth-bounded).
+fn collect_pdfs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            collect_pdfs(&p, depth + 1, out);
+        } else if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("pdf")) {
+            out.push(p);
+        }
+    }
+}
+
+fn serve_index(dir: &Path) -> String {
+    use quarry::serve::url_encode;
+    let mut pdfs = Vec::new();
+    collect_pdfs(dir, 0, &mut pdfs);
+    pdfs.sort();
+    let rows = pdfs
+        .iter()
+        .map(|p| {
+            let enc = url_encode(&p.display().to_string());
+            let name = p.strip_prefix(dir).unwrap_or(p).display();
+            format!(
+                "<li><span>{name}</span> <a href='/run?pdf={enc}'>parse</a> \
+                 <a class=ocr href='/run?pdf={enc}&ocr=1'>parse + OCR</a></li>"
+            )
+        })
+        .collect::<String>();
+    format!(
+        "<!doctype html><meta charset=utf-8><title>quarry</title>\
+         <style>body{{font:15px system-ui,sans-serif;max-width:760px;margin:40px auto;color:#1f2937}}\
+         h1{{font-size:18px}} li{{margin:6px 0;display:flex;gap:12px;align-items:center}}\
+         li span{{flex:1;color:#374151}} a{{color:#2563eb;text-decoration:none;font-size:13px}} a.ocr{{color:#7c3aed}}\
+         .muted{{color:#9ca3af}}</style>\
+         <h1>quarry — pick a document to parse</h1>\
+         <p class=muted>{} PDFs under {}. Parsing runs docling (first run loads models — be patient).</p>\
+         <ul>{rows}</ul>",
+        pdfs.len(),
+        dir.display()
+    )
+}
+
+/// Run pipeline (+materialize, +OCR) on a chosen PDF and return the rendered view.
+fn serve_run(pdf: &Path, ocr: bool) -> Result<String> {
+    let stem = pdf.file_stem().and_then(|s| s.to_str()).unwrap_or("doc");
+    let store = std::env::temp_dir().join("quarry_serve").join(stem);
+    let _ = std::fs::remove_dir_all(&store);
+    cmd_pipeline(pdf, &store, true)?;
+    cmd_materialize(&store)?;
+    if ocr {
+        cmd_ocr(&store, pdf)?;
+    }
+    render_view(&store, Some(pdf))
+}
+
+fn cmd_serve(dir: &Path, port: u16) -> Result<()> {
+    use quarry::serve::{read_request, write_html};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .with_context(|| format!("binding 127.0.0.1:{port}"))?;
+    println!("quarry serve → http://127.0.0.1:{port}   (PDF root: {})", dir.display());
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else { continue };
+        let Ok(req) = read_request(&stream) else { continue };
+        let result = match req.path.as_str() {
+            "/" => Ok(serve_index(dir)),
+            "/run" => match req.query.get("pdf") {
+                Some(pdf) => {
+                    let ocr = req.query.get("ocr").map(|v| v == "1").unwrap_or(false);
+                    println!("→ parse {pdf}{}", if ocr { " + OCR" } else { "" });
+                    serve_run(Path::new(pdf), ocr)
+                }
+                None => Ok("<p>missing ?pdf=</p>".into()),
+            },
+            _ => Ok("<h1>404</h1>".into()),
+        };
+        let (status, body) = match result {
+            Ok(b) => ("200 OK", b),
+            Err(e) => ("500 Internal Server Error", format!("<pre>error: {e:#}</pre>")),
+        };
+        let _ = write_html(&mut stream, status, &body);
+    }
+    Ok(())
 }
 
 /// Actually OCR the store's OcrDeferred image regions and append the recovered text
@@ -311,14 +410,13 @@ fn cmd_ocr(store_dir: &Path, pdf: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_view(store_dir: &Path, out: Option<&Path>, pdf: Option<&Path>) -> Result<()> {
+/// Build the HTML view for a store (rasterizing source pages when `pdf` is given).
+fn render_view(store_dir: &Path, pdf: Option<&Path>) -> Result<String> {
     use quarry::store::FlatStore;
     use quarry::view::{content_pages, PageImage};
     use std::collections::HashMap;
 
     let arts = FlatStore::open(store_dir).current_artifacts()?;
-
-    // optionally rasterize the source pages that carry content (for side-by-side)
     let mut page_images: HashMap<u32, PageImage> = HashMap::new();
     if let Some(pdf) = pdf {
         let pages = content_pages(&arts);
@@ -327,23 +425,22 @@ fn cmd_view(store_dir: &Path, out: Option<&Path>, pdf: Option<&Path>) -> Result<
             let json = run_uv(&["run", "scripts/render_pages.py", &pdf.display().to_string(), "--pages", &list])?;
             let raw: HashMap<String, serde_json::Value> = serde_json::from_str(&json)?;
             for (k, v) in raw {
-                if let (Ok(pg), Some(w), Some(h), Some(png)) = (
-                    k.parse::<u32>(),
-                    v["w"].as_f64(),
-                    v["h"].as_f64(),
-                    v["png"].as_str(),
-                ) {
+                if let (Ok(pg), Some(w), Some(h), Some(png)) =
+                    (k.parse::<u32>(), v["w"].as_f64(), v["h"].as_f64(), v["png"].as_str())
+                {
                     page_images.insert(pg, PageImage { w: w as f32, h: h as f32, png_b64: png.to_string() });
                 }
             }
-            println!("rendered {} source pages", page_images.len());
         }
     }
+    Ok(quarry::view::render_store(&arts, &store_dir.display().to_string(), &page_images))
+}
 
-    let html = quarry::view::render_store(&arts, &store_dir.display().to_string(), &page_images);
+fn cmd_view(store_dir: &Path, out: Option<&Path>, pdf: Option<&Path>) -> Result<()> {
+    let html = render_view(store_dir, pdf)?;
     let out_path = out.map(PathBuf::from).unwrap_or_else(|| store_dir.join("view.html"));
-    std::fs::write(&out_path, html).with_context(|| format!("writing {}", out_path.display()))?;
-    println!("wrote {} ({} artifacts) — open it in a browser", out_path.display(), arts.len());
+    std::fs::write(&out_path, &html).with_context(|| format!("writing {}", out_path.display()))?;
+    println!("wrote {} — open it in a browser", out_path.display());
     Ok(())
 }
 

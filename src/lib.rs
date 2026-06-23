@@ -40,6 +40,7 @@ pub mod route;
 pub mod segment;
 pub mod structure;
 pub mod triage;
+pub mod serve;
 pub mod sidecar;
 pub mod store;
 pub mod view;
