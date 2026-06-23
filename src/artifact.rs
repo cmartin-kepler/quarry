@@ -503,6 +503,64 @@ impl Artifact for StructuredDoc {
     }
 }
 
+// ---- DbTable --------------------------------------------------------------
+
+/// Inferred column type of a materialized table column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ColType {
+    Int,
+    Float,
+    Text,
+    Empty,
+}
+
+/// A queryable table: named (possibly flattened-multi-level) columns, an inferred
+/// type per column, and cleaned string cells — the materialized, dataframe-ready
+/// form of an `HtmlTable` (build-plan Stage 3). MVP: cells are cleaned strings with
+/// a per-column dtype; multi-index headers and section-promotion come later.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DbTable {
+    pub meta: Meta,
+    pub columns: Vec<String>,
+    pub dtypes: Vec<ColType>,
+    pub rows: Vec<Vec<String>>,
+    /// The `HtmlTable` this was materialized from.
+    pub source: ArtifactId,
+}
+
+impl DbTable {
+    pub fn n_rows(&self) -> usize {
+        self.rows.len()
+    }
+    pub fn n_cols(&self) -> usize {
+        self.columns.len()
+    }
+}
+
+impl Artifact for DbTable {
+    fn id(&self) -> ArtifactId {
+        self.meta.id.clone()
+    }
+    fn content_hash(&self) -> DocHash {
+        self.meta.content_hash
+    }
+    fn provenance(&self) -> &Provenance {
+        &self.meta.provenance
+    }
+    fn kind(&self) -> ArtifactKind {
+        ArtifactKind::DbTable
+    }
+    fn generation(&self) -> Generation {
+        self.meta.generation
+    }
+    fn risk(&self) -> &RiskMarkers {
+        &self.meta.risk
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 /// Serializable, kind-tagged envelope for persistence and round-tripping the
 /// open payload set through the flat store. The live pipeline uses
 /// `Box<dyn Artifact>`; the store speaks `StoredArtifact`.
@@ -515,6 +573,7 @@ pub enum StoredArtifact {
     HtmlTable(HtmlTable),
     Image(ImageRef),
     Document(StructuredDoc),
+    DbTable(DbTable),
 }
 
 impl StoredArtifact {
@@ -530,6 +589,8 @@ impl StoredArtifact {
             Some(StoredArtifact::Image(i.clone()))
         } else if let Some(d) = any.downcast_ref::<StructuredDoc>() {
             Some(StoredArtifact::Document(d.clone()))
+        } else if let Some(db) = any.downcast_ref::<DbTable>() {
+            Some(StoredArtifact::DbTable(db.clone()))
         } else {
             any.downcast_ref::<HtmlTable>()
                 .map(|h| StoredArtifact::HtmlTable(h.clone()))
@@ -544,6 +605,7 @@ impl StoredArtifact {
             StoredArtifact::HtmlTable(h) => Box::new(h),
             StoredArtifact::Image(i) => Box::new(i),
             StoredArtifact::Document(d) => Box::new(d),
+            StoredArtifact::DbTable(db) => Box::new(db),
         }
     }
 
@@ -555,6 +617,7 @@ impl StoredArtifact {
             StoredArtifact::HtmlTable(h) => &h.meta,
             StoredArtifact::Image(i) => &i.meta,
             StoredArtifact::Document(d) => &d.meta,
+            StoredArtifact::DbTable(db) => &db.meta,
         }
     }
 }

@@ -124,6 +124,9 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Materialize the HtmlTables in a store into queryable DbTables (Stage 3 MVP:
+    /// cell cleanup + header/dtype inference) and preview them.
+    Materialize { store: PathBuf },
 }
 
 fn main() -> Result<()> {
@@ -154,7 +157,54 @@ fn main() -> Result<()> {
         Command::RegionCheck { regions, words } => cmd_region_check(&regions, &words),
         Command::Triage { pdf } => cmd_triage(&pdf),
         Command::Pipeline { pdf, out } => cmd_pipeline(&pdf, &out),
+        Command::Materialize { store } => cmd_materialize(&store),
     }
+}
+
+/// Stage 3 MVP: materialize every HtmlTable in a store into a DbTable, persist, preview.
+fn cmd_materialize(store_dir: &Path) -> Result<()> {
+    use quarry::artifact::HtmlTable;
+    use quarry::core::Generation;
+    use quarry::materialize::materialize;
+    use quarry::store::FlatStore;
+
+    let store = FlatStore::open(store_dir);
+    let arts = store.current_artifacts()?;
+    let tables: Vec<&HtmlTable> =
+        arts.iter().filter_map(|a| a.as_any().downcast_ref::<HtmlTable>()).collect();
+    if tables.is_empty() {
+        println!("no HtmlTables in {}", store_dir.display());
+        return Ok(());
+    }
+
+    let doc = tables[0].anchor().doc();
+    let mut dbs: Vec<Box<dyn Artifact>> = Vec::new();
+    for t in &tables {
+        let db = materialize(t, Generation(1));
+        println!(
+            "\nDbTable ({} cols × {} rows) ← {}",
+            db.n_cols(),
+            db.n_rows(),
+            db.source
+        );
+        println!(
+            "  {}",
+            db.columns
+                .iter()
+                .zip(&db.dtypes)
+                .map(|(c, d)| format!("{c} [{d:?}]"))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+        for row in db.rows.iter().take(3) {
+            println!("    {}", row.join(" | "));
+        }
+        dbs.push(Box::new(db));
+    }
+
+    store.write(doc, &dbs, &[])?;
+    println!("\nmaterialized {} table(s) → {}", dbs.len(), store_dir.display());
+    Ok(())
 }
 
 /// Run a `uv run <script ...>` sidecar and capture stdout.

@@ -32,6 +32,7 @@ pub mod evidence;
 pub mod eval;
 pub mod extract;
 pub mod grid;
+pub mod materialize;
 pub mod ops;
 pub mod pipeline;
 pub mod region_check;
