@@ -300,6 +300,26 @@ fn serve_is_done(pdf: &Path) -> bool {
     serve_store_dir(pdf).join("observations.jsonl").exists()
 }
 
+fn fmt_ms(ms: u128) -> String {
+    if ms >= 1000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        format!("{ms}ms")
+    }
+}
+
+/// Persisted parse timing for `pdf`, as `(total_ms, "triage 85ms · docling …")`.
+fn serve_timings(pdf: &Path) -> Option<(u128, String)> {
+    let s = std::fs::read_to_string(serve_store_dir(pdf).join("_timings.json")).ok()?;
+    let stages: Vec<(String, u128)> = serde_json::from_str(&s).ok()?;
+    if stages.is_empty() {
+        return None;
+    }
+    let total = stages.iter().map(|(_, m)| m).sum();
+    let breakdown = stages.iter().map(|(k, m)| format!("{k} {m}ms")).collect::<Vec<_>>().join(" · ");
+    Some((total, breakdown))
+}
+
 fn serve_index(dir: &Path) -> String {
     use quarry::serve::url_encode;
     let mut pdfs = Vec::new();
@@ -310,20 +330,29 @@ fn serve_index(dir: &Path) -> String {
         .map(|p| {
             let enc = url_encode(&p.display().to_string());
             let name = p.strip_prefix(dir).unwrap_or(p).display();
-            // already parsed → an instant view link; else parse links
-            let links = if serve_is_done(p) {
-                format!(
-                    "<a class=done href='/view?pdf={enc}'>● view</a> \
-                     <a href='/run?pdf={enc}'>re-parse</a> \
-                     <a class=ocr href='/run?pdf={enc}&ocr=1'>re-parse + OCR</a>"
+            // already parsed → an instant view link + its parse timing; else parse links
+            let (links, timing) = if serve_is_done(p) {
+                let t = serve_timings(p)
+                    .map(|(tot, bd)| format!("<span class=t title='{bd}'>⏱ {}</span>", fmt_ms(tot)))
+                    .unwrap_or_default();
+                (
+                    format!(
+                        "<a class=done href='/view?pdf={enc}'>● view</a> \
+                         <a href='/run?pdf={enc}'>re-parse</a> \
+                         <a class=ocr href='/run?pdf={enc}&ocr=1'>re-parse + OCR</a>"
+                    ),
+                    t,
                 )
             } else {
-                format!(
-                    "<a href='/run?pdf={enc}'>parse</a> \
-                     <a class=ocr href='/run?pdf={enc}&ocr=1'>parse + OCR</a>"
+                (
+                    format!(
+                        "<a href='/run?pdf={enc}'>parse</a> \
+                         <a class=ocr href='/run?pdf={enc}&ocr=1'>parse + OCR</a>"
+                    ),
+                    String::new(),
                 )
             };
-            format!("<li><span>{name}</span> {links}</li>")
+            format!("<li><span>{name}</span> {timing} {links}</li>")
         })
         .collect::<String>();
     format!(
@@ -331,7 +360,8 @@ fn serve_index(dir: &Path) -> String {
          <style>body{{font:15px system-ui,sans-serif;max-width:780px;margin:40px auto;color:#1f2937}}\
          h1{{font-size:18px}} li{{margin:6px 0;display:flex;gap:12px;align-items:center}}\
          li span{{flex:1;color:#374151}} a{{color:#2563eb;text-decoration:none;font-size:13px}} a.ocr{{color:#7c3aed}}\
-         a.done{{color:#059669;font-weight:600}} .muted{{color:#9ca3af}}</style>\
+         a.done{{color:#059669;font-weight:600}} .muted{{color:#9ca3af}}\
+         .t{{font:12px monospace;color:#065f46;background:#ecfdf5;padding:1px 6px;border-radius:8px;cursor:help}}</style>\
          <h1>quarry — pick a document</h1>\
          <p class=muted>{} PDFs under {}. ● = already parsed (instant view); parse runs docling \
          (first run loads models — be patient).</p>\
