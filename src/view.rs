@@ -34,15 +34,29 @@ fn role_color(r: DocRole) -> &'static str {
 const C_TABLE: &str = "#f59e0b";
 const C_IMAGE: &str = "#ef4444";
 
-struct Box2 {
+/// One positioned, content-bearing element in the page reconstruction.
+struct Item {
     page: u32,
     b: BBox,
     color: &'static str,
-    label: String,
+    html: String,
+    tip: String,
+    big: bool,
 }
 
 fn short(id: &str) -> &str {
     id.get(..20).unwrap_or(id)
+}
+
+/// A compact rendering of a table for the in-page reconstruction.
+fn mini_table(cols: &[String], rows: &[Vec<String>]) -> String {
+    let head = cols.iter().map(|c| format!("<th>{}</th>", esc(c))).collect::<String>();
+    let body = rows
+        .iter()
+        .take(12)
+        .map(|r| format!("<tr>{}</tr>", r.iter().map(|c| format!("<td>{}</td>", esc(c))).collect::<String>()))
+        .collect::<String>();
+    format!("<table class=mini><tr>{head}</tr>{body}</table>")
 }
 
 /// Render the whole store to one HTML document.
@@ -67,67 +81,107 @@ pub fn render_store(artifacts: &[Box<dyn Artifact>], store: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ");
 
-    // ---- page-layout boxes ----
-    let mut boxes: Vec<Box2> = Vec::new();
+    // ---- page reconstruction: the actual extracted content, positioned at its bbox ----
+    let mut items: Vec<Item> = Vec::new();
     for sd in &docs {
         for el in &sd.elements {
             if let Some((page, b)) = loc(&el.anchor) {
-                boxes.push(Box2 {
+                items.push(Item {
                     page,
                     b,
                     color: role_color(el.role),
-                    label: format!("{:?}: {}", el.role, el.text.chars().take(50).collect::<String>()),
+                    html: esc(&el.text),
+                    tip: format!("{:?}: {}", el.role, el.text),
+                    big: matches!(el.role, DocRole::Title | DocRole::Heading),
                 });
             }
         }
     }
-    for t in &htmls {
-        if let Some((page, b)) = loc(t.meta.provenance.anchor()) {
-            boxes.push(Box2 { page, b, color: C_TABLE, label: format!("table {}×{}", t.n_rows, t.n_cols) });
+    // tables: prefer the cleaned DbTable (anchored, via its parent, at the table bbox)
+    if !dbs.is_empty() {
+        for db in &dbs {
+            if let Some((page, b)) = loc(db.meta.provenance.anchor()) {
+                items.push(Item {
+                    page,
+                    b,
+                    color: C_TABLE,
+                    html: mini_table(&db.columns, &db.rows),
+                    tip: format!("DbTable {}×{}", db.n_cols(), db.n_rows()),
+                    big: false,
+                });
+            }
+        }
+    } else {
+        for t in &htmls {
+            if let Some((page, b)) = loc(t.meta.provenance.anchor()) {
+                let cols: Vec<String> = (0..t.n_cols).map(|c| format!("c{c}")).collect();
+                let grid = t.grid();
+                items.push(Item {
+                    page,
+                    b,
+                    color: C_TABLE,
+                    html: mini_table(&cols, &grid),
+                    tip: format!("HtmlTable {}×{}", t.n_rows, t.n_cols),
+                    big: false,
+                });
+            }
         }
     }
     for im in &imgs {
         if let Some((page, b)) = loc(im.meta.provenance.anchor()) {
-            boxes.push(Box2 { page, b, color: C_IMAGE, label: format!("{:?}", im.status) });
+            items.push(Item {
+                page,
+                b,
+                color: C_IMAGE,
+                html: format!("🖼 {:?}", im.status),
+                tip: format!("image — {:?}", im.status),
+                big: false,
+            });
         }
     }
-    // figure regions add image boxes not otherwise shown
     for r in &regs {
         if matches!(r.role(), RegionRole::Figure) {
-            boxes.push(Box2 { page: r.page(), b: r.bbox(), color: C_IMAGE, label: "figure".into() });
+            items.push(Item {
+                page: r.page(),
+                b: r.bbox(),
+                color: C_IMAGE,
+                html: "🖼 figure".into(),
+                tip: "figure region".into(),
+                big: false,
+            });
         }
     }
 
-    let mut pages: Vec<u32> = boxes.iter().map(|x| x.page).collect();
+    let mut pages: Vec<u32> = items.iter().map(|x| x.page).collect();
     pages.sort_unstable();
     pages.dedup();
 
     let mut pages_html = String::new();
     for &pg in &pages {
-        let on: Vec<&Box2> = boxes.iter().filter(|x| x.page == pg).collect();
+        let on: Vec<&Item> = items.iter().filter(|x| x.page == pg).collect();
         let (mut w, mut h) = (1.0f32, 1.0f32);
         for x in &on {
             w = w.max(x.b.x1);
             h = h.max(x.b.y1);
         }
-        let disp_w = 460.0;
-        let disp_h = (disp_w * h / w).clamp(60.0, 1400.0);
-        let mut rects = String::new();
+        let scale = 470.0 / w;
+        let (cw, ch) = (w * scale, h * scale);
+        let mut inner = String::new();
         for x in &on {
-            let (rx, ry) = (x.b.x0.min(x.b.x1), x.b.y0.min(x.b.y1));
-            let (rw, rh) = ((x.b.x1 - x.b.x0).abs().max(1.0), (x.b.y1 - x.b.y0).abs().max(1.0));
-            rects.push_str(&format!(
-                "<rect x='{rx:.1}' y='{ry:.1}' width='{rw:.1}' height='{rh:.1}' \
-                 fill='{c}' fill-opacity='0.18' stroke='{c}' stroke-width='1.2'>\
-                 <title>{lbl}</title></rect>",
+            let (lx, ty) = (x.b.x0.min(x.b.x1) * scale, x.b.y0.min(x.b.y1) * scale);
+            let (bw, bh) = ((x.b.x1 - x.b.x0).abs() * scale, (x.b.y1 - x.b.y0).abs() * scale);
+            let fs = if x.big { (bh * 0.62).clamp(8.0, 15.0) } else { (bh * 0.55).clamp(4.5, 10.0) };
+            inner.push_str(&format!(
+                "<div class=el style='left:{lx:.1}px;top:{ty:.1}px;width:{bw:.1}px;height:{bh:.1}px;\
+                 border-left:2px solid {c};font-size:{fs:.1}px' title='{tip}'>{html}</div>",
                 c = x.color,
-                lbl = esc(&x.label)
+                tip = esc(&x.tip.chars().take(300).collect::<String>()),
+                html = x.html
             ));
         }
         pages_html.push_str(&format!(
-            "<div class=page><div class=pglabel>page {pg} — {n} elements</div>\
-             <svg viewBox='0 0 {w:.0} {h:.0}' width='{disp_w:.0}' height='{disp_h:.0}' \
-             preserveAspectRatio='xMidYMin meet' style='background:#fff;border:1px solid #ddd'>{rects}</svg></div>",
+            "<div class=page><div class=pglabel>page {pg} — {n} items</div>\
+             <div class=recon style='width:{cw:.0}px;height:{ch:.0}px'>{inner}</div></div>",
             n = on.len()
         ));
     }
@@ -235,7 +289,11 @@ pub fn render_store(artifacts: &[Box<dyn Artifact>], store: &str) -> String {
  .chip{{background:#374151;border-radius:10px;padding:1px 8px;margin-right:6px;font-size:12px}}
  section{{padding:18px 20px;border-bottom:1px solid #e5e7eb}}
  h2.s{{font-size:15px;margin:0 0 12px;color:#374151}}
- .pages{{display:flex;flex-wrap:wrap;gap:16px}} .page{{}} .pglabel{{font-size:12px;color:#6b7280;margin-bottom:4px}}
+ .pages{{display:flex;flex-wrap:wrap;gap:18px}} .pglabel{{font-size:12px;color:#6b7280;margin-bottom:4px}}
+ .recon{{position:relative;background:#fff;border:1px solid #d1d5db;overflow:hidden}}
+ .el{{position:absolute;overflow:hidden;line-height:1.04;padding-left:2px;color:#111;box-sizing:border-box}}
+ .el:hover{{overflow:visible;background:#fffbe6;z-index:5;box-shadow:0 0 0 1px #999}}
+ table.mini{{border-collapse:collapse;font-size:4.5px;width:100%}} .mini td,.mini th{{border:.5px solid #d1b07a;padding:0 1px;white-space:nowrap;overflow:hidden}}
  .legend span{{margin-right:14px;font-size:12px}} .legend i{{display:inline-block;width:11px;height:11px;border-radius:2px;margin-right:4px;vertical-align:-1px}}
  .card{{background:#fff;border:1px solid #e5e7eb;border-radius:6px;margin-bottom:14px;overflow:hidden}}
  .cardh{{background:#f3f4f6;padding:6px 10px;font-weight:600;font-size:13px}}
