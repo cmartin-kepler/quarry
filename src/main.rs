@@ -149,6 +149,14 @@ enum Command {
     /// List the artifacts currently in a store — kind, id, generation, lineage, and
     /// a one-line preview. Shows the append-only artifact graph.
     Ls { store: PathBuf },
+    /// Actually OCR the store's OcrDeferred image regions (whole image pages +
+    /// text-less embedded figures) and append the recovered text as derived
+    /// artifacts. Needs the original --pdf.
+    Ocr {
+        store: PathBuf,
+        #[arg(long)]
+        pdf: PathBuf,
+    },
     /// Render a store to a single self-contained HTML view (page layout, tables,
     /// structured text, OCR markers, lineage). With --pdf, shows each source page
     /// side-by-side with its extraction. Open it in a browser.
@@ -252,7 +260,55 @@ fn main() -> Result<()> {
         Command::Enrich { store, kind } => cmd_enrich(&store, &kind),
         Command::Ls { store } => cmd_ls(&store),
         Command::View { store, out, pdf } => cmd_view(&store, out.as_deref(), pdf.as_deref()),
+        Command::Ocr { store, pdf } => cmd_ocr(&store, &pdf),
     }
+}
+
+/// Actually OCR the store's OcrDeferred image regions and append the recovered text
+/// (an `ocr` Enrichment derived from each ImageRef — lineage preserved).
+fn cmd_ocr(store_dir: &Path, pdf: &Path) -> Result<()> {
+    use quarry::artifact::{Enrichment, ImageRef, ImageStatus};
+    use quarry::core::{Generation, SourceAnchor};
+    use quarry::store::FlatStore;
+
+    let store = FlatStore::open(store_dir);
+    let arts = store.current_artifacts()?;
+    let targets: Vec<&ImageRef> = arts
+        .iter()
+        .filter_map(|a| a.as_any().downcast_ref::<ImageRef>())
+        .filter(|i| i.status == ImageStatus::OcrDeferred)
+        .collect();
+    if targets.is_empty() {
+        println!("no OcrDeferred images in {} — nothing to OCR", store_dir.display());
+        return Ok(());
+    }
+
+    let req: Vec<serde_json::Value> = targets
+        .iter()
+        .map(|im| {
+            let b = im.bbox();
+            let page = match im.meta.provenance.anchor() {
+                SourceAnchor::Pdf { page, .. } => *page,
+                _ => 0,
+            };
+            serde_json::json!({"page": page, "bbox": [b.x0, b.y0, b.x1, b.y1]})
+        })
+        .collect();
+    let req_s = serde_json::to_string(&req)?;
+    println!("OCR-ing {} image region(s)…", targets.len());
+    let texts: Vec<String> =
+        serde_json::from_str(&run_uv(&["run", "scripts/ocr.py", &pdf.display().to_string(), &req_s])?)?;
+
+    let doc = targets[0].anchor().doc();
+    let mut out: Vec<Box<dyn Artifact>> = Vec::new();
+    for (im, text) in targets.iter().zip(&texts) {
+        if !text.trim().is_empty() {
+            out.push(Box::new(Enrichment::derive(*im, "ocr", text.clone(), Generation(1))));
+        }
+    }
+    store.write(doc, &out, &[])?;
+    println!("recovered text from {}/{} regions → {} OCR artifacts", out.len(), targets.len(), out.len());
+    Ok(())
 }
 
 fn cmd_view(store_dir: &Path, out: Option<&Path>, pdf: Option<&Path>) -> Result<()> {

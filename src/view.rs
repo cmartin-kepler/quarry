@@ -109,6 +109,9 @@ pub fn render_store(
     let imgs: Vec<&ImageRef> = artifacts.iter().filter_map(|a| a.as_any().downcast_ref()).collect();
     let regs: Vec<&Region> = artifacts.iter().filter_map(|a| a.as_any().downcast_ref()).collect();
     let enrs: Vec<&Enrichment> = artifacts.iter().filter_map(|a| a.as_any().downcast_ref()).collect();
+    // OCR results, keyed by the ImageRef they were recovered from
+    let ocr_by_source: HashMap<String, String> =
+        enrs.iter().filter(|e| e.kind == "ocr").map(|e| (e.source.0.clone(), e.text.clone())).collect();
 
     // counts by kind
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
@@ -173,13 +176,25 @@ pub fn render_store(
     }
     for im in &imgs {
         if let Some((page, b)) = loc(im.meta.provenance.anchor()) {
+            let (html, detail, color) = match ocr_by_source.get(&im.id().0) {
+                Some(t) => (
+                    format!("🔡 {}", esc(t)),
+                    format!("<p class=muted>OCR-recovered text:</p><div class=dtext>{}</div>", esc(t)),
+                    "#7c3aed",
+                ),
+                None => (
+                    format!("🖼 {:?}", im.status),
+                    format!("<p>🖼 image region — <b>{:?}</b></p><p class=muted>page {page}, bbox {} — run <code>quarry ocr</code></p>", im.status, bxs(b)),
+                    C_IMAGE,
+                ),
+            };
             items.push(Item {
                 page,
                 b,
-                color: C_IMAGE,
-                html: format!("🖼 {:?}", im.status),
+                color,
+                html,
                 title: format!("Image · {:?} · p{page} · {}", im.status, bxs(b)),
-                detail: format!("<p>🖼 image region — <b>{:?}</b></p><p class=muted>page {page}, bbox {}</p>", im.status, bxs(b)),
+                detail,
                 big: false,
             });
         }
@@ -225,26 +240,30 @@ pub fn render_store(
         let scale = DISP_W / w;
         let (cw, ch) = (w * scale, h * scale);
         let mut inner = String::new();
+        let mut overlay = String::new();
         for x in &on {
             let (lx, ty) = (x.b.x0.min(x.b.x1) * scale, x.b.y0.min(x.b.y1) * scale);
             let (bw, bh) = ((x.b.x1 - x.b.x0).abs() * scale, (x.b.y1 - x.b.y0).abs() * scale);
             let fs = if x.big { (bh * 0.62).clamp(8.0, 15.0) } else { (bh * 0.55).clamp(4.5, 10.0) };
             let gi = details.len();
             details.push(serde_json::json!({"t": x.title, "h": x.detail}));
+            let pos = format!("left:{lx:.1}px;top:{ty:.1}px;width:{bw:.1}px;height:{bh:.1}px");
+            let tip = esc(&x.title);
             inner.push_str(&format!(
-                "<div class=el data-i='{gi}' style='left:{lx:.1}px;top:{ty:.1}px;width:{bw:.1}px;height:{bh:.1}px;\
-                 border-left:2px solid {c};font-size:{fs:.1}px' title='{tip}'>{html}</div>",
+                "<div class=el data-i='{gi}' style='{pos};border-left:2px solid {c};font-size:{fs:.1}px' title='{tip}'>{html}</div>",
                 c = x.color,
-                tip = esc(&x.title),
                 html = x.html
             ));
+            // transparent clickable hotspot over the source page, same data-i
+            overlay.push_str(&format!("<div class=hot data-i='{gi}' style='{pos}' title='{tip}'></div>"));
         }
         let recon = format!("<div class=recon style='width:{cw:.0}px;height:{ch:.0}px'>{inner}</div>");
         let body = match img {
             Some(pi) => format!(
                 "<div class=sxs>\
-                 <figure><figcaption>document</figcaption>\
-                 <img class=orig style='width:{cw:.0}px' src='data:image/png;base64,{b}'></figure>\
+                 <figure><figcaption>document (clickable)</figcaption>\
+                 <div class=imgwrap style='width:{cw:.0}px;height:{ch:.0}px'>\
+                 <img class=orig style='width:{cw:.0}px' src='data:image/png;base64,{b}'>{overlay}</div></figure>\
                  <figure><figcaption>extracted</figcaption>{recon}</figure></div>",
                 b = pi.png_b64
             ),
@@ -370,7 +389,9 @@ pub fn render_store(
  .sxs{{display:flex;gap:14px;align-items:flex-start}} figure{{margin:0}} figcaption{{font-size:11px;color:#6b7280;margin-bottom:3px;font-weight:600}}
  .orig{{border:1px solid #d1d5db;display:block}}
  .recon{{position:relative;background:#fff;border:1px solid #d1d5db;overflow:hidden}}
- .el{{position:absolute;overflow:hidden;line-height:1.04;padding-left:2px;color:#111;box-sizing:border-box}}
+ .el{{position:absolute;overflow:hidden;line-height:1.04;padding-left:2px;color:#111;box-sizing:border-box;cursor:pointer}}
+ .imgwrap{{position:relative}} .hot{{position:absolute;cursor:pointer}}
+ .sel{{outline:2px solid #111 !important;background:rgba(255,251,230,.55) !important;z-index:7}}
  table.mini{{border-collapse:collapse;font-size:4.5px;width:100%}} .mini td,.mini th{{border:.5px solid #d1b07a;padding:0 1px;white-space:nowrap;overflow:hidden}}
  .legend span{{margin-right:14px;font-size:12px}} .legend i{{display:inline-block;width:11px;height:11px;border-radius:2px;margin-right:4px;vertical-align:-1px}}
  .card{{background:#fff;border:1px solid #e5e7eb;border-radius:6px;margin-bottom:14px;overflow:hidden}}
@@ -399,12 +420,14 @@ pub fn render_store(
 <script>
 const D = {details_json};
 document.addEventListener('click', e => {{
-  const el = e.target.closest('.el');
-  if (!el) return;
-  const d = D[+el.dataset.i];
+  const hit = e.target.closest('[data-i]');
+  if (!hit) return;
+  const i = +hit.dataset.i;
+  const d = D[i];
   if (!d) return;
-  document.querySelectorAll('.el.sel').forEach(x => x.classList.remove('sel'));
-  el.classList.add('sel');
+  document.querySelectorAll('.sel').forEach(x => x.classList.remove('sel'));
+  // highlight the element on BOTH the document and the extraction side
+  document.querySelectorAll('[data-i=' + JSON.stringify(String(i)) + ']').forEach(x => x.classList.add('sel'));
   document.getElementById('detail').innerHTML = '<div class=dh>' + d.t + '</div>' + d.h;
 }});
 </script>
