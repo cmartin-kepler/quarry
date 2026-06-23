@@ -18,6 +18,7 @@ warm (models loaded once) unless noted "wall-clock". Harnesses live in `scripts/
 | 5 | Full-page rasterized (0-word) slides are the genuinely expensive pages | Triage must catch image/no-text pages |
 | 6 | A ~40dpi thumbnail's **stddev** cleanly separates blank (0.0) from content (≥33), ~10ms | Cheap blank-vs-content gate; content → OCR-deferred, not dropped |
 | 7 | docling whole-page is clip- and diagram-immune and competitive on cost | **docling whole-page** (not cropped, not escalation) is the default parser |
+| 8 | Pipeline vs docling-full (20 docs): gate loses **no real tables** (Δ=0 on all 18 text docs); only drops spurious empty tables on all-image decks; structured text misses nested groups | **Gate validated**; fix: recurse `body.children` groups for complete sections |
 
 **Detailed write-ups** (full method, data tables, analysis, caveats) in `evidence/`:
 1. [`evidence/01-step0-probe.md`](evidence/01-step0-probe.md) — cheap-parse wrong answers / region clipping
@@ -27,6 +28,7 @@ warm (models loaded once) unless noted "wall-clock". Harnesses live in `scripts/
 5. [`evidence/05-image-pages.md`](evidence/05-image-pages.md) — which image pages are expensive
 6. [`evidence/06-blank-discriminator.md`](evidence/06-blank-discriminator.md) — blank vs content
 7. [`evidence/07-whole-vs-crop-docling.md`](evidence/07-whole-vs-crop-docling.md) — whole-page vs crop
+8. [`evidence/08-pipeline-validation.md`](evidence/08-pipeline-validation.md) — pipeline vs docling-full vs lit (corpus)
 
 The sections below are the short version; follow the links for the full evidence.
 
