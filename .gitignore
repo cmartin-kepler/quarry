@@ -3,6 +3,9 @@
 # Fetched / generated corpus (large, reproducible via scripts/)
 /corpus
 
+# Generated eval data (stores, qdoc dumps — reproducible via scripts/build_catch_eval.py)
+/catch_eval
+
 # Input corpus: track the folder structure, ignore the documents dropped in.
 /input/*
 !/input/README.md
