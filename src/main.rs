@@ -142,6 +142,58 @@ enum Command {
         #[arg(long, default_value = "summary")]
         kind: String,
     },
+    /// List the artifacts currently in a store — kind, id, generation, lineage, and
+    /// a one-line preview. Shows the append-only artifact graph.
+    Ls { store: PathBuf },
+}
+
+fn short_id(id: &quarry::core::ArtifactId) -> String {
+    id.0.chars().take(20).collect()
+}
+
+fn artifact_preview(a: &dyn Artifact) -> String {
+    use quarry::artifact::*;
+    let any = a.as_any();
+    if let Some(t) = any.downcast_ref::<HtmlTable>() {
+        format!("{}×{} table", t.n_rows, t.n_cols)
+    } else if let Some(d) = any.downcast_ref::<StructuredDoc>() {
+        format!("{} text elements, {} sections", d.elements.len(), d.sections().len())
+    } else if let Some(db) = any.downcast_ref::<DbTable>() {
+        format!("[{}]", db.columns.join(", "))
+    } else if let Some(e) = any.downcast_ref::<Enrichment>() {
+        format!("{}: {}…", e.kind, e.text.chars().take(48).collect::<String>())
+    } else if let Some(i) = any.downcast_ref::<ImageRef>() {
+        format!("{:?}", i.status)
+    } else if let Some(g) = any.downcast_ref::<TextGrid>() {
+        format!("{} words", g.words.len())
+    } else {
+        String::new()
+    }
+}
+
+fn cmd_ls(store_dir: &Path) -> Result<()> {
+    use quarry::core::Provenance;
+    use quarry::store::FlatStore;
+
+    let arts = FlatStore::open(store_dir).current_artifacts()?;
+    println!("{} artifacts in {}", arts.len(), store_dir.display());
+    for a in &arts {
+        let lineage = match a.provenance() {
+            Provenance::Source(_) => "source".to_string(),
+            Provenance::Derived { parents, .. } => {
+                format!("← {}", parents.iter().map(short_id).collect::<Vec<_>>().join(","))
+            }
+        };
+        println!(
+            "  {:10} {:22} gen{} {:14} | {}",
+            format!("{:?}", a.kind()),
+            short_id(&a.id()),
+            a.generation().0,
+            lineage,
+            artifact_preview(a.as_ref())
+        );
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -175,6 +227,7 @@ fn main() -> Result<()> {
         Command::Materialize { store } => cmd_materialize(&store),
         Command::Text { store, summary } => cmd_text(&store, summary),
         Command::Enrich { store, kind } => cmd_enrich(&store, &kind),
+        Command::Ls { store } => cmd_ls(&store),
     }
 }
 
