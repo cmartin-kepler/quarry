@@ -8,7 +8,37 @@
 
 use crate::artifact::*;
 use crate::core::{BBox, Provenance, SourceAnchor};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+
+/// A rasterized source page: size in POINTS (to scale the overlay to the same space)
+/// plus a base64 PNG. Built by `scripts/render_pages.py`.
+pub struct PageImage {
+    pub w: f32,
+    pub h: f32,
+    pub png_b64: String,
+}
+
+/// Pages that carry positioned content (so the caller knows which to rasterize).
+pub fn content_pages(artifacts: &[Box<dyn Artifact>]) -> Vec<u32> {
+    let mut pages: Vec<u32> = Vec::new();
+    for a in artifacts {
+        let any = a.as_any();
+        if let Some(sd) = any.downcast_ref::<StructuredDoc>() {
+            for el in &sd.elements {
+                if let Some((p, _)) = loc(&el.anchor) {
+                    pages.push(p);
+                }
+            }
+        } else if let Some((p, _)) = loc(a.provenance().anchor())
+            .filter(|_| matches!(a.kind(), ArtifactKind::HtmlTable | ArtifactKind::Image | ArtifactKind::Region))
+        {
+            pages.push(p);
+        }
+    }
+    pages.sort_unstable();
+    pages.dedup();
+    pages
+}
 
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
@@ -59,8 +89,14 @@ fn mini_table(cols: &[String], rows: &[Vec<String>]) -> String {
     format!("<table class=mini><tr>{head}</tr>{body}</table>")
 }
 
-/// Render the whole store to one HTML document.
-pub fn render_store(artifacts: &[Box<dyn Artifact>], store: &str) -> String {
+/// Render the whole store to one HTML document. When `page_images` has a page, the
+/// rasterized source page is shown side-by-side with the extraction (aligned via the
+/// real page dimensions); otherwise just the extraction reconstruction is shown.
+pub fn render_store(
+    artifacts: &[Box<dyn Artifact>],
+    store: &str,
+    page_images: &HashMap<u32, PageImage>,
+) -> String {
     // typed views
     let docs: Vec<&StructuredDoc> =
         artifacts.iter().filter_map(|a| a.as_any().downcast_ref()).collect();
@@ -156,15 +192,25 @@ pub fn render_store(artifacts: &[Box<dyn Artifact>], store: &str) -> String {
     pages.sort_unstable();
     pages.dedup();
 
+    const DISP_W: f32 = 470.0;
     let mut pages_html = String::new();
     for &pg in &pages {
         let on: Vec<&Item> = items.iter().filter(|x| x.page == pg).collect();
-        let (mut w, mut h) = (1.0f32, 1.0f32);
-        for x in &on {
-            w = w.max(x.b.x1);
-            h = h.max(x.b.y1);
-        }
-        let scale = 470.0 / w;
+        let img = page_images.get(&pg);
+        // real page dims when we have the rendered image (so the overlay aligns to
+        // the same coordinate space); otherwise fall back to the content extent.
+        let (w, h) = match img {
+            Some(pi) => (pi.w.max(1.0), pi.h.max(1.0)),
+            None => {
+                let (mut w, mut h) = (1.0f32, 1.0f32);
+                for x in &on {
+                    w = w.max(x.b.x1);
+                    h = h.max(x.b.y1);
+                }
+                (w, h)
+            }
+        };
+        let scale = DISP_W / w;
         let (cw, ch) = (w * scale, h * scale);
         let mut inner = String::new();
         for x in &on {
@@ -179,9 +225,19 @@ pub fn render_store(artifacts: &[Box<dyn Artifact>], store: &str) -> String {
                 html = x.html
             ));
         }
+        let recon = format!("<div class=recon style='width:{cw:.0}px;height:{ch:.0}px'>{inner}</div>");
+        let body = match img {
+            Some(pi) => format!(
+                "<div class=sxs>\
+                 <figure><figcaption>document</figcaption>\
+                 <img class=orig style='width:{cw:.0}px' src='data:image/png;base64,{b}'></figure>\
+                 <figure><figcaption>extracted</figcaption>{recon}</figure></div>",
+                b = pi.png_b64
+            ),
+            None => recon,
+        };
         pages_html.push_str(&format!(
-            "<div class=page><div class=pglabel>page {pg} — {n} items</div>\
-             <div class=recon style='width:{cw:.0}px;height:{ch:.0}px'>{inner}</div></div>",
+            "<div class=page><div class=pglabel>page {pg} — {n} items</div>{body}</div>",
             n = on.len()
         ));
     }
@@ -290,6 +346,8 @@ pub fn render_store(artifacts: &[Box<dyn Artifact>], store: &str) -> String {
  section{{padding:18px 20px;border-bottom:1px solid #e5e7eb}}
  h2.s{{font-size:15px;margin:0 0 12px;color:#374151}}
  .pages{{display:flex;flex-wrap:wrap;gap:18px}} .pglabel{{font-size:12px;color:#6b7280;margin-bottom:4px}}
+ .sxs{{display:flex;gap:14px;align-items:flex-start}} figure{{margin:0}} figcaption{{font-size:11px;color:#6b7280;margin-bottom:3px;font-weight:600}}
+ .orig{{border:1px solid #d1d5db;display:block}}
  .recon{{position:relative;background:#fff;border:1px solid #d1d5db;overflow:hidden}}
  .el{{position:absolute;overflow:hidden;line-height:1.04;padding-left:2px;color:#111;box-sizing:border-box}}
  .el:hover{{overflow:visible;background:#fffbe6;z-index:5;box-shadow:0 0 0 1px #999}}
@@ -307,7 +365,7 @@ pub fn render_store(artifacts: &[Box<dyn Artifact>], store: &str) -> String {
 <header><h1>Quarry store — {store}</h1><div>{summary}</div>
  <nav><a href=#pages>Layout</a><a href=#tables>Tables</a><a href=#text>Text</a><a href=#enrich>Enrichments</a><a href=#dag>Lineage</a></nav>
 </header>
-<section id=pages><h2 class=s>Page layout (docling regions, bboxes to scale)</h2>
+<section id=pages><h2 class=s>Document vs extraction (source page beside the reconstructed content)</h2>
  <div class=legend>
   <span><i style='background:#2563eb'></i>heading</span><span><i style='background:#93c5fd'></i>paragraph</span>
   <span><i style='background:#16a34a'></i>list</span><span><i style='background:#0d9488'></i>caption</span>

@@ -149,13 +149,17 @@ enum Command {
     /// List the artifacts currently in a store — kind, id, generation, lineage, and
     /// a one-line preview. Shows the append-only artifact graph.
     Ls { store: PathBuf },
-    /// Render a store to a single self-contained HTML view (page layout + bboxes,
-    /// tables, structured text, OCR markers, lineage). Open it in a browser.
+    /// Render a store to a single self-contained HTML view (page layout, tables,
+    /// structured text, OCR markers, lineage). With --pdf, shows each source page
+    /// side-by-side with its extraction. Open it in a browser.
     View {
         store: PathBuf,
         /// Output file (default: <store>/view.html).
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Original PDF — renders source pages beside the extraction.
+        #[arg(long)]
+        pdf: Option<PathBuf>,
     },
 }
 
@@ -247,15 +251,40 @@ fn main() -> Result<()> {
         Command::Text { store, summary } => cmd_text(&store, summary),
         Command::Enrich { store, kind } => cmd_enrich(&store, &kind),
         Command::Ls { store } => cmd_ls(&store),
-        Command::View { store, out } => cmd_view(&store, out.as_deref()),
+        Command::View { store, out, pdf } => cmd_view(&store, out.as_deref(), pdf.as_deref()),
     }
 }
 
-fn cmd_view(store_dir: &Path, out: Option<&Path>) -> Result<()> {
+fn cmd_view(store_dir: &Path, out: Option<&Path>, pdf: Option<&Path>) -> Result<()> {
     use quarry::store::FlatStore;
+    use quarry::view::{content_pages, PageImage};
+    use std::collections::HashMap;
 
     let arts = FlatStore::open(store_dir).current_artifacts()?;
-    let html = quarry::view::render_store(&arts, &store_dir.display().to_string());
+
+    // optionally rasterize the source pages that carry content (for side-by-side)
+    let mut page_images: HashMap<u32, PageImage> = HashMap::new();
+    if let Some(pdf) = pdf {
+        let pages = content_pages(&arts);
+        if !pages.is_empty() {
+            let list = pages.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
+            let json = run_uv(&["run", "scripts/render_pages.py", &pdf.display().to_string(), "--pages", &list])?;
+            let raw: HashMap<String, serde_json::Value> = serde_json::from_str(&json)?;
+            for (k, v) in raw {
+                if let (Ok(pg), Some(w), Some(h), Some(png)) = (
+                    k.parse::<u32>(),
+                    v["w"].as_f64(),
+                    v["h"].as_f64(),
+                    v["png"].as_str(),
+                ) {
+                    page_images.insert(pg, PageImage { w: w as f32, h: h as f32, png_b64: png.to_string() });
+                }
+            }
+            println!("rendered {} source pages", page_images.len());
+        }
+    }
+
+    let html = quarry::view::render_store(&arts, &store_dir.display().to_string(), &page_images);
     let out_path = out.map(PathBuf::from).unwrap_or_else(|| store_dir.join("view.html"));
     std::fs::write(&out_path, html).with_context(|| format!("writing {}", out_path.display()))?;
     println!("wrote {} ({} artifacts) — open it in a browser", out_path.display(), arts.len());
