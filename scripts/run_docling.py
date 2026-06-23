@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["docling", "pypdf"]
+# dependencies = ["docling", "pypdf", "rapidocr-onnxruntime", "onnxruntime"]
 # ///
 """Docling sidecar for the Rust `docling` extractor.
 
-Run Docling on a PDF (born-digital config: no OCR, pictures bounded-not-processed)
-and print the `DoclingDocument` JSON — the schema the crate's
+Run Docling on a PDF (do_ocr=True, text-layer-aware: docling reads the programmatic
+text layer and OCRs ONLY bitmap regions that lack one — e.g. embedded figures — so
+figure text is recovered surgically, ~free on pure-text pages; see evidence/10. We use
+the RapidOCR engine so no system tesseract / easyocr+torch is needed. Pictures are
+bounded-not-processed.) and print the `DoclingDocument` JSON — the schema the crate's
 `docling::artifacts_from_docling` / `structured_doc_from_docling` adapters consume
 (pages, tables with cells+prov, texts with labels, body reading order).
 
@@ -25,13 +28,14 @@ import os
 import tempfile
 
 from docling.datamodel.base_models import InputFormat
-from docling.datamodel.pipeline_options import PdfPipelineOptions
+from docling.datamodel.pipeline_options import PdfPipelineOptions, RapidOcrOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
 
 
 def converter():
     o = PdfPipelineOptions()
-    o.do_ocr = False
+    o.do_ocr = True  # text-layer-aware: OCRs only no-text regions (figures), not the text
+    o.ocr_options = RapidOcrOptions()  # ONNX/CPU engine — no system tesseract / torch
     o.do_table_structure = True
     for a in ("generate_picture_images", "do_picture_classification", "do_picture_description"):
         if hasattr(o, a):

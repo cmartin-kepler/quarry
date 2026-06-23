@@ -711,15 +711,10 @@ fn run_uv(args: &[&str]) -> Result<String> {
 
 /// Pipeline Stage 0–1: triage → docling-whole on text pages → store.
 fn cmd_pipeline(pdf: &Path, out: &Path, regions: bool) -> Result<()> {
-    use quarry::artifact::{ImageRef, Region, RegionRole};
     use quarry::core::{DocHash, Generation};
     use quarry::docling::{artifacts_from_docling, regions_from_docling, structured_doc_from_docling};
     use quarry::store::FlatStore;
     use quarry::triage::{counts, ocr_markers, parse as parse_triage, PageClass};
-
-    // a Figure region with fewer than this many words under its bbox is text-less → OCR target
-    const OCR_WORD_MIN: i32 = 3;
-
     use std::time::Instant;
     let t_all = Instant::now();
     let bytes = std::fs::read(pdf).with_context(|| format!("reading {}", pdf.display()))?;
@@ -743,9 +738,12 @@ fn cmd_pipeline(pdf: &Path, out: &Path, regions: bool) -> Result<()> {
     // Stage 1 — docling whole-page on TEXT pages only (image/blank skipped)
     let text: Vec<String> =
         pages.iter().filter(|p| p.klass == PageClass::Text).map(|p| p.page.to_string()).collect();
-    let (mut n_tables, mut n_elems, mut n_regions, mut n_embedded_ocr) = (0usize, 0usize, 0usize, 0usize);
-    let (mut docling_ms, mut ocrscan_ms) = (0u128, 0u128);
+    let (mut n_tables, mut n_elems, mut n_regions) = (0usize, 0usize, 0usize);
+    let mut docling_ms = 0u128;
     if !text.is_empty() {
+        // docling runs with do_ocr=True (text-layer-aware): it reads the text layer and
+        // OCRs only no-text regions (embedded figures), so figure text lands inline in
+        // the StructuredDoc — no separate figure-OCR pass needed (evidence/10).
         let t = Instant::now();
         let dj = run_uv(&["run", "scripts/run_docling.py", &pdf_s, "--pages", &text.join(",")])?;
         docling_ms = t.elapsed().as_millis();
@@ -757,35 +755,8 @@ fn cmd_pipeline(pdf: &Path, out: &Path, regions: bool) -> Result<()> {
         if n_elems > 0 {
             artifacts.push(Box::new(sd));
         }
-
-        // Embedded image regions (docling Figures) whose bbox has no text layer are
-        // OCR targets — invariant 11 extended from whole pages to sub-page images.
-        let regs = regions_from_docling(&dj, doc, generation)?;
-        let figures: Vec<&Region> =
-            regs.iter().filter(|r| r.role() == RegionRole::Figure).collect();
-        if !figures.is_empty() {
-            let req: Vec<serde_json::Value> = figures
-                .iter()
-                .map(|r| {
-                    let b = r.bbox();
-                    serde_json::json!({"page": r.page(), "bbox": [b.x0, b.y0, b.x1, b.y1]})
-                })
-                .collect();
-            let req_s = serde_json::to_string(&req)?;
-            let t = Instant::now();
-            let word_counts: Vec<i32> = serde_json::from_str(
-                &run_uv(&["run", "scripts/region_text.py", &pdf_s, &req_s])?,
-            )?;
-            ocrscan_ms = t.elapsed().as_millis();
-            for (fig, &words) in figures.iter().zip(&word_counts) {
-                if (0..OCR_WORD_MIN).contains(&words) {
-                    artifacts.push(Box::new(ImageRef::ocr_deferred_region(fig)));
-                    n_embedded_ocr += 1;
-                }
-            }
-        }
-
         if regions {
+            let regs = regions_from_docling(&dj, doc, generation)?;
             n_regions = regs.len();
             for r in regs {
                 artifacts.push(Box::new(r));
@@ -795,18 +766,13 @@ fn cmd_pipeline(pdf: &Path, out: &Path, regions: bool) -> Result<()> {
 
     FlatStore::open(out).write(doc, &artifacts, &[])?;
     let reg_note = if regions { format!(", {n_regions} layout regions") } else { String::new() };
-    let ocr_note =
-        if n_embedded_ocr > 0 { format!(", {n_embedded_ocr} embedded-image OCR markers") } else { String::new() };
     println!(
-        "parsed: {n_tables} tables, {n_elems} text elements, {i} OCR markers{ocr_note}{reg_note} → {}",
+        "parsed: {n_tables} tables, {n_elems} text elements, {i} OCR markers{reg_note} → {}",
         out.display()
     );
-    println!(
-        "⏱  triage {triage_ms}ms · docling {docling_ms}ms · ocr-scan {ocrscan_ms}ms · total {}ms",
-        t_all.elapsed().as_millis()
-    );
+    println!("⏱  triage {triage_ms}ms · docling {docling_ms}ms · total {}ms", t_all.elapsed().as_millis());
     // persist stage timings so any view (CLI or served) shows the banner
-    write_timings(out, &[("triage", triage_ms), ("docling", docling_ms), ("ocr-scan", ocrscan_ms)]);
+    write_timings(out, &[("triage", triage_ms), ("docling", docling_ms)]);
     Ok(())
 }
 

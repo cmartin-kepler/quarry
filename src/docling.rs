@@ -35,12 +35,15 @@ struct DoclingDoc {
     body: DBody,
 }
 
-/// A picture/figure the layout model located (we don't process its pixels, but we
-/// record its box as a `Region`).
+/// A picture/figure the layout model located. With `do_ocr=True` docling attaches the
+/// figure's OCR'd text as `children` (refs to `#/texts/N`) — so the reading-order walk
+/// recurses into it to capture figure text. `prov` is the figure's box (→ `Region`).
 #[derive(Deserialize, Default)]
 struct DPicture {
     #[serde(default)]
     prov: Vec<DProv>,
+    #[serde(default)]
+    children: Vec<DRef>,
 }
 
 /// A nesting group (a list, a multi-column section, …) — its `children` are more
@@ -267,15 +270,18 @@ fn doc_role(label: &str) -> DocRole {
     }
 }
 
-/// Walk a list of `body`/group child refs in reading order, emitting a
-/// `DocElement` per `#/texts/N` and **recursing through `#/groups/N`** (lists,
-/// multi-column sections). Tables/pictures are skipped (their own artifacts).
+/// Walk a list of `body`/group/picture child refs in reading order, emitting a
+/// `DocElement` per `#/texts/N`, **recursing through `#/groups/N`** (lists,
+/// multi-column sections) **and `#/pictures/N`** (figure text recovered by docling's
+/// OCR, which lands under the picture, not in body). `in_picture` text is tagged
+/// `Other` so it stays distinguishable from prose. Tables are separate artifacts.
 fn walk_children(
     children: &[DRef],
     dd: &DoclingDoc,
     doc: DocHash,
     out: &mut Vec<DocElement>,
-    seen: &mut std::collections::HashSet<usize>,
+    seen: &mut std::collections::HashSet<String>,
+    in_picture: bool,
 ) {
     for child in children {
         if let Some(idx) = child.cref.strip_prefix("#/texts/").and_then(|s| s.parse::<usize>().ok()) {
@@ -288,17 +294,24 @@ fn walk_children(
             let page_h = dd.pages.get(&page.to_string()).map(|p| p.size.height).unwrap_or(792.0);
             let bbox = prov.map(|p| p.bbox.to_topleft(page_h)).unwrap_or(BBox::new(0.0, 0.0, 0.0, 0.0));
             out.push(DocElement {
-                role: doc_role(&t.label),
+                role: if in_picture { DocRole::Other } else { doc_role(&t.label) },
                 // collapse docling's layout-derived whitespace ("Though  born" -> "Though born")
                 text: t.text.split_whitespace().collect::<Vec<_>>().join(" "),
                 anchor: SourceAnchor::Pdf { doc, page, bbox },
             });
         } else if let Some(g) = child.cref.strip_prefix("#/groups/").and_then(|s| s.parse::<usize>().ok())
         {
-            // recurse into the group (guard against cycles)
-            if seen.insert(g) {
+            // recurse into the group (guard against cycles by ref)
+            if seen.insert(child.cref.clone()) {
                 let Some(grp) = dd.groups.get(g) else { continue };
-                walk_children(&grp.children, dd, doc, out, seen);
+                walk_children(&grp.children, dd, doc, out, seen, in_picture);
+            }
+        } else if let Some(p) = child.cref.strip_prefix("#/pictures/").and_then(|s| s.parse::<usize>().ok())
+        {
+            // recurse into the picture's OCR'd figure text (do_ocr=True), tagged Other
+            if seen.insert(child.cref.clone()) {
+                let Some(pic) = dd.pictures.get(p) else { continue };
+                walk_children(&pic.children, dd, doc, out, seen, true);
             }
         }
     }
@@ -315,8 +328,8 @@ pub fn structured_doc_from_docling(
 ) -> Result<StructuredDoc> {
     let dd: DoclingDoc = serde_json::from_str(json).context("parsing Docling JSON")?;
     let mut elements = Vec::new();
-    let mut seen_groups = std::collections::HashSet::new();
-    walk_children(&dd.body.children, &dd, doc, &mut elements, &mut seen_groups);
+    let mut seen = std::collections::HashSet::new();
+    walk_children(&dd.body.children, &dd, doc, &mut elements, &mut seen, false);
     let joined: String = elements.iter().map(|e| e.text.as_str()).collect();
     let content = DocHash::of(format!("structdoc:{joined}").as_bytes());
     let anchor = elements
