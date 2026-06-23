@@ -7,27 +7,16 @@
 use crate::artifact::{ColType, DbTable, HtmlTable, Meta};
 use crate::core::{ArtifactId, DocHash, Generation, Origin, Provenance, RiskMarkers};
 
-/// Clean a raw cell: drop dot-leaders (runs of 2+ `.`, as in `13......`) while
-/// keeping a lone decimal point (`13.5`), and collapse/trim whitespace.
+/// Clean a raw cell: drop dot-leaders — both consecutive (`13......`) and
+/// space-separated (`1965 . . . . .`) — while keeping decimals (`13.5`), and
+/// collapse/trim whitespace. Per whitespace token, strip trailing dots; an all-dots
+/// token then becomes empty and is dropped.
 pub fn clean_cell(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut dots = 0usize;
-    for ch in s.chars() {
-        if ch == '.' {
-            dots += 1;
-            continue;
-        }
-        if dots == 1 {
-            out.push('.'); // a single dot is a decimal point — keep it
-        }
-        // dots >= 2 was a leader — drop it
-        dots = 0;
-        out.push(ch);
-    }
-    if dots == 1 {
-        out.push('.');
-    }
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    s.split_whitespace()
+        .map(|t| t.trim_end_matches('.'))
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Parse a cleaned cell as a number ($, commas, %, and `(123)` negatives handled).
@@ -140,6 +129,9 @@ mod tests {
         assert_eq!(clean_cell("13.5"), "13.5");
         assert_eq!(clean_cell("Revenue ....  1,234"), "Revenue 1,234");
         assert_eq!(clean_cell("  spaced   out "), "spaced out");
+        // space-separated dot-leaders (real Berkshire tables use these)
+        assert_eq!(clean_cell("1965 . . . . . . ."), "1965");
+        assert_eq!(clean_cell("Insurance-underwriting . . . ."), "Insurance-underwriting");
     }
 
     fn cell(r: u32, c: u32, text: &str, hdr: bool) -> Cell {
