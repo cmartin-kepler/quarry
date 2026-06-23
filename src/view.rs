@@ -69,8 +69,12 @@ struct Item {
     page: u32,
     b: BBox,
     color: &'static str,
+    /// Clipped content drawn in-place on the page.
     html: String,
-    tip: String,
+    /// Header line for hover + the blow-up panel.
+    title: String,
+    /// Full, readable content shown in the detail column when selected.
+    detail: String,
     big: bool,
 }
 
@@ -78,15 +82,15 @@ fn short(id: &str) -> &str {
     id.get(..20).unwrap_or(id)
 }
 
-/// A compact rendering of a table for the in-page reconstruction.
-fn mini_table(cols: &[String], rows: &[Vec<String>]) -> String {
+/// Render a table (`klass` = `mini` for the tiny in-page copy, `full` for the panel).
+fn table_html(cols: &[String], rows: &[Vec<String>], max: usize, klass: &str) -> String {
     let head = cols.iter().map(|c| format!("<th>{}</th>", esc(c))).collect::<String>();
     let body = rows
         .iter()
-        .take(12)
+        .take(max)
         .map(|r| format!("<tr>{}</tr>", r.iter().map(|c| format!("<td>{}</td>", esc(c))).collect::<String>()))
         .collect::<String>();
-    format!("<table class=mini><tr>{head}</tr>{body}</table>")
+    format!("<table class={klass}><tr>{head}</tr>{body}</table>")
 }
 
 /// Render the whole store to one HTML document. When `page_images` has a page, the
@@ -118,6 +122,7 @@ pub fn render_store(
         .join(" ");
 
     // ---- page reconstruction: the actual extracted content, positioned at its bbox ----
+    let bxs = |b: BBox| format!("[{:.0},{:.0},{:.0},{:.0}]", b.x0, b.y0, b.x1, b.y1);
     let mut items: Vec<Item> = Vec::new();
     for sd in &docs {
         for el in &sd.elements {
@@ -127,7 +132,8 @@ pub fn render_store(
                     b,
                     color: role_color(el.role),
                     html: esc(&el.text),
-                    tip: format!("{:?}: {}", el.role, el.text),
+                    title: format!("{:?} · p{page} · {}", el.role, bxs(b)),
+                    detail: format!("<div class=dtext>{}</div>", esc(&el.text)),
                     big: matches!(el.role, DocRole::Title | DocRole::Heading),
                 });
             }
@@ -141,8 +147,9 @@ pub fn render_store(
                     page,
                     b,
                     color: C_TABLE,
-                    html: mini_table(&db.columns, &db.rows),
-                    tip: format!("DbTable {}×{}", db.n_cols(), db.n_rows()),
+                    html: table_html(&db.columns, &db.rows, 12, "mini"),
+                    title: format!("DbTable {}×{} · p{page} · {}", db.n_cols(), db.n_rows(), bxs(b)),
+                    detail: table_html(&db.columns, &db.rows, 500, "full"),
                     big: false,
                 });
             }
@@ -156,8 +163,9 @@ pub fn render_store(
                     page,
                     b,
                     color: C_TABLE,
-                    html: mini_table(&cols, &grid),
-                    tip: format!("HtmlTable {}×{}", t.n_rows, t.n_cols),
+                    html: table_html(&cols, &grid, 12, "mini"),
+                    title: format!("HtmlTable {}×{} · p{page} · {}", t.n_rows, t.n_cols, bxs(b)),
+                    detail: table_html(&cols, &grid, 500, "full"),
                     big: false,
                 });
             }
@@ -170,19 +178,22 @@ pub fn render_store(
                 b,
                 color: C_IMAGE,
                 html: format!("🖼 {:?}", im.status),
-                tip: format!("image — {:?}", im.status),
+                title: format!("Image · {:?} · p{page} · {}", im.status, bxs(b)),
+                detail: format!("<p>🖼 image region — <b>{:?}</b></p><p class=muted>page {page}, bbox {}</p>", im.status, bxs(b)),
                 big: false,
             });
         }
     }
     for r in &regs {
         if matches!(r.role(), RegionRole::Figure) {
+            let b = r.bbox();
             items.push(Item {
                 page: r.page(),
-                b: r.bbox(),
+                b,
                 color: C_IMAGE,
                 html: "🖼 figure".into(),
-                tip: "figure region".into(),
+                title: format!("Figure region · p{} · {}", r.page(), bxs(b)),
+                detail: format!("<p>🖼 figure region</p><p class=muted>page {}, bbox {}</p>", r.page(), bxs(b)),
                 big: false,
             });
         }
@@ -193,6 +204,7 @@ pub fn render_store(
     pages.dedup();
 
     const DISP_W: f32 = 470.0;
+    let mut details: Vec<serde_json::Value> = Vec::new();
     let mut pages_html = String::new();
     for &pg in &pages {
         let on: Vec<&Item> = items.iter().filter(|x| x.page == pg).collect();
@@ -217,11 +229,13 @@ pub fn render_store(
             let (lx, ty) = (x.b.x0.min(x.b.x1) * scale, x.b.y0.min(x.b.y1) * scale);
             let (bw, bh) = ((x.b.x1 - x.b.x0).abs() * scale, (x.b.y1 - x.b.y0).abs() * scale);
             let fs = if x.big { (bh * 0.62).clamp(8.0, 15.0) } else { (bh * 0.55).clamp(4.5, 10.0) };
+            let gi = details.len();
+            details.push(serde_json::json!({"t": x.title, "h": x.detail}));
             inner.push_str(&format!(
-                "<div class=el style='left:{lx:.1}px;top:{ty:.1}px;width:{bw:.1}px;height:{bh:.1}px;\
+                "<div class=el data-i='{gi}' style='left:{lx:.1}px;top:{ty:.1}px;width:{bw:.1}px;height:{bh:.1}px;\
                  border-left:2px solid {c};font-size:{fs:.1}px' title='{tip}'>{html}</div>",
                 c = x.color,
-                tip = esc(&x.tip.chars().take(300).collect::<String>()),
+                tip = esc(&x.title),
                 html = x.html
             ));
         }
@@ -336,10 +350,17 @@ pub fn render_store(
         edges = "<p class=muted>all artifacts are sources (no derivations yet)</p>".into();
     }
 
+    let details_json = serde_json::to_string(&details).unwrap_or_else(|_| "[]".into());
+
     format!(
         "<!doctype html><html><head><meta charset=utf-8><title>Quarry — {store}</title>
 <style>
- body{{font:14px/1.5 -apple-system,system-ui,sans-serif;margin:0;color:#1f2937;background:#f9fafb}}
+ body{{font:14px/1.5 -apple-system,system-ui,sans-serif;margin:0;color:#1f2937;background:#f9fafb;padding-right:400px}}
+ #detail{{position:fixed;top:0;right:0;width:380px;height:100vh;overflow:auto;background:#fff;border-left:1px solid #d1d5db;padding:14px 16px;box-sizing:border-box;z-index:20}}
+ #detail .dh{{font:12px monospace;color:#6b7280;margin-bottom:10px;border-bottom:1px solid #eee;padding-bottom:6px}}
+ .dtext{{font-size:14px;line-height:1.55;white-space:pre-wrap}}
+ table.full{{border-collapse:collapse;font-size:12px;width:100%;margin-top:4px}} .full td,.full th{{border:1px solid #e5e7eb;padding:2px 6px;text-align:left}} .full th{{background:#fafafa}}
+ .el{{cursor:pointer}} .el.sel{{outline:2px solid #111;background:#fffbe6;z-index:6;overflow:visible}}
  header{{position:sticky;top:0;background:#111827;color:#fff;padding:12px 20px;z-index:9}}
  header h1{{margin:0 0 6px;font-size:16px}} header a{{color:#93c5fd;margin-right:14px;text-decoration:none;font-size:13px}}
  .chip{{background:#374151;border-radius:10px;padding:1px 8px;margin-right:6px;font-size:12px}}
@@ -350,7 +371,6 @@ pub fn render_store(
  .orig{{border:1px solid #d1d5db;display:block}}
  .recon{{position:relative;background:#fff;border:1px solid #d1d5db;overflow:hidden}}
  .el{{position:absolute;overflow:hidden;line-height:1.04;padding-left:2px;color:#111;box-sizing:border-box}}
- .el:hover{{overflow:visible;background:#fffbe6;z-index:5;box-shadow:0 0 0 1px #999}}
  table.mini{{border-collapse:collapse;font-size:4.5px;width:100%}} .mini td,.mini th{{border:.5px solid #d1b07a;padding:0 1px;white-space:nowrap;overflow:hidden}}
  .legend span{{margin-right:14px;font-size:12px}} .legend i{{display:inline-block;width:11px;height:11px;border-radius:2px;margin-right:4px;vertical-align:-1px}}
  .card{{background:#fff;border:1px solid #e5e7eb;border-radius:6px;margin-bottom:14px;overflow:hidden}}
@@ -375,6 +395,19 @@ pub fn render_store(
 <section id=text><h2 class=s>Structured text</h2><div class=doc>{text_html}</div></section>
 <section id=enrich><h2 class=s>Enrichments</h2>{enrich_html}</section>
 <section id=dag><h2 class=s>Artifact lineage (DAG)</h2>{edges}</section>
+<aside id=detail><div class=muted>Click any extracted element to blow it up here.</div></aside>
+<script>
+const D = {details_json};
+document.addEventListener('click', e => {{
+  const el = e.target.closest('.el');
+  if (!el) return;
+  const d = D[+el.dataset.i];
+  if (!d) return;
+  document.querySelectorAll('.el.sel').forEach(x => x.classList.remove('sel'));
+  el.classList.add('sel');
+  document.getElementById('detail').innerHTML = '<div class=dh>' + d.t + '</div>' + d.h;
+}});
+</script>
 </body></html>"
     )
 }
