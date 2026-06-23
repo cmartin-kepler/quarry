@@ -28,7 +28,17 @@ struct DoclingDoc {
     #[serde(default)]
     texts: Vec<DText>,
     #[serde(default)]
+    groups: Vec<DGroup>,
+    #[serde(default)]
     body: DBody,
+}
+
+/// A nesting group (a list, a multi-column section, …) — its `children` are more
+/// refs (texts / sub-groups), so the reading-order walk recurses through it.
+#[derive(Deserialize, Default)]
+struct DGroup {
+    #[serde(default)]
+    children: Vec<DRef>,
 }
 
 #[derive(Deserialize)]
@@ -201,10 +211,47 @@ fn doc_role(label: &str) -> DocRole {
     }
 }
 
+/// Walk a list of `body`/group child refs in reading order, emitting a
+/// `DocElement` per `#/texts/N` and **recursing through `#/groups/N`** (lists,
+/// multi-column sections). Tables/pictures are skipped (their own artifacts).
+fn walk_children(
+    children: &[DRef],
+    dd: &DoclingDoc,
+    doc: DocHash,
+    out: &mut Vec<DocElement>,
+    seen: &mut std::collections::HashSet<usize>,
+) {
+    for child in children {
+        if let Some(idx) = child.cref.strip_prefix("#/texts/").and_then(|s| s.parse::<usize>().ok()) {
+            let Some(t) = dd.texts.get(idx) else { continue };
+            if t.text.trim().is_empty() {
+                continue;
+            }
+            let prov = t.prov.first();
+            let page = prov.map(|p| p.page_no).unwrap_or(1);
+            let page_h = dd.pages.get(&page.to_string()).map(|p| p.size.height).unwrap_or(792.0);
+            let bbox = prov.map(|p| p.bbox.to_topleft(page_h)).unwrap_or(BBox::new(0.0, 0.0, 0.0, 0.0));
+            out.push(DocElement {
+                role: doc_role(&t.label),
+                text: t.text.clone(),
+                anchor: SourceAnchor::Pdf { doc, page, bbox },
+            });
+        } else if let Some(g) = child.cref.strip_prefix("#/groups/").and_then(|s| s.parse::<usize>().ok())
+        {
+            // recurse into the group (guard against cycles)
+            if seen.insert(g) {
+                if let Some(grp) = dd.groups.get(g) {
+                    walk_children(&grp.children, dd, doc, out, seen);
+                }
+            }
+        }
+    }
+}
+
 /// Extract the structured text — sections / paragraphs / captions in reading
 /// order — from Docling JSON, using docling's own element labels (no font
-/// heuristics) and its `body.children` reading order. Tables are separate
-/// `HtmlTable` artifacts (`artifacts_from_docling`); this is the prose spine.
+/// heuristics) and its `body.children` reading order, recursing through groups.
+/// Tables are separate `HtmlTable` artifacts; this is the prose spine.
 pub fn structured_doc_from_docling(
     json: &str,
     doc: DocHash,
@@ -212,25 +259,8 @@ pub fn structured_doc_from_docling(
 ) -> Result<StructuredDoc> {
     let dd: DoclingDoc = serde_json::from_str(json).context("parsing Docling JSON")?;
     let mut elements = Vec::new();
-    for child in &dd.body.children {
-        let Some(idx) = child.cref.strip_prefix("#/texts/").and_then(|s| s.parse::<usize>().ok())
-        else {
-            continue; // tables/pictures are their own artifacts
-        };
-        let Some(t) = dd.texts.get(idx) else { continue };
-        if t.text.trim().is_empty() {
-            continue;
-        }
-        let prov = t.prov.first();
-        let page = prov.map(|p| p.page_no).unwrap_or(1);
-        let page_h = dd.pages.get(&page.to_string()).map(|p| p.size.height).unwrap_or(792.0);
-        let bbox = prov.map(|p| p.bbox.to_topleft(page_h)).unwrap_or(BBox::new(0.0, 0.0, 0.0, 0.0));
-        elements.push(DocElement {
-            role: doc_role(&t.label),
-            text: t.text.clone(),
-            anchor: SourceAnchor::Pdf { doc, page, bbox },
-        });
-    }
+    let mut seen_groups = std::collections::HashSet::new();
+    walk_children(&dd.body.children, &dd, doc, &mut elements, &mut seen_groups);
     let joined: String = elements.iter().map(|e| e.text.as_str()).collect();
     let content = DocHash::of(format!("structdoc:{joined}").as_bytes());
     let anchor = elements
@@ -308,6 +338,25 @@ mod tests {
 
     const SAMPLE: &str = include_str!("../tests/data/sample.docling.json");
     const FULL: &str = include_str!("../tests/data/sample.docling_full.json");
+
+    #[test]
+    fn recurses_into_groups() {
+        // a heading followed by a list group containing two items
+        let json = r##"{
+          "texts": [
+            {"label":"section_header","text":"H","prov":[{"page_no":1,"bbox":{"l":0,"t":10,"r":10,"b":0}}]},
+            {"label":"list_item","text":"item A","prov":[{"page_no":1,"bbox":{"l":0,"t":20,"r":10,"b":10}}]},
+            {"label":"list_item","text":"item B","prov":[{"page_no":1,"bbox":{"l":0,"t":30,"r":10,"b":20}}]}
+          ],
+          "groups": [ {"children":[{"cref":"#/texts/1"},{"cref":"#/texts/2"}]} ],
+          "body": {"children":[{"cref":"#/texts/0"},{"cref":"#/groups/0"}]},
+          "pages": {"1":{"size":{"width":100,"height":100}}}
+        }"##;
+        let sd = structured_doc_from_docling(json, DocHash::of(b"d"), Generation(0)).unwrap();
+        let texts: Vec<&str> = sd.elements.iter().map(|e| e.text.as_str()).collect();
+        // without group recursion, "item A"/"item B" would be missing
+        assert_eq!(texts, vec!["H", "item A", "item B"]);
+    }
 
     #[test]
     fn extracts_structured_text_and_sections() {
