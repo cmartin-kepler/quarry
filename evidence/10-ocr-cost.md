@@ -38,6 +38,28 @@ Where the no-text pages are (the only pages that *need* OCR — 209 of 1061):
 | jpm-2023-ar | 364 | 1 | |
 | *every other doc* | — | 0 | born-digital, full text layer |
 
+## Is docling smart enough to OCR only what needs it? — yes
+
+Tested on 1706 page 3 (body text + the Transformer architecture figure; the figure's
+labels are only obtainable via OCR):
+
+```
+do_ocr=False   108ms | body text: ✓ | figure labels OCR'd: ✗ |  8 text items
+do_ocr=True    546ms | body text: ✓ | figure labels OCR'd: ✓ | 41 text items
+```
+
+docling does **targeted** OCR (default `force_full_page_ocr=False`): it reads the
+programmatic text layer and runs OCR **only on bitmap regions that have no text** — here,
+the figure (8 → 41 text items, "Multi-Head Attention" recovered). It does **not** re-OCR
+the body text (identical both ways). The +438ms is the cost of OCRing that one figure,
+not the page. So docling's OCR cost scales with bitmap content, not page count.
+
+This means much of our separate OCR machinery (triage's text-less-figure scan +
+standalone RapidOCR per figure) is redundant for **embedded figures on text pages** —
+`do_ocr=True` already does it surgically. The standalone pass still matters for **whole
+image/scanned pages**, which we gate *out* of docling (to avoid the ~950ms table-model
+waste) — those have no docling pass to piggyback OCR on.
+
 ## Conclusions
 
 - **OCR is expensive** (~1s/page standalone) and **80% of corpus pages don't need it** —

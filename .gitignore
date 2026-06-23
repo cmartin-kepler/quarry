@@ -36,3 +36,6 @@ __pycache__/
 
 # ENVIRONMENT VARIABLES
 .env
+# generated benchmark results (interrogable, not source)
+/bench_corpus.json
+/docling_ocr_corpus.json
