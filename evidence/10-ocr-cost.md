@@ -92,19 +92,27 @@ waste) — those have no docling pass to piggyback OCR on.
 
 ## Conclusions
 
-- **OCR is expensive** (~1s/page standalone) and **80% of corpus pages don't need it** —
-  they already have a text layer. Running OCR on everything (~18 min) is almost all waste.
-- **Sparing use is clearly right.** Restricting OCR to no-text content (the `OcrDeferred`
-  gate) saves **80%** of OCR time. The pages that need it are concentrated: scanned docs
-  and image decks.
-- **Is it worth it?** On a no-text page OCR is the *only* way to get text, so yes — for
-  those 209 pages it's necessary, not optional. On the 852 text pages it's pure cost.
-- **docling `do_ocr=True` may beat the separate RapidOCR pass.** It's text-layer-aware
-  (≈free on text pages, 580ms on image pages — cheaper per image page than our 1000ms
-  standalone) and needs no second tool. Trade-off: `do_ocr` is global, so it adds ~83ms
-  to every text page (≈71s across the corpus) unless gated to docs/pages that actually
-  have no-text content. A future option: enable docling OCR only when triage finds
-  image/no-text pages, instead of the standalone pass.
+- **Don't engineer an OCR "sparing" gate — docling already does it.** With `do_ocr=True`
+  (default `force_full_page_ocr=False`) docling OCRs *only* the bitmap regions that lack a
+  text layer and reads everything else from the text layer. So the right move is to **let
+  docling choose**, not to build our own text-less-region detector + standalone-OCR
+  targeting. (The earlier "OCR everything = 80% waste" figure is about *blind standalone*
+  OCR — a strawman you'd never actually run; it's an argument against the naive standalone
+  path, not for a hand-built gate.)
+- **The cost lands exactly where it should, automatically.** Corpus: `do_ocr=True` adds
+  67% overall but **89% of that is 3 pure scan/image docs**; the 17 text/mixed docs add
+  ~8%, which *is* their figures being OCR'd. No tuning needed — overhead ∝ bitmap content.
+- **Is it worth it?** On no-text content OCR is the only way to get text, so yes; on text
+  it's ≈free because docling doesn't run it there. Worth-it is decided per-region by
+  docling, not per-doc by us.
+- **Where we still choose:** the *pure scan/image* docs that triage gates **out** of
+  docling (to avoid the ~950ms table-model waste). They have no docling pass to ride on,
+  so they need a path — and docling-with-everything is ~2.3s/pg there vs ~1s/pg for a lean
+  standalone OCR. That's "this doc needs full OCR", not "sparing".
 
-Harnesses: `scripts/ocr_cost.py` (per-page cost + corpus economics), `scripts/docling_ocr_cost.py`
-(docling OCR on/off per page).
+**Net:** flip the docling text-page pass to `do_ocr=True` and delete the bespoke
+figure-OCR machinery (region-text scan + standalone per-figure OCR); keep a lean OCR-only
+path solely for the gated-out scans/image decks.
+
+Harnesses: `scripts/ocr_cost.py` (per-page cost), `scripts/docling_ocr_cost.py` (docling
+OCR on/off per page), `scripts/docling_ocr_corpus.py` (corpus do_ocr false vs true).
