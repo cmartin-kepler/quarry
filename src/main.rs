@@ -289,6 +289,17 @@ fn collect_pdfs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Where a served parse of `pdf` is cached.
+fn serve_store_dir(pdf: &Path) -> PathBuf {
+    let stem = pdf.file_stem().and_then(|s| s.to_str()).unwrap_or("doc");
+    std::env::temp_dir().join("quarry_serve").join(stem)
+}
+
+/// True if `pdf` has already been parsed in this serve session.
+fn serve_is_done(pdf: &Path) -> bool {
+    serve_store_dir(pdf).join("observations.jsonl").exists()
+}
+
 fn serve_index(dir: &Path) -> String {
     use quarry::serve::url_encode;
     let mut pdfs = Vec::new();
@@ -299,20 +310,31 @@ fn serve_index(dir: &Path) -> String {
         .map(|p| {
             let enc = url_encode(&p.display().to_string());
             let name = p.strip_prefix(dir).unwrap_or(p).display();
-            format!(
-                "<li><span>{name}</span> <a href='/run?pdf={enc}'>parse</a> \
-                 <a class=ocr href='/run?pdf={enc}&ocr=1'>parse + OCR</a></li>"
-            )
+            // already parsed → an instant view link; else parse links
+            let links = if serve_is_done(p) {
+                format!(
+                    "<a class=done href='/view?pdf={enc}'>● view</a> \
+                     <a href='/run?pdf={enc}'>re-parse</a> \
+                     <a class=ocr href='/run?pdf={enc}&ocr=1'>re-parse + OCR</a>"
+                )
+            } else {
+                format!(
+                    "<a href='/run?pdf={enc}'>parse</a> \
+                     <a class=ocr href='/run?pdf={enc}&ocr=1'>parse + OCR</a>"
+                )
+            };
+            format!("<li><span>{name}</span> {links}</li>")
         })
         .collect::<String>();
     format!(
         "<!doctype html><meta charset=utf-8><title>quarry</title>\
-         <style>body{{font:15px system-ui,sans-serif;max-width:760px;margin:40px auto;color:#1f2937}}\
+         <style>body{{font:15px system-ui,sans-serif;max-width:780px;margin:40px auto;color:#1f2937}}\
          h1{{font-size:18px}} li{{margin:6px 0;display:flex;gap:12px;align-items:center}}\
          li span{{flex:1;color:#374151}} a{{color:#2563eb;text-decoration:none;font-size:13px}} a.ocr{{color:#7c3aed}}\
-         .muted{{color:#9ca3af}}</style>\
-         <h1>quarry — pick a document to parse</h1>\
-         <p class=muted>{} PDFs under {}. Parsing runs docling (first run loads models — be patient).</p>\
+         a.done{{color:#059669;font-weight:600}} .muted{{color:#9ca3af}}</style>\
+         <h1>quarry — pick a document</h1>\
+         <p class=muted>{} PDFs under {}. ● = already parsed (instant view); parse runs docling \
+         (first run loads models — be patient).</p>\
          <ul>{rows}</ul>",
         pdfs.len(),
         dir.display()
@@ -322,8 +344,7 @@ fn serve_index(dir: &Path) -> String {
 /// Run pipeline (+materialize, +OCR) on a chosen PDF and return the rendered view.
 fn serve_run(pdf: &Path, ocr: bool) -> Result<String> {
     use std::time::Instant;
-    let stem = pdf.file_stem().and_then(|s| s.to_str()).unwrap_or("doc");
-    let store = std::env::temp_dir().join("quarry_serve").join(stem);
+    let store = serve_store_dir(pdf);
     let _ = std::fs::remove_dir_all(&store);
 
     let mut stages: Vec<(&str, u128)> = Vec::new();
@@ -367,6 +388,18 @@ fn cmd_serve(dir: &Path, port: u16) -> Result<()> {
                     let ocr = req.query.get("ocr").map(|v| v == "1").unwrap_or(false);
                     println!("→ parse {pdf}{}", if ocr { " + OCR" } else { "" });
                     serve_run(Path::new(pdf), ocr)
+                }
+                None => Ok("<p>missing ?pdf=</p>".into()),
+            },
+            // instant view of an already-parsed document (no re-run)
+            "/view" => match req.query.get("pdf") {
+                Some(pdf) => {
+                    let pdf = Path::new(pdf);
+                    if serve_is_done(pdf) {
+                        render_view(&serve_store_dir(pdf), Some(pdf))
+                    } else {
+                        Ok("<p>not parsed yet — go back and click <b>parse</b>.</p>".into())
+                    }
                 }
                 None => Ok("<p>missing ?pdf=</p>".into()),
             },
