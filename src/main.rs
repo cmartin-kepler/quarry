@@ -4,8 +4,11 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use quarry::adjudicate::{Adjudicator, DefaultAdjudicator};
 use quarry::artifact::{Artifact, ArtifactKind, HtmlTable};
-use quarry::check::{CheckCtx, CheckOutcome, IntrinsicArithmetic, QualityCheck, StructuralValidity};
-use quarry::core::{SourceAnchor, Severity};
+use quarry::check::{
+    cross_tier_agreement, CheckCtx, CheckOutcome, IntrinsicArithmetic, QualityCheck,
+    ReconstructionError, StructuralValidity,
+};
+use quarry::core::{Origin, SourceAnchor, Severity};
 use quarry::doc::QDoc;
 use quarry::eval::{CatchReport, GroundTruth, run_eval};
 use quarry::pipeline;
@@ -25,7 +28,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run an extractor and emit artifacts (HTML + manifest) to <out>. Choose a
-    /// named op with `--op` (e.g. pdf-text, docling, reducto, yolo26) or a tier;
+    /// named op with `--op` (e.g. pdf-text, docling, reducto, yolo26n) or a tier;
     /// sidecars run on `--source` (the original file) if it isn't `file` itself.
     Parse {
         file: PathBuf,
@@ -53,6 +56,10 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Judge raw grids: read JSON `[{id, grid, header_rows}]`, run the detectors
+    /// on each, and emit `[{id, html, flagged, signals}]` to stdout. The eval-
+    /// harness entry point — same detectors that run in the pipeline, on any table.
+    Judge { input: PathBuf },
     /// Run all applicable quality checks over a parsed artifact directory.
     Check { artifact_dir: PathBuf },
     /// THE first deliverable: measure the silent-failure catch rate vs truth.
@@ -89,6 +96,104 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Segment a page from its word boxes: read JSON `[{text,x0,y0,x1,y1}]`, run the
+    /// model-free XY-cut segmenter (build-plan B′'s independent region source) plus
+    /// column-alignment, and print the discovered blocks. Exercises region quality
+    /// on real pdfplumber word boxes — no YOLO required.
+    Regions { words: PathBuf },
+    /// Full Step B′ region-quality check on a layout model's regions vs a page's
+    /// words: typed roles, coverage diagnostic, table-overlap gate, and agreement
+    /// with the model-free XY-cut source (the decorrelated cross-check), plus figure
+    /// markers. `--regions` = `{regions:[{label,confidence,bbox}]}` (e.g. from
+    /// `layout_detect.py`); `--words` = `[{text,x0,y0,x1,y1}]`.
+    RegionCheck {
+        #[arg(long)]
+        regions: PathBuf,
+        #[arg(long)]
+        words: PathBuf,
+    },
+    /// Stage-0 page triage: classify every page (text / image_content / blank) via
+    /// scripts/triage.py and report. The cheap gate that keeps image/blank pages
+    /// out of docling (where the table-structure model wastes ~950ms on an image).
+    Triage { pdf: PathBuf },
+    /// Run the pipeline (Stage 0–1): triage → docling-whole on TEXT pages only
+    /// (tables + sections via litparse-free docling) → append-only store. Image
+    /// pages become OCR-deferred markers; blanks are skipped.
+    Pipeline {
+        pdf: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Materialize the HtmlTables in a store into queryable DbTables (Stage 3 MVP:
+    /// cell cleanup + header/dtype inference) and preview them.
+    Materialize { store: PathBuf },
+    /// Print the extracted structured text (sections/paragraphs/captions) from a
+    /// store's StructuredDoc as markdown.
+    Text {
+        store: PathBuf,
+        /// Show a role + counts summary instead of the full text.
+        #[arg(long)]
+        summary: bool,
+    },
+    /// Compute (or return cached) an enrichment of the store's StructuredDoc — e.g.
+    /// `--kind summary`. Lazy: a derived, content-addressed artifact computed once.
+    Enrich {
+        store: PathBuf,
+        #[arg(long, default_value = "summary")]
+        kind: String,
+    },
+    /// List the artifacts currently in a store — kind, id, generation, lineage, and
+    /// a one-line preview. Shows the append-only artifact graph.
+    Ls { store: PathBuf },
+}
+
+fn short_id(id: &quarry::core::ArtifactId) -> String {
+    id.0.chars().take(20).collect()
+}
+
+fn artifact_preview(a: &dyn Artifact) -> String {
+    use quarry::artifact::*;
+    let any = a.as_any();
+    if let Some(t) = any.downcast_ref::<HtmlTable>() {
+        format!("{}×{} table", t.n_rows, t.n_cols)
+    } else if let Some(d) = any.downcast_ref::<StructuredDoc>() {
+        format!("{} text elements, {} sections", d.elements.len(), d.sections().len())
+    } else if let Some(db) = any.downcast_ref::<DbTable>() {
+        format!("[{}]", db.columns.join(", "))
+    } else if let Some(e) = any.downcast_ref::<Enrichment>() {
+        format!("{}: {}…", e.kind, e.text.chars().take(48).collect::<String>())
+    } else if let Some(i) = any.downcast_ref::<ImageRef>() {
+        format!("{:?}", i.status)
+    } else if let Some(g) = any.downcast_ref::<TextGrid>() {
+        format!("{} words", g.words.len())
+    } else {
+        String::new()
+    }
+}
+
+fn cmd_ls(store_dir: &Path) -> Result<()> {
+    use quarry::core::Provenance;
+    use quarry::store::FlatStore;
+
+    let arts = FlatStore::open(store_dir).current_artifacts()?;
+    println!("{} artifacts in {}", arts.len(), store_dir.display());
+    for a in &arts {
+        let lineage = match a.provenance() {
+            Provenance::Source(_) => "source".to_string(),
+            Provenance::Derived { parents, .. } => {
+                format!("← {}", parents.iter().map(short_id).collect::<Vec<_>>().join(","))
+            }
+        };
+        println!(
+            "  {:10} {:22} gen{} {:14} | {}",
+            format!("{:?}", a.kind()),
+            short_id(&a.id()),
+            a.generation().0,
+            lineage,
+            artifact_preview(a.as_ref())
+        );
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -100,6 +205,7 @@ fn main() -> Result<()> {
         Command::Chain { file, ops, source, out } => {
             cmd_chain(&file, &ops, source.as_deref(), &out)
         }
+        Command::Judge { input } => cmd_judge(&input),
         Command::Check { artifact_dir } => cmd_check(&artifact_dir),
         Command::Eval {
             file,
@@ -114,7 +220,329 @@ fn main() -> Result<()> {
         Command::Explain { artifact_dir, suspect_only, json } => {
             cmd_explain(&artifact_dir, suspect_only, json)
         }
+        Command::Regions { words } => cmd_regions(&words),
+        Command::RegionCheck { regions, words } => cmd_region_check(&regions, &words),
+        Command::Triage { pdf } => cmd_triage(&pdf),
+        Command::Pipeline { pdf, out } => cmd_pipeline(&pdf, &out),
+        Command::Materialize { store } => cmd_materialize(&store),
+        Command::Text { store, summary } => cmd_text(&store, summary),
+        Command::Enrich { store, kind } => cmd_enrich(&store, &kind),
+        Command::Ls { store } => cmd_ls(&store),
     }
+}
+
+/// Lazy enrichment: derive (e.g.) a summary of the store's StructuredDoc — computed
+/// once, content-addressed, cached. The compute backend (here a deterministic stub)
+/// is the only LLM-specific part; everything around it is the generic substrate.
+fn cmd_enrich(store_dir: &Path, kind: &str) -> Result<()> {
+    use quarry::artifact::{DocRole, Enrichment, StructuredDoc};
+    use quarry::core::Generation;
+    use quarry::store::FlatStore;
+
+    let store = FlatStore::open(store_dir);
+    let arts = store.current_artifacts()?;
+    let sd = arts
+        .iter()
+        .find_map(|a| a.as_any().downcast_ref::<StructuredDoc>())
+        .ok_or_else(|| anyhow::anyhow!("no StructuredDoc in store — run `pipeline` first"))?;
+    let source_id = sd.id();
+
+    // LAZY: content-addressed by (kind, source) → if already computed, return cached.
+    if let Some(e) = arts
+        .iter()
+        .filter_map(|a| a.as_any().downcast_ref::<Enrichment>())
+        .find(|e| e.kind == kind && e.source == source_id)
+    {
+        println!("(cached) {kind} of {source_id}:\n\n{}", e.text);
+        return Ok(());
+    }
+
+    // COMPUTE ON DEMAND. This is where an LLM call goes — a sidecar, like docling:
+    // hand the model `sd.to_markdown()`, store its response. Everything else is generic.
+    let text = match kind {
+        "summary" => {
+            let headings: Vec<&str> = sd
+                .elements
+                .iter()
+                .filter(|e| matches!(e.role, DocRole::Heading | DocRole::Title))
+                .map(|e| e.text.as_str())
+                .collect();
+            let opens: String = sd
+                .elements
+                .iter()
+                .find(|e| e.role == DocRole::Paragraph)
+                .map(|e| e.text.chars().take(180).collect())
+                .unwrap_or_default();
+            format!(
+                "[stub summary — drop in an LLM call here over sd.to_markdown()]\n\
+                 {} elements, {} sections.\nSections: {}.\nOpens: {opens}",
+                sd.elements.len(),
+                headings.len(),
+                headings.join("; ")
+            )
+        }
+        other => anyhow::bail!("unknown enrichment kind: {other}"),
+    };
+
+    let enr = Enrichment::derive(sd, kind, text.clone(), Generation(1));
+    store.write(sd.anchor().doc(), &[Box::new(enr)], &[])?;
+    println!("(computed + cached) {kind} of {source_id}:\n\n{text}");
+    Ok(())
+}
+
+/// Print a store's structured text (StructuredDoc) as markdown, or a role summary.
+fn cmd_text(store_dir: &Path, summary: bool) -> Result<()> {
+    use quarry::artifact::{DocRole, StructuredDoc};
+    use quarry::store::FlatStore;
+    use std::collections::BTreeMap;
+
+    let arts = FlatStore::open(store_dir).current_artifacts()?;
+    let docs: Vec<&StructuredDoc> =
+        arts.iter().filter_map(|a| a.as_any().downcast_ref::<StructuredDoc>()).collect();
+    if docs.is_empty() {
+        println!("no StructuredDoc in {}", store_dir.display());
+        return Ok(());
+    }
+    for d in docs {
+        if summary {
+            let mut roles: BTreeMap<String, usize> = BTreeMap::new();
+            for el in &d.elements {
+                *roles.entry(format!("{:?}", el.role)).or_default() += 1;
+            }
+            let chars: usize = d.elements.iter().map(|e| e.text.chars().count()).sum();
+            let headings: Vec<&str> = d
+                .elements
+                .iter()
+                .filter(|e| matches!(e.role, DocRole::Heading | DocRole::Title))
+                .map(|e| e.text.as_str())
+                .collect();
+            println!("{} elements, {chars} chars; roles {roles:?}", d.elements.len());
+            println!("headings ({}):", headings.len());
+            for h in headings {
+                println!("  • {h}");
+            }
+        } else {
+            print!("{}", d.to_markdown());
+        }
+    }
+    Ok(())
+}
+
+/// Stage 3 MVP: materialize every HtmlTable in a store into a DbTable, persist, preview.
+fn cmd_materialize(store_dir: &Path) -> Result<()> {
+    use quarry::artifact::HtmlTable;
+    use quarry::core::Generation;
+    use quarry::materialize::materialize;
+    use quarry::store::FlatStore;
+
+    let store = FlatStore::open(store_dir);
+    let arts = store.current_artifacts()?;
+    let tables: Vec<&HtmlTable> =
+        arts.iter().filter_map(|a| a.as_any().downcast_ref::<HtmlTable>()).collect();
+    if tables.is_empty() {
+        println!("no HtmlTables in {}", store_dir.display());
+        return Ok(());
+    }
+
+    let doc = tables[0].anchor().doc();
+    let mut dbs: Vec<Box<dyn Artifact>> = Vec::new();
+    for t in &tables {
+        let db = materialize(t, Generation(1));
+        println!(
+            "\nDbTable ({} cols × {} rows) ← {}",
+            db.n_cols(),
+            db.n_rows(),
+            db.source
+        );
+        println!(
+            "  {}",
+            db.columns
+                .iter()
+                .zip(&db.dtypes)
+                .map(|(c, d)| format!("{c} [{d:?}]"))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+        for row in db.rows.iter().take(3) {
+            println!("    {}", row.join(" | "));
+        }
+        dbs.push(Box::new(db));
+    }
+
+    store.write(doc, &dbs, &[])?;
+    println!("\nmaterialized {} table(s) → {}", dbs.len(), store_dir.display());
+    Ok(())
+}
+
+/// Run a `uv run <script ...>` sidecar and capture stdout.
+fn run_uv(args: &[&str]) -> Result<String> {
+    let out = std::process::Command::new("uv")
+        .args(args)
+        .output()
+        .with_context(|| format!("running: uv {}", args.join(" ")))?;
+    if !out.status.success() {
+        anyhow::bail!("`uv {}` failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Pipeline Stage 0–1: triage → docling-whole on text pages → store.
+fn cmd_pipeline(pdf: &Path, out: &Path) -> Result<()> {
+    use quarry::core::{DocHash, Generation};
+    use quarry::docling::{artifacts_from_docling, structured_doc_from_docling};
+    use quarry::store::FlatStore;
+    use quarry::triage::{counts, ocr_markers, parse as parse_triage, PageClass};
+
+    let bytes = std::fs::read(pdf).with_context(|| format!("reading {}", pdf.display()))?;
+    let doc = DocHash::of(&bytes);
+    let generation = Generation(0);
+    let pdf_s = pdf.display().to_string();
+
+    // Stage 0 — triage
+    let pages = parse_triage(&run_uv(&["run", "scripts/triage.py", &pdf_s])?)?;
+    let (t, i, b) = counts(&pages);
+    println!("triage: {} pages — {t} text, {i} image_content, {b} blank", pages.len());
+
+    let mut artifacts: Vec<Box<dyn Artifact>> = Vec::new();
+    // image_content pages → OCR-deferred markers (invariant 11: recorded, not dropped)
+    for m in ocr_markers(&pages, doc) {
+        artifacts.push(Box::new(m));
+    }
+
+    // Stage 1 — docling whole-page on TEXT pages only (image/blank skipped)
+    let text: Vec<String> =
+        pages.iter().filter(|p| p.klass == PageClass::Text).map(|p| p.page.to_string()).collect();
+    let (mut n_tables, mut n_elems) = (0usize, 0usize);
+    if !text.is_empty() {
+        let dj = run_uv(&["run", "scripts/run_docling.py", &pdf_s, "--pages", &text.join(",")])?;
+        let tables = artifacts_from_docling(&dj, doc, generation)?;
+        n_tables = tables.len();
+        artifacts.extend(tables);
+        let sd = structured_doc_from_docling(&dj, doc, generation)?;
+        n_elems = sd.elements.len();
+        if n_elems > 0 {
+            artifacts.push(Box::new(sd));
+        }
+    }
+
+    FlatStore::open(out).write(doc, &artifacts, &[])?;
+    println!("parsed: {n_tables} tables, {n_elems} text elements, {i} OCR markers → {}", out.display());
+    Ok(())
+}
+
+/// Stage-0 triage: run scripts/triage.py via uv, classify pages, report.
+fn cmd_triage(pdf: &Path) -> Result<()> {
+    use quarry::triage::{counts, parse};
+    let pages = parse(&run_uv(&["run", "scripts/triage.py", &pdf.display().to_string()])?)?;
+    let (t, i, b) = counts(&pages);
+    println!("{} pages: {t} text, {i} image_content (OCR-deferred), {b} blank", pages.len());
+    for p in &pages {
+        let sd = p.stddev.map(|s| format!("{s:.1}")).unwrap_or_else(|| "-".into());
+        println!("  p{:<4} {:?}  chars={} stddev={}", p.page, p.klass, p.chars, sd);
+    }
+    Ok(())
+}
+
+/// Run the full Step B′ region-quality check on a layout model's regions vs a
+/// page's words: coverage diagnostic, table-overlap gate, and agreement with the
+/// decorrelated XY-cut source. Exercises region_check/segment/figure_markers on
+/// real layout output.
+fn cmd_region_check(regions_path: &Path, words_path: &Path) -> Result<()> {
+    use quarry::artifact::{figure_markers, Word};
+    use quarry::core::{BBox, DocHash, Generation};
+    use quarry::region_check::{
+        boundary_agreement, disagreeing_regions, overlapping_table_pairs, passes_agreement_bar,
+        passes_overlap_bar, typed_orphans, AGREEMENT_IOU,
+    };
+    use quarry::segment::{xy_cut, CutParams};
+    use quarry::sidecar::regions_from_json;
+    use std::collections::BTreeMap;
+
+    #[derive(serde::Deserialize)]
+    struct WordIn { text: String, x0: f32, y0: f32, x1: f32, y1: f32 }
+
+    let regions = regions_from_json(
+        &std::fs::read_to_string(regions_path)?,
+        DocHash::of(b"region-check"),
+        1,
+        Generation(0),
+    )?;
+    let wins: Vec<WordIn> = serde_json::from_slice(&std::fs::read(words_path)?)?;
+    let words: Vec<Word> = wins
+        .iter()
+        .map(|w| Word { text: w.text.clone(), bbox: BBox::new(w.x0, w.y0, w.x1, w.y1) })
+        .collect();
+
+    println!("{} regions, {} words", regions.len(), words.len());
+    let mut roles: BTreeMap<String, usize> = BTreeMap::new();
+    for r in &regions {
+        *roles.entry(format!("{:?}", r.role())).or_default() += 1;
+    }
+    println!("  roles: {roles:?}");
+
+    let orphans = typed_orphans(&regions, &words);
+    println!(
+        "  coverage (diagnostic): {} typed-orphan spans — expect page furniture; \
+         body-content orphans mean a missed box",
+        orphans.len()
+    );
+
+    let pairs = overlapping_table_pairs(&regions);
+    println!(
+        "  overlap gate: {} ({} offending table pair(s))",
+        if passes_overlap_bar(&regions) { "PASS" } else { "FAIL" },
+        pairs.len()
+    );
+
+    let indep = xy_cut(&words, &CutParams::default());
+    let yolo: Vec<BBox> = regions.iter().map(|r| r.bbox()).collect();
+    let agree = boundary_agreement(&yolo, &indep, AGREEMENT_IOU);
+    println!(
+        "  agreement vs XY-cut: {} blocks, {:.0}% of regions match (bar 90%) — {}",
+        indep.len(),
+        agree * 100.0,
+        if passes_agreement_bar(&yolo, &indep) { "PASS" } else { "FAIL" }
+    );
+    let dis = disagreeing_regions(&yolo, &indep);
+    if !dis.is_empty() {
+        println!("    {} region(s) with no independent match (flag for review): {dis:?}", dis.len());
+    }
+
+    let figs = figure_markers(&regions);
+    println!("  figure markers: {} ImageRef(s) recorded (extraction deferred)", figs.len());
+    Ok(())
+}
+
+/// Run the model-free region machinery on a page's word boxes (build-plan B′):
+/// XY-cut segmentation + per-block column-alignment. A dev/inspection tool that
+/// exercises `segment` and `columns` on real spans without a layout model.
+fn cmd_regions(words: &Path) -> Result<()> {
+    use quarry::artifact::Word;
+    use quarry::columns::{column_count, COLUMN_GUTTER};
+    use quarry::core::BBox;
+    use quarry::segment::{xy_cut, CutParams};
+
+    #[derive(serde::Deserialize)]
+    struct WordIn { text: String, x0: f32, y0: f32, x1: f32, y1: f32 }
+
+    let ins: Vec<WordIn> = serde_json::from_slice(&std::fs::read(words)?)?;
+    let spans: Vec<Word> = ins
+        .iter()
+        .map(|w| Word { text: w.text.clone(), bbox: BBox::new(w.x0, w.y0, w.x1, w.y1) })
+        .collect();
+
+    let blocks = xy_cut(&spans, &CutParams::default());
+    println!("{} spans → {} blocks (XY-cut, model-free)", spans.len(), blocks.len());
+    for (i, b) in blocks.iter().enumerate() {
+        let inside: Vec<Word> = spans.iter().filter(|w| b.contains_center(&w.bbox)).cloned().collect();
+        let cols = column_count(&inside, COLUMN_GUTTER);
+        let preview: String = inside.iter().take(10).map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
+        println!(
+            "  block {i}: ({:.0},{:.0})-({:.0},{:.0})  words={:<4} cols={}  | {}",
+            b.x0, b.y0, b.x1, b.y1, inside.len(), cols, preview
+        );
+    }
+    Ok(())
 }
 
 fn cmd_explain(artifact_dir: &Path, suspect_only: bool, json: bool) -> Result<()> {
@@ -272,6 +700,157 @@ fn load_doc(file: &Path) -> Result<(QDoc, quarry::core::DocHash)> {
             Ok((QDoc { format: quarry::doc::DocFormat::Pdf, pages: vec![] }, quarry::core::DocHash::of(&bytes)))
         }
     }
+}
+
+fn cmd_judge(input: &Path) -> Result<()> {
+    use quarry::artifact::{Cell, HtmlTable, Meta};
+    use quarry::core::{ArtifactId, BBox, DocHash, Generation, Provenance};
+    use quarry::doc::{DocFormat, Page, Span};
+    use quarry::grid::to_html;
+
+    #[derive(serde::Deserialize)]
+    struct Word {
+        text: String,
+        bbox: [f32; 4],
+    }
+    #[derive(serde::Deserialize)]
+    struct In {
+        id: String,
+        grid: Vec<Vec<String>>,
+        #[serde(default = "one")]
+        header_rows: usize,
+        #[serde(default)]
+        source: String,
+        // Optional source geometry; when all three are present the
+        // reconstruction-error detector runs (else it no-ops, as for synthetic).
+        #[serde(default)]
+        page: u32,
+        #[serde(default)]
+        cell_boxes: Vec<Vec<[f32; 4]>>, // parallel to `grid`: bbox per cell
+        #[serde(default)]
+        source_words: Vec<Word>, // words in the table's region
+        #[serde(default)]
+        region: Option<[f32; 4]>, // detected table region (provenance bbox)
+        // An independent second-tier parse of the same region; when present, the
+        // cross-tier-agreement detector compares the two.
+        #[serde(default)]
+        alt_grid: Vec<Vec<String>>,
+        #[serde(default = "one")]
+        alt_header_rows: usize,
+        #[serde(default)]
+        alt_cell_boxes: Vec<Vec<[f32; 4]>>, // parallel to `alt_grid`: bbox per cell
+        #[serde(default)]
+        alt_page: u32,
+    }
+    fn one() -> usize { 1 }
+    #[derive(serde::Serialize)]
+    struct Sig { check: String, severity: String, reason: String }
+    #[derive(serde::Serialize)]
+    struct Out { id: String, source: String, html: String, flagged: bool, signals: Vec<Sig> }
+
+    let ins: Vec<In> = serde_json::from_slice(&std::fs::read(input).with_context(|| format!("reading {}", input.display()))?)?;
+    let arith = IntrinsicArithmetic::default();
+    let structural = StructuralValidity;
+    let recon = ReconstructionError::default();
+    let checks: [(&str, &dyn QualityCheck); 3] = [
+        ("intrinsic_arithmetic", &arith),
+        ("structural_validity", &structural),
+        ("reconstruction_error", &recon),
+    ];
+
+    let mut outs = Vec::new();
+    for it in ins {
+        let dh = DocHash::of(it.id.as_bytes());
+        let dummy = SourceAnchor::Pdf { doc: dh, page: 1, bbox: BBox::new(0.0, 0.0, 1.0, 1.0) };
+        // Cell geometry (for reconstruction + cross-tier) is independent of source
+        // words (for reconstruction's region scan): cross-tier needs boxes but no
+        // source words; reconstruction needs both.
+        let ext_geo = it.page > 0 && !it.cell_boxes.is_empty();
+        let prov = match (ext_geo, it.region) {
+            (true, Some(r)) => SourceAnchor::Pdf { doc: dh, page: it.page, bbox: BBox::new(r[0], r[1], r[2], r[3]) },
+            _ => dummy.clone(),
+        };
+        let n_rows = it.grid.len() as u32;
+        let n_cols = it.grid.iter().map(|r| r.len()).max().unwrap_or(0) as u32;
+        let mk_cells = |grid: &[Vec<String>], boxes: &[Vec<[f32; 4]>], page: u32, hdr: usize| {
+            let mut cells = Vec::new();
+            for (r, row) in grid.iter().enumerate() {
+                for (c, t) in row.iter().enumerate() {
+                    let anchor = match boxes.get(r).and_then(|rr| rr.get(c)) {
+                        Some(b) if page > 0 => SourceAnchor::Pdf { doc: dh, page, bbox: BBox::new(b[0], b[1], b[2], b[3]) },
+                        _ => dummy.clone(),
+                    };
+                    cells.push(Cell { row: r as u32, col: c as u32, text: t.clone(), anchor, is_header: r < hdr });
+                }
+            }
+            cells
+        };
+        let cells = mk_cells(&it.grid, &it.cell_boxes, it.page, it.header_rows);
+        let html = to_html(&it.grid, it.header_rows);
+        let table = HtmlTable {
+            meta: Meta {
+                id: ArtifactId::mint(&dh, Generation(0)),
+                content_hash: dh,
+                provenance: Provenance::Source(prov.clone()),
+                generation: Generation(0),
+                risk: Default::default(),
+                origin: Origin::default(),
+            },
+            n_rows,
+            n_cols,
+            cells,
+            html: html.clone(),
+        };
+        // Real region words when supplied, else an empty doc so the reconstruction
+        // detector no-ops on grid-only input.
+        let source = if !it.source_words.is_empty() {
+            QDoc {
+                format: DocFormat::Pdf,
+                pages: vec![Page {
+                    page: it.page,
+                    width: 10_000.0,
+                    height: 10_000.0,
+                    spans: it.source_words.iter().map(|w| Span {
+                        text: w.text.clone(), bbox: w.bbox, confidence: 1.0, rotated: false,
+                    }).collect(),
+                    table_regions: vec![],
+                }],
+            }
+        } else {
+            QDoc { format: DocFormat::Pdf, pages: vec![] }
+        };
+        let cctx = CheckCtx { source: &source };
+        let mut signals = Vec::new();
+        for (cid, chk) in &checks {
+            if let CheckOutcome::Flag { reason, severity } = chk.check(&table, &cctx) {
+                signals.push(Sig { check: cid.to_string(), severity: format!("{severity:?}"), reason });
+            }
+        }
+        // Cross-tier agreement (compares two parses, so it isn't a QualityCheck).
+        // Geometry-keyed, so the alt parse needs its own cell boxes + page.
+        if !it.alt_grid.is_empty() {
+            let alt = HtmlTable {
+                meta: Meta {
+                    id: ArtifactId::mint(&dh, Generation(0)),
+                    content_hash: dh,
+                    provenance: Provenance::Source(dummy.clone()),
+                    generation: Generation(0),
+                    risk: Default::default(),
+                    origin: Origin::default(),
+                },
+                n_rows: it.alt_grid.len() as u32,
+                n_cols: it.alt_grid.iter().map(|r| r.len()).max().unwrap_or(0) as u32,
+                cells: mk_cells(&it.alt_grid, &it.alt_cell_boxes, it.alt_page, it.alt_header_rows),
+                html: String::new(),
+            };
+            if let CheckOutcome::Flag { reason, severity } = cross_tier_agreement(&table, &alt) {
+                signals.push(Sig { check: "cross_tier_agreement".into(), severity: format!("{severity:?}"), reason });
+            }
+        }
+        outs.push(Out { id: it.id, source: it.source, html, flagged: !signals.is_empty(), signals });
+    }
+    println!("{}", serde_json::to_string(&outs)?);
+    Ok(())
 }
 
 fn cmd_chain(file: &Path, ops: &str, source: Option<&Path>, out: &Path) -> Result<()> {

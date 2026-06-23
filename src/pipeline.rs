@@ -17,7 +17,9 @@ pub fn extractor_by_id(id: &str) -> Option<Box<dyn Extractor>> {
         "pdf-text" => Some(Box::new(PdfTextLayerReconstructor)),
         "docling" => Some(Box::new(DoclingSidecar::default_cmd())),
         "text-table" => Some(Box::new(LiteParseSidecar::default_cmd())),
-        "yolo26" | "doclayout" | "surya" => Some(Box::new(LayoutSidecar::model(id))),
+        "yolo26n" | "yolo26s" | "yolo26m" | "doclayout" | "surya" => {
+            Some(Box::new(LayoutSidecar::model(id)))
+        }
         "reducto" | "llamaparse" => Some(Box::new(TableSidecar::parser(id))),
         // structure / sign-fix / markdown / merge / regions (artifact- or page-level)
         other => crate::ops::op_by_id(other),

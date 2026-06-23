@@ -280,6 +280,7 @@ mod tests {
                 provenance: Provenance::Source(anchor),
                 generation: Generation(0),
                 risk: RiskMarkers { min_ocr_confidence: 1.0, ..Default::default() },
+                origin: Origin::default(),
             },
             n_rows,
             n_cols,

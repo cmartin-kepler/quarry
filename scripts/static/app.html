@@ -110,13 +110,15 @@ const EXTRACTORS=[{op:'pdf-text',kind:'extract',reason:'pdfplumber detects the t
                   {op:'Docling',kind:'extract',reason:'Docling ML model parses the table structure from the page'}];
 const LAYOUT_OPS=[
  {op:'find_tables',kind:'layout',reason:'geometric: ruled lines + text-aligned columns'},
- {op:'yolo26',kind:'layout',reason:'YOLO26 learned layout (DocLayNet)'},
+ {op:'yolo26n',kind:'layout',reason:'YOLO26 learned layout — nano (DocLayNet)'},
+ {op:'yolo26s',kind:'layout',reason:'YOLO26 learned layout — small (DocLayNet)'},
+ {op:'yolo26m',kind:'layout',reason:'YOLO26 learned layout — medium (DocLayNet)'},
  {op:'doclayout',kind:'layout',reason:'DocLayout-YOLO (DocStructBench)'},
  {op:'docling',kind:'layout',reason:'Docling layout model'},
  {op:'surya',kind:'layout',reason:'Surya — VLM layout + reading order (sidecar; slow on CPU)'},
  {op:'reducto',kind:'layout',reason:'Reducto cloud page parse (~$0.015/page; tables come parsed)'},
  {op:'llamaparse',kind:'layout',reason:'LlamaParse cloud page parse (~$0.0013/page; tables come parsed)'}];
-const LAYOUT_NAME={find_tables:'find_tables',yolo26:'YOLO26 layout',doclayout:'DocLayout-YOLO',docling:'Docling layout',surya:'Surya layout',reducto:'Reducto parse',llamaparse:'LlamaParse parse'};
+const LAYOUT_NAME={find_tables:'find_tables',yolo26n:'YOLO26 nano',yolo26s:'YOLO26 small',yolo26m:'YOLO26 medium',doclayout:'DocLayout-YOLO',docling:'Docling layout',surya:'Surya layout',reducto:'Reducto parse',llamaparse:'LlamaParse parse'};
 const enc=encodeURIComponent;
 const GOOD=s=>['ok','confirmed','typed'].includes(s);
 async function J(u,o){return (await fetch(u,o)).json();}

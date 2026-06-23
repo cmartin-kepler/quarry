@@ -205,6 +205,7 @@ mod tests {
                 provenance: Provenance::Source(SourceAnchor::Pdf { doc: dh, page: 1, bbox: BBox::new(0.0, 0.0, 10.0, 10.0) }),
                 generation: Generation(0),
                 risk: RiskMarkers::default(),
+                origin: Origin::default(),
             },
             n_rows,
             n_cols,

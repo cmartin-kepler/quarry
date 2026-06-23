@@ -9,7 +9,7 @@ Render a PDF page and run a layout model, emitting
 `{regions:[{label,confidence,bbox:[x0,y0,x1,y1]}]}` in PAGE points (top-left) — the
 shape the crate's `sidecar::regions_from_json` adapter consumes.
 
-Usage: layout_detect.py <model> <pdf> <page>   (model: yolo26 | doclayout)
+Usage: layout_detect.py <model> <pdf> <page>   (model: yolo26n | yolo26s | yolo26m | doclayout)
 """
 import json
 import os

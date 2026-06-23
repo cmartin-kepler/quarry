@@ -661,9 +661,10 @@ def norm_label(lbl):
 def api_layout(name, n):
     """Learned layout detection: every document element (Table, Picture, Title,
     Text/paragraph, Section-header, …) on one page, as PDF-coordinate boxes.
-    ?model = yolo26 (default) | doclayout (DocLayout-YOLO) | docling (Docling's own
-    layout model). Lazy: model loads/downloads on first call; degrades gracefully."""
-    model = request.args.get("model", "yolo26")
+    ?model = yolo26n (default) | yolo26s | yolo26m | doclayout (DocLayout-YOLO) |
+    docling (Docling's own layout model). Lazy: model loads/downloads on first
+    call; degrades gracefully."""
+    model = request.args.get("model", "yolo26n")
     key = (name, n, model)
     if key not in _layout:
         try:
@@ -786,7 +787,9 @@ _PG, _RG, _TB, _TY = (ArtifactKind.PAGE, ArtifactKind.REGION, ArtifactKind.TABLE
 OPS: dict[str, Operation] = {o.name: o for o in [
     # layout: Page -> Region(s)
     Operation("find_tables", OpKind.LAYOUT, _PG, _RG, label="geometric (ruled + text-aligned)"),
-    Operation("yolo26",      OpKind.LAYOUT, _PG, _RG, label="YOLO26 learned layout"),
+    Operation("yolo26n",     OpKind.LAYOUT, _PG, _RG, label="YOLO26 learned layout (nano)"),
+    Operation("yolo26s",     OpKind.LAYOUT, _PG, _RG, label="YOLO26 learned layout (small)"),
+    Operation("yolo26m",     OpKind.LAYOUT, _PG, _RG, label="YOLO26 learned layout (medium)"),
     Operation("doclayout",   OpKind.LAYOUT, _PG, _RG, label="DocLayout-YOLO"),
     Operation("docling",     OpKind.LAYOUT, _PG, _RG, label="Docling layout model"),
     Operation("surya",       OpKind.LAYOUT, _PG, _RG, label="Surya (VLM layout + reading order)"),
@@ -1127,7 +1130,7 @@ def warmup():
     # stall the (now-serialized) request pipeline.
     try:
         import yolo_layout as yl
-        for key in ("yolo26", "doclayout"):
+        for key in ("yolo26n", "doclayout"):  # s/m lazy-load on first use
             t = time.monotonic(); yl._load(key)
             print(f"  layout '{key}' ready in {time.monotonic()-t:.0f}s.", flush=True)
     except Exception as e:  # noqa: BLE001

@@ -7,7 +7,9 @@ paragraphs (Text), Section-headers, etc. as boxes on the rendered page — a lea
 alternative to pdfplumber's ruled-line find_tables.
 
 Models (selected by key):
-  yolo26    - Armaggheddon/yolo26-document-layout (DocLayNet, nano)
+  yolo26n   - Armaggheddon/yolo26-document-layout (DocLayNet, nano)
+  yolo26s   - same repo, small variant (yolo26s_doc_layout.pt)
+  yolo26m   - same repo, medium variant (yolo26m_doc_layout.pt)
   doclayout - opendatalab DocLayout-YOLO trained on DocStructBench (YOLOv10);
               stronger on diverse real-world docs (papers, financial, textbooks)
 
@@ -17,8 +19,12 @@ Lazy: each model's package + weights load on first use. NEVER hardcode class nam
 from __future__ import annotations
 
 MODELS = {
-    "yolo26": {"repo": "Armaggheddon/yolo26-document-layout",
-               "file": "yolo26n_doc_layout.pt", "imgsz": 1280, "loader": "ultralytics"},
+    "yolo26n": {"repo": "Armaggheddon/yolo26-document-layout",
+                "file": "yolo26n_doc_layout.pt", "imgsz": 1280, "loader": "ultralytics"},
+    "yolo26s": {"repo": "Armaggheddon/yolo26-document-layout",
+                "file": "yolo26s_doc_layout.pt", "imgsz": 1280, "loader": "ultralytics"},
+    "yolo26m": {"repo": "Armaggheddon/yolo26-document-layout",
+                "file": "yolo26m_doc_layout.pt", "imgsz": 1280, "loader": "ultralytics"},
     "doclayout": {"repo": "juliozhao/DocLayout-YOLO-DocStructBench",
                   "file": "doclayout_yolo_docstructbench_imgsz1024.pt", "imgsz": 1024, "loader": "doclayout"},
 }
@@ -40,7 +46,7 @@ def _load(key: str):
     return _models[key]
 
 
-def detect(pil_img, res: float, key: str = "yolo26", conf: float = 0.25):
+def detect(pil_img, res: float, key: str = "yolo26n", conf: float = 0.25):
     """Run layout detection; return elements with bboxes in PDF points (top-left
     origin, matching pdfplumber), sorted by reading order."""
     cfg = MODELS[key]
