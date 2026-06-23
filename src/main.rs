@@ -135,6 +135,13 @@ enum Command {
         #[arg(long)]
         summary: bool,
     },
+    /// Compute (or return cached) an enrichment of the store's StructuredDoc — e.g.
+    /// `--kind summary`. Lazy: a derived, content-addressed artifact computed once.
+    Enrich {
+        store: PathBuf,
+        #[arg(long, default_value = "summary")]
+        kind: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -167,7 +174,67 @@ fn main() -> Result<()> {
         Command::Pipeline { pdf, out } => cmd_pipeline(&pdf, &out),
         Command::Materialize { store } => cmd_materialize(&store),
         Command::Text { store, summary } => cmd_text(&store, summary),
+        Command::Enrich { store, kind } => cmd_enrich(&store, &kind),
     }
+}
+
+/// Lazy enrichment: derive (e.g.) a summary of the store's StructuredDoc — computed
+/// once, content-addressed, cached. The compute backend (here a deterministic stub)
+/// is the only LLM-specific part; everything around it is the generic substrate.
+fn cmd_enrich(store_dir: &Path, kind: &str) -> Result<()> {
+    use quarry::artifact::{DocRole, Enrichment, StructuredDoc};
+    use quarry::core::Generation;
+    use quarry::store::FlatStore;
+
+    let store = FlatStore::open(store_dir);
+    let arts = store.current_artifacts()?;
+    let sd = arts
+        .iter()
+        .find_map(|a| a.as_any().downcast_ref::<StructuredDoc>())
+        .ok_or_else(|| anyhow::anyhow!("no StructuredDoc in store — run `pipeline` first"))?;
+    let source_id = sd.id();
+
+    // LAZY: content-addressed by (kind, source) → if already computed, return cached.
+    if let Some(e) = arts
+        .iter()
+        .filter_map(|a| a.as_any().downcast_ref::<Enrichment>())
+        .find(|e| e.kind == kind && e.source == source_id)
+    {
+        println!("(cached) {kind} of {source_id}:\n\n{}", e.text);
+        return Ok(());
+    }
+
+    // COMPUTE ON DEMAND. This is where an LLM call goes — a sidecar, like docling:
+    // hand the model `sd.to_markdown()`, store its response. Everything else is generic.
+    let text = match kind {
+        "summary" => {
+            let headings: Vec<&str> = sd
+                .elements
+                .iter()
+                .filter(|e| matches!(e.role, DocRole::Heading | DocRole::Title))
+                .map(|e| e.text.as_str())
+                .collect();
+            let opens: String = sd
+                .elements
+                .iter()
+                .find(|e| e.role == DocRole::Paragraph)
+                .map(|e| e.text.chars().take(180).collect())
+                .unwrap_or_default();
+            format!(
+                "[stub summary — drop in an LLM call here over sd.to_markdown()]\n\
+                 {} elements, {} sections.\nSections: {}.\nOpens: {opens}",
+                sd.elements.len(),
+                headings.len(),
+                headings.join("; ")
+            )
+        }
+        other => anyhow::bail!("unknown enrichment kind: {other}"),
+    };
+
+    let enr = Enrichment::derive(sd, kind, text.clone(), Generation(1));
+    store.write(sd.anchor().doc(), &[Box::new(enr)], &[])?;
+    println!("(computed + cached) {kind} of {source_id}:\n\n{text}");
+    Ok(())
 }
 
 /// Print a store's structured text (StructuredDoc) as markdown, or a role summary.

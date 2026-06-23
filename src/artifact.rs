@@ -20,6 +20,9 @@ pub enum ArtifactKind {
     /// A page/document's structured text (sections, paragraphs, captions) in
     /// reading order — the prose spine that places the tables.
     Document,
+    /// A derived enrichment of another artifact (LLM summary, classification, …) —
+    /// computed on demand and content-addressed, so it's cached.
+    Enrichment,
     /// Raw region text + word geometry, columns not yet committed (LiteParse-style
     /// ASCII); `structure` turns it into an HtmlTable.
     TextGrid,
@@ -577,6 +580,75 @@ impl Artifact for DbTable {
     }
 }
 
+// ---- Enrichment -----------------------------------------------------------
+
+/// A derived enrichment of another artifact — an LLM summary, a classification, an
+/// embedding label, … The point: it is **just a derived artifact**, so the lazy /
+/// add-info-as-needed model falls out of the substrate — content-addressed by
+/// `(kind, source)` so it's computed once and cached; appended (the source text is
+/// never mutated); `resolve`d like everything else; lineage records `enrichment ←
+/// source`. Swap the compute backend (deterministic, LLM sidecar, …) freely.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Enrichment {
+    pub meta: Meta,
+    /// What kind of enrichment ("summary", "classification", …). Serialized as
+    /// `enrich_kind` so it doesn't collide with `StoredArtifact`'s `kind` tag.
+    #[serde(rename = "enrich_kind")]
+    pub kind: String,
+    pub text: String,
+    /// The artifact this enriches.
+    pub source: ArtifactId,
+}
+
+impl Enrichment {
+    /// Build an enrichment derived from `source`. The id is content-addressed by
+    /// `(kind, source-id)`, so the same enrichment of the same source mints the
+    /// same id — re-requesting it finds the cached one instead of recomputing.
+    pub fn derive(source: &dyn Artifact, kind: &str, text: String, generation: Generation) -> Enrichment {
+        let content = DocHash::of(format!("enrich:{kind}:{}", source.id()).as_bytes());
+        Enrichment {
+            meta: Meta {
+                id: ArtifactId::mint(&content, generation),
+                content_hash: content,
+                provenance: Provenance::Derived {
+                    parents: vec![source.id()],
+                    anchor: source.anchor().clone(),
+                },
+                generation,
+                risk: RiskMarkers::default(),
+                origin: Origin::default(),
+            },
+            kind: kind.to_string(),
+            text,
+            source: source.id(),
+        }
+    }
+}
+
+impl Artifact for Enrichment {
+    fn id(&self) -> ArtifactId {
+        self.meta.id.clone()
+    }
+    fn content_hash(&self) -> DocHash {
+        self.meta.content_hash
+    }
+    fn provenance(&self) -> &Provenance {
+        &self.meta.provenance
+    }
+    fn kind(&self) -> ArtifactKind {
+        ArtifactKind::Enrichment
+    }
+    fn generation(&self) -> Generation {
+        self.meta.generation
+    }
+    fn risk(&self) -> &RiskMarkers {
+        &self.meta.risk
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 /// Serializable, kind-tagged envelope for persistence and round-tripping the
 /// open payload set through the flat store. The live pipeline uses
 /// `Box<dyn Artifact>`; the store speaks `StoredArtifact`.
@@ -590,6 +662,7 @@ pub enum StoredArtifact {
     Image(ImageRef),
     Document(StructuredDoc),
     DbTable(DbTable),
+    Enrichment(Enrichment),
 }
 
 impl StoredArtifact {
@@ -607,6 +680,8 @@ impl StoredArtifact {
             Some(StoredArtifact::Document(d.clone()))
         } else if let Some(db) = any.downcast_ref::<DbTable>() {
             Some(StoredArtifact::DbTable(db.clone()))
+        } else if let Some(e) = any.downcast_ref::<Enrichment>() {
+            Some(StoredArtifact::Enrichment(e.clone()))
         } else {
             any.downcast_ref::<HtmlTable>()
                 .map(|h| StoredArtifact::HtmlTable(h.clone()))
@@ -622,6 +697,7 @@ impl StoredArtifact {
             StoredArtifact::Image(i) => Box::new(i),
             StoredArtifact::Document(d) => Box::new(d),
             StoredArtifact::DbTable(db) => Box::new(db),
+            StoredArtifact::Enrichment(e) => Box::new(e),
         }
     }
 
@@ -634,6 +710,7 @@ impl StoredArtifact {
             StoredArtifact::Image(i) => &i.meta,
             StoredArtifact::Document(d) => &d.meta,
             StoredArtifact::DbTable(db) => &db.meta,
+            StoredArtifact::Enrichment(e) => &e.meta,
         }
     }
 }
