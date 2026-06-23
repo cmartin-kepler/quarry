@@ -343,25 +343,15 @@ fn serve_index(dir: &Path) -> String {
 
 /// Run pipeline (+materialize, +OCR) on a chosen PDF and return the rendered view.
 fn serve_run(pdf: &Path, ocr: bool) -> Result<String> {
-    use std::time::Instant;
     let store = serve_store_dir(pdf);
     let _ = std::fs::remove_dir_all(&store);
-
-    let mut stages: Vec<(String, u128)> = Vec::new();
-    let s = Instant::now();
+    // each step persists its own timing into the store (_timings.json); render_view
+    // reads them, appends the render time, and injects the banner.
     cmd_pipeline(pdf, &store, true)?;
-    stages.push(("pipeline".into(), s.elapsed().as_millis()));
-    let s = Instant::now();
     cmd_materialize(&store)?;
-    stages.push(("materialize".into(), s.elapsed().as_millis()));
     if ocr {
-        let s = Instant::now();
         cmd_ocr(&store, pdf)?;
-        stages.push(("ocr".into(), s.elapsed().as_millis()));
     }
-    // persist stage timings so the cached /view shows them too; render_view appends
-    // its own render time and injects the banner.
-    std::fs::write(store.join("_timings.json"), serde_json::to_string(&stages)?)?;
     render_view(&store, Some(pdf))
 }
 
@@ -453,6 +443,7 @@ fn cmd_ocr(store_dir: &Path, pdf: &Path) -> Result<()> {
         }
     }
     store.write(doc, &out, &[])?;
+    append_timing(store_dir, "ocr", ocr_ms);
     println!(
         "recovered text from {}/{} regions → {} OCR artifacts ({ocr_ms}ms)",
         out.len(),
@@ -492,8 +483,24 @@ fn render_view(store_dir: &Path, pdf: Option<&Path>) -> Result<String> {
     Ok(inject_timing_banner(store_dir, html, t.elapsed().as_millis()))
 }
 
+/// Overwrite the store's stage-timing record (fresh parse).
+fn write_timings(store: &Path, stages: &[(&str, u128)]) {
+    let v: Vec<(String, u128)> = stages.iter().map(|(k, m)| (k.to_string(), *m)).collect();
+    let _ = std::fs::write(store.join("_timings.json"), serde_json::to_string(&v).unwrap_or_default());
+}
+
+/// Append one stage timing to the store's record (materialize / ocr, run later).
+fn append_timing(store: &Path, name: &str, ms: u128) {
+    let mut v: Vec<(String, u128)> = std::fs::read_to_string(store.join("_timings.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    v.push((name.to_string(), ms));
+    let _ = std::fs::write(store.join("_timings.json"), serde_json::to_string(&v).unwrap_or_default());
+}
+
 /// If `_timings.json` (parse-stage timings) is present in the store, prepend a timing
-/// banner to the view, adding this render's own time. No file → no banner (CLI use).
+/// banner to the view, adding this render's own time. No file → no banner.
 fn inject_timing_banner(store_dir: &Path, html: String, render_ms: u128) -> String {
     let Ok(s) = std::fs::read_to_string(store_dir.join("_timings.json")) else { return html };
     let mut stages: Vec<(String, u128)> = serde_json::from_str(&s).unwrap_or_default();
@@ -654,7 +661,9 @@ fn cmd_materialize(store_dir: &Path) -> Result<()> {
     }
 
     store.write(doc, &dbs, &[])?;
-    println!("\nmaterialized {} table(s) → {} ({}ms)", dbs.len(), store_dir.display(), t0.elapsed().as_millis());
+    let ms = t0.elapsed().as_millis();
+    append_timing(store_dir, "materialize", ms);
+    println!("\nmaterialized {} table(s) → {} ({ms}ms)", dbs.len(), store_dir.display());
     Ok(())
 }
 
@@ -766,6 +775,8 @@ fn cmd_pipeline(pdf: &Path, out: &Path, regions: bool) -> Result<()> {
         "⏱  triage {triage_ms}ms · docling {docling_ms}ms · ocr-scan {ocrscan_ms}ms · total {}ms",
         t_all.elapsed().as_millis()
     );
+    // persist stage timings so any view (CLI or served) shows the banner
+    write_timings(out, &[("triage", triage_ms), ("docling", docling_ms), ("ocr-scan", ocrscan_ms)]);
     Ok(())
 }
 
