@@ -347,28 +347,22 @@ fn serve_run(pdf: &Path, ocr: bool) -> Result<String> {
     let store = serve_store_dir(pdf);
     let _ = std::fs::remove_dir_all(&store);
 
-    let mut stages: Vec<(&str, u128)> = Vec::new();
+    let mut stages: Vec<(String, u128)> = Vec::new();
     let s = Instant::now();
     cmd_pipeline(pdf, &store, true)?;
-    stages.push(("pipeline", s.elapsed().as_millis()));
+    stages.push(("pipeline".into(), s.elapsed().as_millis()));
     let s = Instant::now();
     cmd_materialize(&store)?;
-    stages.push(("materialize", s.elapsed().as_millis()));
+    stages.push(("materialize".into(), s.elapsed().as_millis()));
     if ocr {
         let s = Instant::now();
         cmd_ocr(&store, pdf)?;
-        stages.push(("ocr", s.elapsed().as_millis()));
+        stages.push(("ocr".into(), s.elapsed().as_millis()));
     }
-    let s = Instant::now();
-    let html = render_view(&store, Some(pdf))?;
-    stages.push(("render", s.elapsed().as_millis()));
-
-    let total: u128 = stages.iter().map(|(_, ms)| ms).sum();
-    let parts = stages.iter().map(|(k, ms)| format!("{k} {ms}ms")).collect::<Vec<_>>().join(" · ");
-    let banner = format!(
-        "<div style='background:#065f46;color:#fff;padding:6px 20px;font:13px monospace'>⏱ {parts} · total {total}ms</div>"
-    );
-    Ok(html.replacen("<header>", &format!("{banner}<header>"), 1))
+    // persist stage timings so the cached /view shows them too; render_view appends
+    // its own render time and injects the banner.
+    std::fs::write(store.join("_timings.json"), serde_json::to_string(&stages)?)?;
+    render_view(&store, Some(pdf))
 }
 
 fn cmd_serve(dir: &Path, port: u16) -> Result<()> {
@@ -469,11 +463,14 @@ fn cmd_ocr(store_dir: &Path, pdf: &Path) -> Result<()> {
 }
 
 /// Build the HTML view for a store (rasterizing source pages when `pdf` is given).
+/// If the store recorded parse-stage timings (`_timings.json`, written by serve), a
+/// timing banner is injected — so cached `/view`s show timings too.
 fn render_view(store_dir: &Path, pdf: Option<&Path>) -> Result<String> {
     use quarry::store::FlatStore;
     use quarry::view::{content_pages, PageImage};
     use std::collections::HashMap;
 
+    let t = std::time::Instant::now();
     let arts = FlatStore::open(store_dir).current_artifacts()?;
     let mut page_images: HashMap<u32, PageImage> = HashMap::new();
     if let Some(pdf) = pdf {
@@ -491,7 +488,22 @@ fn render_view(store_dir: &Path, pdf: Option<&Path>) -> Result<String> {
             }
         }
     }
-    Ok(quarry::view::render_store(&arts, &store_dir.display().to_string(), &page_images))
+    let html = quarry::view::render_store(&arts, &store_dir.display().to_string(), &page_images);
+    Ok(inject_timing_banner(store_dir, html, t.elapsed().as_millis()))
+}
+
+/// If `_timings.json` (parse-stage timings) is present in the store, prepend a timing
+/// banner to the view, adding this render's own time. No file → no banner (CLI use).
+fn inject_timing_banner(store_dir: &Path, html: String, render_ms: u128) -> String {
+    let Ok(s) = std::fs::read_to_string(store_dir.join("_timings.json")) else { return html };
+    let mut stages: Vec<(String, u128)> = serde_json::from_str(&s).unwrap_or_default();
+    stages.push(("render".into(), render_ms));
+    let total: u128 = stages.iter().map(|(_, m)| m).sum();
+    let parts = stages.iter().map(|(k, m)| format!("{k} {m}ms")).collect::<Vec<_>>().join(" · ");
+    let banner = format!(
+        "<div style='background:#065f46;color:#fff;padding:6px 20px;font:13px monospace'>⏱ {parts} · total {total}ms</div>"
+    );
+    html.replacen("<header>", &format!("{banner}<header>"), 1)
 }
 
 fn cmd_view(store_dir: &Path, out: Option<&Path>, pdf: Option<&Path>) -> Result<()> {
