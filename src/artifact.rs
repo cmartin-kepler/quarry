@@ -461,6 +461,22 @@ pub struct StructuredDoc {
 }
 
 impl StructuredDoc {
+    /// Render the structured text as markdown (a readable/diffable view of the
+    /// reading-order extraction).
+    pub fn to_markdown(&self) -> String {
+        let mut s = String::new();
+        for el in &self.elements {
+            match el.role {
+                DocRole::Title => s.push_str(&format!("# {}\n\n", el.text)),
+                DocRole::Heading => s.push_str(&format!("## {}\n\n", el.text)),
+                DocRole::ListItem => s.push_str(&format!("- {}\n", el.text)),
+                DocRole::Caption => s.push_str(&format!("*{}*\n\n", el.text)),
+                DocRole::Paragraph | DocRole::Other => s.push_str(&format!("{}\n\n", el.text)),
+            }
+        }
+        s
+    }
+
     /// Group into `(heading, body)` sections. Elements before the first heading
     /// form a leading section with `None` heading.
     pub fn sections(&self) -> Vec<(Option<&DocElement>, Vec<&DocElement>)> {

@@ -233,7 +233,8 @@ fn walk_children(
             let bbox = prov.map(|p| p.bbox.to_topleft(page_h)).unwrap_or(BBox::new(0.0, 0.0, 0.0, 0.0));
             out.push(DocElement {
                 role: doc_role(&t.label),
-                text: t.text.clone(),
+                // collapse docling's layout-derived whitespace ("Though  born" -> "Though born")
+                text: t.text.split_whitespace().collect::<Vec<_>>().join(" "),
                 anchor: SourceAnchor::Pdf { doc, page, bbox },
             });
         } else if let Some(g) = child.cref.strip_prefix("#/groups/").and_then(|s| s.parse::<usize>().ok())

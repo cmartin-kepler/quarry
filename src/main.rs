@@ -127,6 +127,14 @@ enum Command {
     /// Materialize the HtmlTables in a store into queryable DbTables (Stage 3 MVP:
     /// cell cleanup + header/dtype inference) and preview them.
     Materialize { store: PathBuf },
+    /// Print the extracted structured text (sections/paragraphs/captions) from a
+    /// store's StructuredDoc as markdown.
+    Text {
+        store: PathBuf,
+        /// Show a role + counts summary instead of the full text.
+        #[arg(long)]
+        summary: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -158,7 +166,46 @@ fn main() -> Result<()> {
         Command::Triage { pdf } => cmd_triage(&pdf),
         Command::Pipeline { pdf, out } => cmd_pipeline(&pdf, &out),
         Command::Materialize { store } => cmd_materialize(&store),
+        Command::Text { store, summary } => cmd_text(&store, summary),
     }
+}
+
+/// Print a store's structured text (StructuredDoc) as markdown, or a role summary.
+fn cmd_text(store_dir: &Path, summary: bool) -> Result<()> {
+    use quarry::artifact::{DocRole, StructuredDoc};
+    use quarry::store::FlatStore;
+    use std::collections::BTreeMap;
+
+    let arts = FlatStore::open(store_dir).current_artifacts()?;
+    let docs: Vec<&StructuredDoc> =
+        arts.iter().filter_map(|a| a.as_any().downcast_ref::<StructuredDoc>()).collect();
+    if docs.is_empty() {
+        println!("no StructuredDoc in {}", store_dir.display());
+        return Ok(());
+    }
+    for d in docs {
+        if summary {
+            let mut roles: BTreeMap<String, usize> = BTreeMap::new();
+            for el in &d.elements {
+                *roles.entry(format!("{:?}", el.role)).or_default() += 1;
+            }
+            let chars: usize = d.elements.iter().map(|e| e.text.chars().count()).sum();
+            let headings: Vec<&str> = d
+                .elements
+                .iter()
+                .filter(|e| matches!(e.role, DocRole::Heading | DocRole::Title))
+                .map(|e| e.text.as_str())
+                .collect();
+            println!("{} elements, {chars} chars; roles {roles:?}", d.elements.len());
+            println!("headings ({}):", headings.len());
+            for h in headings {
+                println!("  • {h}");
+            }
+        } else {
+            print!("{}", d.to_markdown());
+        }
+    }
+    Ok(())
 }
 
 /// Stage 3 MVP: materialize every HtmlTable in a store into a DbTable, persist, preview.
