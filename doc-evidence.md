@@ -20,7 +20,7 @@ warm (models loaded once) unless noted "wall-clock". Harnesses live in `scripts/
 | 7 | docling whole-page is clip- and diagram-immune and competitive on cost | **docling whole-page** (not cropped, not escalation) is the default parser |
 | 8 | Pipeline vs docling-full (20 docs): gate loses **no real tables** (Δ=0 on all 18 text docs); only drops spurious empty tables on all-image decks; structured text misses nested groups | **Gate validated**; fix: recurse `body.children` groups for complete sections |
 | 9 | Gate timing: docling saved 21s (4%) all from 2 image decks; triage cost decides net — pdfplumber 35s (−14s LOSS) vs **pypdfium2 2.7s (+18s WIN)** | Use **pypdfium2** triage; gate net-positive but value is concentrated on image/scanned docs (≈neutral on text corpora) |
-| 10 | OCR ~1s/page standalone; 80% of corpus pages already have a text layer; sparing saves 80% (858s). docling `do_ocr=True` is text-layer-aware (+83ms text / +580ms image) | **OCR only no-text content** (OcrDeferred gate); consider docling `do_ocr=True` gated to image/no-text docs vs the standalone pass |
+| 10 | OCR ~1s/page standalone; docling `do_ocr=True` is text-layer-aware (proven: OCRs an embedded figure, not the text). Corpus do_ocr add = 414s (67%) but **89% is 3 pure-scan/image docs**; the 17 text/mixed docs add only ~8% | **Text/mixed docs → docling `do_ocr=True`** (surgical figure OCR, ~8%); **pure scans → standalone OCR** (already gated out of docling) |
 
 **Detailed write-ups** (full method, data tables, analysis, caveats) in `evidence/`:
 1. [`evidence/01-step0-probe.md`](evidence/01-step0-probe.md) — cheap-parse wrong answers / region clipping

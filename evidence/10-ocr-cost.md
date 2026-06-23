@@ -54,6 +54,36 @@ the figure (8 → 41 text items, "Multi-Head Attention" recovered). It does **no
 the body text (identical both ways). The +438ms is the cost of OCRing that one figure,
 not the page. So docling's OCR cost scales with bitmap content, not page count.
 
+### Corpus-wide: docling do_ocr=False vs True (20 docs, 1061 pages)
+
+`scripts/docling_ocr_corpus.py` (warm, whole-doc, per doc → `docling_ocr_corpus.json`):
+
+```
+docling no-OCR  622s  →  with-OCR 1036s   (OCR adds 414s, 67%)
+```
+
+But the 67% is concentrated — **89% of the OCR overhead is 3 documents**, exactly the
+pure scan/image ones:
+
+| document | pages | OCR overhead | share |
+|---|--:|--:|--:|
+| Abacus CDO (fully scanned) | 133 | +304s | 73% |
+| Q3 deck (all image) | 34 | +36s | 9% |
+| Q4 deck (all image) | 25 | +27s | 7% |
+| **the other 17 text/mixed docs** | 869 | **+47s** | **11%** |
+
+So across the 17 docs that have a text layer, `do_ocr=True` adds only **~8%** (47s over
+584s) — and that buys every embedded figure/chart OCR'd surgically. jpm (364pg, 1 scanned)
+adds 5%; brk-ar's −17% is run variance (≈4 scanned pages → ≈0 real overhead).
+
+**Design split (backed by these numbers):**
+- *Text/mixed docs* → docling already runs the text-page pass, so flipping it to
+  `do_ocr=True` gets embedded-figure OCR for ~8% — replacing the separate region-text
+  scan + standalone figure-OCR with something built-in and cheaper.
+- *Pure scan/image docs* → triage already gates these out of docling (no table-model
+  waste), so they never pay docling's ~2.3s/pg OCR; the lean standalone RapidOCR (~1s/pg)
+  handles them.
+
 This means much of our separate OCR machinery (triage's text-less-figure scan +
 standalone RapidOCR per figure) is redundant for **embedded figures on text pages** —
 `do_ocr=True` already does it surgically. The standalone pass still matters for **whole
