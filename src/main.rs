@@ -321,15 +321,33 @@ fn serve_index(dir: &Path) -> String {
 
 /// Run pipeline (+materialize, +OCR) on a chosen PDF and return the rendered view.
 fn serve_run(pdf: &Path, ocr: bool) -> Result<String> {
+    use std::time::Instant;
     let stem = pdf.file_stem().and_then(|s| s.to_str()).unwrap_or("doc");
     let store = std::env::temp_dir().join("quarry_serve").join(stem);
     let _ = std::fs::remove_dir_all(&store);
+
+    let mut stages: Vec<(&str, u128)> = Vec::new();
+    let s = Instant::now();
     cmd_pipeline(pdf, &store, true)?;
+    stages.push(("pipeline", s.elapsed().as_millis()));
+    let s = Instant::now();
     cmd_materialize(&store)?;
+    stages.push(("materialize", s.elapsed().as_millis()));
     if ocr {
+        let s = Instant::now();
         cmd_ocr(&store, pdf)?;
+        stages.push(("ocr", s.elapsed().as_millis()));
     }
-    render_view(&store, Some(pdf))
+    let s = Instant::now();
+    let html = render_view(&store, Some(pdf))?;
+    stages.push(("render", s.elapsed().as_millis()));
+
+    let total: u128 = stages.iter().map(|(_, ms)| ms).sum();
+    let parts = stages.iter().map(|(k, ms)| format!("{k} {ms}ms")).collect::<Vec<_>>().join(" · ");
+    let banner = format!(
+        "<div style='background:#065f46;color:#fff;padding:6px 20px;font:13px monospace'>⏱ {parts} · total {total}ms</div>"
+    );
+    Ok(html.replacen("<header>", &format!("{banner}<header>"), 1))
 }
 
 fn cmd_serve(dir: &Path, port: u16) -> Result<()> {
@@ -395,8 +413,10 @@ fn cmd_ocr(store_dir: &Path, pdf: &Path) -> Result<()> {
         .collect();
     let req_s = serde_json::to_string(&req)?;
     println!("OCR-ing {} image region(s)…", targets.len());
+    let t0 = std::time::Instant::now();
     let texts: Vec<String> =
         serde_json::from_str(&run_uv(&["run", "scripts/ocr.py", &pdf.display().to_string(), &req_s])?)?;
+    let ocr_ms = t0.elapsed().as_millis();
 
     let doc = targets[0].anchor().doc();
     let mut out: Vec<Box<dyn Artifact>> = Vec::new();
@@ -406,7 +426,12 @@ fn cmd_ocr(store_dir: &Path, pdf: &Path) -> Result<()> {
         }
     }
     store.write(doc, &out, &[])?;
-    println!("recovered text from {}/{} regions → {} OCR artifacts", out.len(), targets.len(), out.len());
+    println!(
+        "recovered text from {}/{} regions → {} OCR artifacts ({ocr_ms}ms)",
+        out.len(),
+        targets.len(),
+        out.len()
+    );
     Ok(())
 }
 
@@ -548,6 +573,7 @@ fn cmd_materialize(store_dir: &Path) -> Result<()> {
     use quarry::materialize::materialize;
     use quarry::store::FlatStore;
 
+    let t0 = std::time::Instant::now();
     let store = FlatStore::open(store_dir);
     let arts = store.current_artifacts()?;
     let tables: Vec<&HtmlTable> =
@@ -583,7 +609,7 @@ fn cmd_materialize(store_dir: &Path) -> Result<()> {
     }
 
     store.write(doc, &dbs, &[])?;
-    println!("\nmaterialized {} table(s) → {}", dbs.len(), store_dir.display());
+    println!("\nmaterialized {} table(s) → {} ({}ms)", dbs.len(), store_dir.display(), t0.elapsed().as_millis());
     Ok(())
 }
 
@@ -610,13 +636,17 @@ fn cmd_pipeline(pdf: &Path, out: &Path, regions: bool) -> Result<()> {
     // a Figure region with fewer than this many words under its bbox is text-less → OCR target
     const OCR_WORD_MIN: i32 = 3;
 
+    use std::time::Instant;
+    let t_all = Instant::now();
     let bytes = std::fs::read(pdf).with_context(|| format!("reading {}", pdf.display()))?;
     let doc = DocHash::of(&bytes);
     let generation = Generation(0);
     let pdf_s = pdf.display().to_string();
 
     // Stage 0 — triage
+    let t = Instant::now();
     let pages = parse_triage(&run_uv(&["run", "scripts/triage.py", &pdf_s])?)?;
+    let triage_ms = t.elapsed().as_millis();
     let (t, i, b) = counts(&pages);
     println!("triage: {} pages — {t} text, {i} image_content, {b} blank", pages.len());
 
@@ -630,8 +660,11 @@ fn cmd_pipeline(pdf: &Path, out: &Path, regions: bool) -> Result<()> {
     let text: Vec<String> =
         pages.iter().filter(|p| p.klass == PageClass::Text).map(|p| p.page.to_string()).collect();
     let (mut n_tables, mut n_elems, mut n_regions, mut n_embedded_ocr) = (0usize, 0usize, 0usize, 0usize);
+    let (mut docling_ms, mut ocrscan_ms) = (0u128, 0u128);
     if !text.is_empty() {
+        let t = Instant::now();
         let dj = run_uv(&["run", "scripts/run_docling.py", &pdf_s, "--pages", &text.join(",")])?;
+        docling_ms = t.elapsed().as_millis();
         let tables = artifacts_from_docling(&dj, doc, generation)?;
         n_tables = tables.len();
         artifacts.extend(tables);
@@ -655,9 +688,11 @@ fn cmd_pipeline(pdf: &Path, out: &Path, regions: bool) -> Result<()> {
                 })
                 .collect();
             let req_s = serde_json::to_string(&req)?;
+            let t = Instant::now();
             let word_counts: Vec<i32> = serde_json::from_str(
                 &run_uv(&["run", "scripts/region_text.py", &pdf_s, &req_s])?,
             )?;
+            ocrscan_ms = t.elapsed().as_millis();
             for (fig, &words) in figures.iter().zip(&word_counts) {
                 if (0..OCR_WORD_MIN).contains(&words) {
                     artifacts.push(Box::new(ImageRef::ocr_deferred_region(fig)));
@@ -681,6 +716,10 @@ fn cmd_pipeline(pdf: &Path, out: &Path, regions: bool) -> Result<()> {
     println!(
         "parsed: {n_tables} tables, {n_elems} text elements, {i} OCR markers{ocr_note}{reg_note} → {}",
         out.display()
+    );
+    println!(
+        "⏱  triage {triage_ms}ms · docling {docling_ms}ms · ocr-scan {ocrscan_ms}ms · total {}ms",
+        t_all.elapsed().as_millis()
     );
     Ok(())
 }
