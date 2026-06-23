@@ -240,9 +240,8 @@ fn walk_children(
         {
             // recurse into the group (guard against cycles)
             if seen.insert(g) {
-                if let Some(grp) = dd.groups.get(g) {
-                    walk_children(&grp.children, dd, doc, out, seen);
-                }
+                let Some(grp) = dd.groups.get(g) else { continue };
+                walk_children(&grp.children, dd, doc, out, seen);
             }
         }
     }
