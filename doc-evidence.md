@@ -19,6 +19,17 @@ warm (models loaded once) unless noted "wall-clock". Harnesses live in `scripts/
 | 6 | A ~40dpi thumbnail's **stddev** cleanly separates blank (0.0) from content (≥33), ~10ms | Cheap blank-vs-content gate; content → OCR-deferred, not dropped |
 | 7 | docling whole-page is clip- and diagram-immune and competitive on cost | **docling whole-page** (not cropped, not escalation) is the default parser |
 
+**Detailed write-ups** (full method, data tables, analysis, caveats) in `evidence/`:
+1. [`evidence/01-step0-probe.md`](evidence/01-step0-probe.md) — cheap-parse wrong answers / region clipping
+2. [`evidence/02-layout-speed.md`](evidence/02-layout-speed.md) — layout model speed; removing YOLO
+3. [`evidence/03-corpus-cost.md`](evidence/03-corpus-cost.md) — 1061-page 4-pipeline cost
+4. [`evidence/04-docling-stages.md`](evidence/04-docling-stages.md) — where docling spends time
+5. [`evidence/05-image-pages.md`](evidence/05-image-pages.md) — which image pages are expensive
+6. [`evidence/06-blank-discriminator.md`](evidence/06-blank-discriminator.md) — blank vs content
+7. [`evidence/07-whole-vs-crop-docling.md`](evidence/07-whole-vs-crop-docling.md) — whole-page vs crop
+
+The sections below are the short version; follow the links for the full evidence.
+
 ---
 
 ## 1. Step-0 probe — do cheap parses give *wrong answers*?
