@@ -149,6 +149,14 @@ enum Command {
     /// List the artifacts currently in a store — kind, id, generation, lineage, and
     /// a one-line preview. Shows the append-only artifact graph.
     Ls { store: PathBuf },
+    /// Render a store to a single self-contained HTML view (page layout + bboxes,
+    /// tables, structured text, OCR markers, lineage). Open it in a browser.
+    View {
+        store: PathBuf,
+        /// Output file (default: <store>/view.html).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 fn short_id(id: &quarry::core::ArtifactId) -> String {
@@ -239,7 +247,19 @@ fn main() -> Result<()> {
         Command::Text { store, summary } => cmd_text(&store, summary),
         Command::Enrich { store, kind } => cmd_enrich(&store, &kind),
         Command::Ls { store } => cmd_ls(&store),
+        Command::View { store, out } => cmd_view(&store, out.as_deref()),
     }
+}
+
+fn cmd_view(store_dir: &Path, out: Option<&Path>) -> Result<()> {
+    use quarry::store::FlatStore;
+
+    let arts = FlatStore::open(store_dir).current_artifacts()?;
+    let html = quarry::view::render_store(&arts, &store_dir.display().to_string());
+    let out_path = out.map(PathBuf::from).unwrap_or_else(|| store_dir.join("view.html"));
+    std::fs::write(&out_path, html).with_context(|| format!("writing {}", out_path.display()))?;
+    println!("wrote {} ({} artifacts) — open it in a browser", out_path.display(), arts.len());
+    Ok(())
 }
 
 /// Lazy enrichment: derive (e.g.) a summary of the store's StructuredDoc — computed
