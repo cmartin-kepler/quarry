@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["docling", "pypdf", "pdfplumber"]
+# dependencies = ["docling", "pypdf", "pypdfium2", "Pillow"]
 # ///
 """Does the cheap triage gate SAVE docling time? Warm, per page, across a corpus.
 
@@ -22,14 +22,14 @@ import os
 import tempfile
 import time
 
-import pdfplumber
+import pypdfium2 as pdfium
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from PIL import ImageStat
 from pypdf import PdfReader, PdfWriter
 
-W_TEXT, W_LOW, EPS, IMG_FRAC = 30, 5, 5.0, 0.5
+CHARS_TEXT, CHARS_LOW, EPS = 150, 25, 5.0
 
 
 def make_conv():
@@ -43,19 +43,17 @@ def make_conv():
 
 
 def classify(page):
-    """Return (klass, classify_ms). Renders only for low-text pages."""
+    """(klass, classify_ms) via pypdfium2 native char count + render (the real
+    cheap triage — pdfplumber chars/words was ~30-65ms/page; this is ~2.5ms)."""
     t = time.perf_counter()
-    words = len(page.extract_words() or [])
-    pa = (page.width or 0) * (page.height or 0)
-    iarea = sum(max(0.0, im["x1"] - im["x0"]) * max(0.0, im["bottom"] - im["top"]) for im in (page.images or []))
-    frac = iarea / pa if pa else 0.0
-    if words >= W_TEXT:
+    n = page.get_textpage().count_chars()
+    if n >= CHARS_TEXT:
         return "text", (time.perf_counter() - t) * 1000
-    sd = ImageStat.Stat(page.to_image(resolution=40).original.convert("L")).stddev[0]
+    sd = ImageStat.Stat(page.render(scale=40 / 72.0).to_pil().convert("L")).stddev[0]
     ms = (time.perf_counter() - t) * 1000
     if sd < EPS:
         return "blank", ms
-    if words < W_LOW and frac >= IMG_FRAC:
+    if n < CHARS_LOW:
         return "image_content", ms
     return "text", ms
 
@@ -84,19 +82,19 @@ def main():
     tot = {"full": 0.0, "gated": 0.0, "triage": 0.0, "pg": 0}
     for pdf in pdfs:
         reader = PdfReader(pdf)
+        fdoc = pdfium.PdfDocument(pdf)
         full = gated = triage = 0.0
         c = {"text": 0, "image_content": 0, "blank": 0}
-        with pdfplumber.open(pdf) as plumb:
-            for i, page in enumerate(plumb.pages, 1):
-                klass, cms = classify(page)
-                triage += cms
-                c[klass] += 1
-                t = time.perf_counter()
-                conv.convert(page_pdf(reader, i))
-                ms = (time.perf_counter() - t) * 1000
-                full += ms
-                if klass == "text":
-                    gated += ms
+        for i in range(1, len(reader.pages) + 1):
+            klass, cms = classify(fdoc[i - 1])
+            triage += cms
+            c[klass] += 1
+            t = time.perf_counter()
+            conv.convert(page_pdf(reader, i))
+            ms = (time.perf_counter() - t) * 1000
+            full += ms
+            if klass == "text":
+                gated += ms
         saved = full - gated
         net = saved - triage
         for k, v in (("full", full), ("gated", gated), ("triage", triage)):

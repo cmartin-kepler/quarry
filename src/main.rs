@@ -221,10 +221,7 @@ fn cmd_triage(pdf: &Path) -> Result<()> {
     println!("{} pages: {t} text, {i} image_content (OCR-deferred), {b} blank", pages.len());
     for p in &pages {
         let sd = p.stddev.map(|s| format!("{s:.1}")).unwrap_or_else(|| "-".into());
-        println!(
-            "  p{:<4} {:?}  words={} img={:.2} stddev={}",
-            p.page, p.klass, p.words, p.image_frac, sd
-        );
+        println!("  p{:<4} {:?}  chars={} stddev={}", p.page, p.klass, p.chars, sd);
     }
     Ok(())
 }

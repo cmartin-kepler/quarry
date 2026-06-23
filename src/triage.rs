@@ -29,9 +29,7 @@ pub struct PageTriage {
     #[serde(default)]
     pub height: f32,
     #[serde(default)]
-    pub words: u32,
-    #[serde(default)]
-    pub image_frac: f32,
+    pub chars: u32,
     #[serde(default)]
     pub stddev: Option<f32>,
     pub klass: PageClass,
@@ -76,9 +74,9 @@ mod tests {
     use crate::artifact::ImageStatus;
 
     const SAMPLE: &str = r#"[
-        {"page":1,"width":612,"height":792,"words":361,"image_frac":0.0,"stddev":null,"klass":"text"},
-        {"page":2,"width":612,"height":792,"words":0,"image_frac":0.0,"stddev":0.0,"klass":"blank"},
-        {"page":3,"width":612,"height":792,"words":0,"image_frac":1.0,"stddev":33.5,"klass":"image_content"}
+        {"page":1,"width":612,"height":792,"chars":2000,"stddev":null,"klass":"text"},
+        {"page":2,"width":612,"height":792,"chars":0,"stddev":0.0,"klass":"blank"},
+        {"page":3,"width":612,"height":792,"chars":0,"stddev":33.5,"klass":"image_content"}
     ]"#;
 
     #[test]
