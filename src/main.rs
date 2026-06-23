@@ -116,6 +116,14 @@ enum Command {
     /// scripts/triage.py and report. The cheap gate that keeps image/blank pages
     /// out of docling (where the table-structure model wastes ~950ms on an image).
     Triage { pdf: PathBuf },
+    /// Run the pipeline (Stage 0–1): triage → docling-whole on TEXT pages only
+    /// (tables + sections via litparse-free docling) → append-only store. Image
+    /// pages become OCR-deferred markers; blanks are skipped.
+    Pipeline {
+        pdf: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -145,20 +153,70 @@ fn main() -> Result<()> {
         Command::Regions { words } => cmd_regions(&words),
         Command::RegionCheck { regions, words } => cmd_region_check(&regions, &words),
         Command::Triage { pdf } => cmd_triage(&pdf),
+        Command::Pipeline { pdf, out } => cmd_pipeline(&pdf, &out),
     }
+}
+
+/// Run a `uv run <script ...>` sidecar and capture stdout.
+fn run_uv(args: &[&str]) -> Result<String> {
+    let out = std::process::Command::new("uv")
+        .args(args)
+        .output()
+        .with_context(|| format!("running: uv {}", args.join(" ")))?;
+    if !out.status.success() {
+        anyhow::bail!("`uv {}` failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Pipeline Stage 0–1: triage → docling-whole on text pages → store.
+fn cmd_pipeline(pdf: &Path, out: &Path) -> Result<()> {
+    use quarry::core::{DocHash, Generation};
+    use quarry::docling::{artifacts_from_docling, structured_doc_from_docling};
+    use quarry::store::FlatStore;
+    use quarry::triage::{counts, ocr_markers, parse as parse_triage, PageClass};
+
+    let bytes = std::fs::read(pdf).with_context(|| format!("reading {}", pdf.display()))?;
+    let doc = DocHash::of(&bytes);
+    let generation = Generation(0);
+    let pdf_s = pdf.display().to_string();
+
+    // Stage 0 — triage
+    let pages = parse_triage(&run_uv(&["run", "scripts/triage.py", &pdf_s])?)?;
+    let (t, i, b) = counts(&pages);
+    println!("triage: {} pages — {t} text, {i} image_content, {b} blank", pages.len());
+
+    let mut artifacts: Vec<Box<dyn Artifact>> = Vec::new();
+    // image_content pages → OCR-deferred markers (invariant 11: recorded, not dropped)
+    for m in ocr_markers(&pages, doc) {
+        artifacts.push(Box::new(m));
+    }
+
+    // Stage 1 — docling whole-page on TEXT pages only (image/blank skipped)
+    let text: Vec<String> =
+        pages.iter().filter(|p| p.klass == PageClass::Text).map(|p| p.page.to_string()).collect();
+    let (mut n_tables, mut n_elems) = (0usize, 0usize);
+    if !text.is_empty() {
+        let dj = run_uv(&["run", "scripts/run_docling.py", &pdf_s, "--pages", &text.join(",")])?;
+        let tables = artifacts_from_docling(&dj, doc, generation)?;
+        n_tables = tables.len();
+        artifacts.extend(tables);
+        let sd = structured_doc_from_docling(&dj, doc, generation)?;
+        n_elems = sd.elements.len();
+        if n_elems > 0 {
+            artifacts.push(Box::new(sd));
+        }
+    }
+
+    FlatStore::open(out).write(doc, &artifacts, &[])?;
+    println!("parsed: {n_tables} tables, {n_elems} text elements, {i} OCR markers → {}", out.display());
+    Ok(())
 }
 
 /// Stage-0 triage: run scripts/triage.py via uv, classify pages, report.
 fn cmd_triage(pdf: &Path) -> Result<()> {
     use quarry::triage::{counts, parse};
-    let out = std::process::Command::new("uv")
-        .args(["run", "scripts/triage.py", &pdf.display().to_string()])
-        .output()
-        .with_context(|| "running scripts/triage.py via uv")?;
-    if !out.status.success() {
-        anyhow::bail!("triage.py failed: {}", String::from_utf8_lossy(&out.stderr));
-    }
-    let pages = parse(&String::from_utf8_lossy(&out.stdout))?;
+    let pages = parse(&run_uv(&["run", "scripts/triage.py", &pdf.display().to_string()])?)?;
     let (t, i, b) = counts(&pages);
     println!("{} pages: {t} text, {i} image_content (OCR-deferred), {b} blank", pages.len());
     for p in &pages {

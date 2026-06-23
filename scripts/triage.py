@@ -38,8 +38,9 @@ def classify(page):
     )
     frac = round(iarea / pa, 3) if pa else 0.0
 
+    dims = {"width": round(page.width or 0, 1), "height": round(page.height or 0, 1)}
     if words >= W_TEXT:
-        return {"words": words, "image_frac": frac, "stddev": None, "klass": "text"}
+        return {**dims, "words": words, "image_frac": frac, "stddev": None, "klass": "text"}
 
     # low/no text layer: render a small thumbnail and measure spatial complexity
     img = page.to_image(resolution=40).original.convert("L")
@@ -50,7 +51,7 @@ def classify(page):
         klass = "image_content"
     else:
         klass = "text"  # sparse but has a real (small) text layer -> parse it
-    return {"words": words, "image_frac": frac, "stddev": sd, "klass": klass}
+    return {**dims, "words": words, "image_frac": frac, "stddev": sd, "klass": klass}
 
 
 def main():

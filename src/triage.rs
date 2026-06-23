@@ -25,6 +25,10 @@ pub enum PageClass {
 pub struct PageTriage {
     pub page: u32,
     #[serde(default)]
+    pub width: f32,
+    #[serde(default)]
+    pub height: f32,
+    #[serde(default)]
     pub words: u32,
     #[serde(default)]
     pub image_frac: f32,
@@ -45,11 +49,11 @@ pub fn text_pages(t: &[PageTriage]) -> Vec<u32> {
 
 /// OCR-deferred markers for image-content pages (invariant 11): one `ImageRef` per
 /// page so a future OCR pass knows exactly which pages have content (and that they
-/// aren't blank). `page_box(page)` supplies the full-page bbox for the anchor.
-pub fn ocr_markers(t: &[PageTriage], doc: DocHash, page_box: impl Fn(u32) -> BBox) -> Vec<ImageRef> {
+/// aren't blank). The anchor is the full page bbox (from the triage dimensions).
+pub fn ocr_markers(t: &[PageTriage], doc: DocHash) -> Vec<ImageRef> {
     t.iter()
         .filter(|p| p.klass == PageClass::ImageContent)
-        .map(|p| ImageRef::ocr_deferred(doc, p.page, page_box(p.page)))
+        .map(|p| ImageRef::ocr_deferred(doc, p.page, BBox::new(0.0, 0.0, p.width, p.height)))
         .collect()
 }
 
@@ -72,9 +76,9 @@ mod tests {
     use crate::artifact::ImageStatus;
 
     const SAMPLE: &str = r#"[
-        {"page":1,"words":361,"image_frac":0.0,"stddev":null,"klass":"text"},
-        {"page":2,"words":0,"image_frac":0.0,"stddev":0.0,"klass":"blank"},
-        {"page":3,"words":0,"image_frac":1.0,"stddev":33.5,"klass":"image_content"}
+        {"page":1,"width":612,"height":792,"words":361,"image_frac":0.0,"stddev":null,"klass":"text"},
+        {"page":2,"width":612,"height":792,"words":0,"image_frac":0.0,"stddev":0.0,"klass":"blank"},
+        {"page":3,"width":612,"height":792,"words":0,"image_frac":1.0,"stddev":33.5,"klass":"image_content"}
     ]"#;
 
     #[test]
@@ -89,11 +93,14 @@ mod tests {
     fn image_content_pages_become_ocr_deferred_markers() {
         let t = parse(SAMPLE).unwrap();
         let doc = DocHash::of(b"d");
-        let markers = ocr_markers(&t, doc, |_| BBox::new(0.0, 0.0, 612.0, 792.0));
+        let markers = ocr_markers(&t, doc);
         assert_eq!(markers.len(), 1, "one marker for the image_content page (not blank/text)");
         assert_eq!(markers[0].status, ImageStatus::OcrDeferred);
         match markers[0].meta.provenance.anchor() {
-            crate::core::SourceAnchor::Pdf { page, .. } => assert_eq!(*page, 3),
+            crate::core::SourceAnchor::Pdf { page, bbox, .. } => {
+                assert_eq!(*page, 3);
+                assert_eq!(*bbox, BBox::new(0.0, 0.0, 612.0, 792.0), "full-page anchor");
+            }
             _ => panic!("expected a PDF page anchor"),
         }
     }
