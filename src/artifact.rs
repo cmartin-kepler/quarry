@@ -250,6 +250,14 @@ impl Region {
     pub fn role(&self) -> RegionRole {
         RegionRole::from_label(&self.label)
     }
+
+    /// The page this region sits on.
+    pub fn page(&self) -> u32 {
+        match self.meta.provenance.anchor() {
+            SourceAnchor::Pdf { page, .. } => *page,
+            _ => 0,
+        }
+    }
 }
 
 // ---- ImageRef -------------------------------------------------------------
@@ -299,6 +307,31 @@ impl ImageRef {
                 origin: Origin::default(),
             },
             status: ImageStatus::Figure,
+            crop: None,
+        }
+    }
+
+    /// Build an OCR-deferred marker for an embedded image *region* — a `Figure`
+    /// region on a text page whose bbox has no text layer (a scanned/rasterized
+    /// sub-image). Like [`from_region`](Self::from_region) but flags OCR rather than
+    /// figure extraction, so a future OCR pass targets exactly these sub-page boxes.
+    /// Derived from the region (lineage + bbox preserved), content-addressed by its
+    /// id so multiple figures on one page don't collide.
+    pub fn ocr_deferred_region(region: &Region) -> ImageRef {
+        let content = DocHash::of(format!("ocrimage:{}", region.id()).as_bytes());
+        ImageRef {
+            meta: Meta {
+                id: ArtifactId::mint(&content, region.generation()),
+                content_hash: content,
+                provenance: Provenance::Derived {
+                    parents: vec![region.id()],
+                    anchor: region.provenance().anchor().clone(),
+                },
+                generation: region.generation(),
+                risk: RiskMarkers::default(),
+                origin: Origin::default(),
+            },
+            status: ImageStatus::OcrDeferred,
             crop: None,
         }
     }

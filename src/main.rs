@@ -123,6 +123,10 @@ enum Command {
         pdf: PathBuf,
         #[arg(long)]
         out: PathBuf,
+        /// Also emit a Region artifact per docling layout box (text/table/picture)
+        /// — the layout model's full detection list, queryable + crop-ready.
+        #[arg(long)]
+        regions: bool,
     },
     /// Materialize the HtmlTables in a store into queryable DbTables (Stage 3 MVP:
     /// cell cleanup + header/dtype inference) and preview them.
@@ -162,6 +166,13 @@ fn artifact_preview(a: &dyn Artifact) -> String {
         format!("[{}]", db.columns.join(", "))
     } else if let Some(e) = any.downcast_ref::<Enrichment>() {
         format!("{}: {}…", e.kind, e.text.chars().take(48).collect::<String>())
+    } else if let Some(r) = any.downcast_ref::<Region>() {
+        let b = r.bbox();
+        let page = match a.anchor() {
+            quarry::core::SourceAnchor::Pdf { page, .. } => *page,
+            _ => 0,
+        };
+        format!("{:?} '{}' p{page} [{:.0},{:.0},{:.0},{:.0}]", r.role(), r.label, b.x0, b.y0, b.x1, b.y1)
     } else if let Some(i) = any.downcast_ref::<ImageRef>() {
         format!("{:?}", i.status)
     } else if let Some(g) = any.downcast_ref::<TextGrid>() {
@@ -223,7 +234,7 @@ fn main() -> Result<()> {
         Command::Regions { words } => cmd_regions(&words),
         Command::RegionCheck { regions, words } => cmd_region_check(&regions, &words),
         Command::Triage { pdf } => cmd_triage(&pdf),
-        Command::Pipeline { pdf, out } => cmd_pipeline(&pdf, &out),
+        Command::Pipeline { pdf, out, regions } => cmd_pipeline(&pdf, &out, regions),
         Command::Materialize { store } => cmd_materialize(&store),
         Command::Text { store, summary } => cmd_text(&store, summary),
         Command::Enrich { store, kind } => cmd_enrich(&store, &kind),
@@ -387,11 +398,15 @@ fn run_uv(args: &[&str]) -> Result<String> {
 }
 
 /// Pipeline Stage 0–1: triage → docling-whole on text pages → store.
-fn cmd_pipeline(pdf: &Path, out: &Path) -> Result<()> {
+fn cmd_pipeline(pdf: &Path, out: &Path, regions: bool) -> Result<()> {
+    use quarry::artifact::{ImageRef, Region, RegionRole};
     use quarry::core::{DocHash, Generation};
-    use quarry::docling::{artifacts_from_docling, structured_doc_from_docling};
+    use quarry::docling::{artifacts_from_docling, regions_from_docling, structured_doc_from_docling};
     use quarry::store::FlatStore;
     use quarry::triage::{counts, ocr_markers, parse as parse_triage, PageClass};
+
+    // a Figure region with fewer than this many words under its bbox is text-less → OCR target
+    const OCR_WORD_MIN: i32 = 3;
 
     let bytes = std::fs::read(pdf).with_context(|| format!("reading {}", pdf.display()))?;
     let doc = DocHash::of(&bytes);
@@ -412,7 +427,7 @@ fn cmd_pipeline(pdf: &Path, out: &Path) -> Result<()> {
     // Stage 1 — docling whole-page on TEXT pages only (image/blank skipped)
     let text: Vec<String> =
         pages.iter().filter(|p| p.klass == PageClass::Text).map(|p| p.page.to_string()).collect();
-    let (mut n_tables, mut n_elems) = (0usize, 0usize);
+    let (mut n_tables, mut n_elems, mut n_regions, mut n_embedded_ocr) = (0usize, 0usize, 0usize, 0usize);
     if !text.is_empty() {
         let dj = run_uv(&["run", "scripts/run_docling.py", &pdf_s, "--pages", &text.join(",")])?;
         let tables = artifacts_from_docling(&dj, doc, generation)?;
@@ -423,10 +438,48 @@ fn cmd_pipeline(pdf: &Path, out: &Path) -> Result<()> {
         if n_elems > 0 {
             artifacts.push(Box::new(sd));
         }
+
+        // Embedded image regions (docling Figures) whose bbox has no text layer are
+        // OCR targets — invariant 11 extended from whole pages to sub-page images.
+        let regs = regions_from_docling(&dj, doc, generation)?;
+        let figures: Vec<&Region> =
+            regs.iter().filter(|r| r.role() == RegionRole::Figure).collect();
+        if !figures.is_empty() {
+            let req: Vec<serde_json::Value> = figures
+                .iter()
+                .map(|r| {
+                    let b = r.bbox();
+                    serde_json::json!({"page": r.page(), "bbox": [b.x0, b.y0, b.x1, b.y1]})
+                })
+                .collect();
+            let req_s = serde_json::to_string(&req)?;
+            let word_counts: Vec<i32> = serde_json::from_str(
+                &run_uv(&["run", "scripts/region_text.py", &pdf_s, &req_s])?,
+            )?;
+            for (fig, &words) in figures.iter().zip(&word_counts) {
+                if (0..OCR_WORD_MIN).contains(&words) {
+                    artifacts.push(Box::new(ImageRef::ocr_deferred_region(fig)));
+                    n_embedded_ocr += 1;
+                }
+            }
+        }
+
+        if regions {
+            n_regions = regs.len();
+            for r in regs {
+                artifacts.push(Box::new(r));
+            }
+        }
     }
 
     FlatStore::open(out).write(doc, &artifacts, &[])?;
-    println!("parsed: {n_tables} tables, {n_elems} text elements, {i} OCR markers → {}", out.display());
+    let reg_note = if regions { format!(", {n_regions} layout regions") } else { String::new() };
+    let ocr_note =
+        if n_embedded_ocr > 0 { format!(", {n_embedded_ocr} embedded-image OCR markers") } else { String::new() };
+    println!(
+        "parsed: {n_tables} tables, {n_elems} text elements, {i} OCR markers{ocr_note}{reg_note} → {}",
+        out.display()
+    );
     Ok(())
 }
 

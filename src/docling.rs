@@ -30,7 +30,17 @@ struct DoclingDoc {
     #[serde(default)]
     groups: Vec<DGroup>,
     #[serde(default)]
+    pictures: Vec<DPicture>,
+    #[serde(default)]
     body: DBody,
+}
+
+/// A picture/figure the layout model located (we don't process its pixels, but we
+/// record its box as a `Region`).
+#[derive(Deserialize, Default)]
+struct DPicture {
+    #[serde(default)]
+    prov: Vec<DProv>,
 }
 
 /// A nesting group (a list, a multi-column section, …) — its `children` are more
@@ -125,6 +135,52 @@ impl DBBox {
             "BOTTOMLEFT" => BBox::new(self.l, page_h - self.t, self.r, page_h - self.b),
             _ => BBox::new(self.l, self.t, self.r, self.b),
         }
+    }
+}
+
+/// Promote docling's full layout-detection list to first-class `Region` artifacts —
+/// one per located element (text block, table, picture), each carrying its page +
+/// bbox + label. These are the layout model's raw output: queryable ("all boxes on
+/// page 10"), and the input a region-scoped extractor / cropper reads. Opt-in
+/// (verbose), separate from the extracted tables/text.
+pub fn regions_from_docling(json: &str, doc: DocHash, generation: Generation) -> Result<Vec<Region>> {
+    let dd: DoclingDoc = serde_json::from_str(json).context("parsing Docling JSON")?;
+    let mut out = Vec::new();
+    let mut push = |prov: &[DProv], label: &str| {
+        if let Some(p) = prov.first() {
+            let page_h =
+                dd.pages.get(&p.page_no.to_string()).map(|x| x.size.height).unwrap_or(792.0);
+            out.push(region_artifact(doc, p.page_no, p.bbox.to_topleft(page_h), label, generation));
+        }
+    };
+    for t in &dd.texts {
+        push(&t.prov, &t.label);
+    }
+    for t in &dd.tables {
+        push(&t.prov, "table");
+    }
+    for p in &dd.pictures {
+        push(&p.prov, "picture");
+    }
+    Ok(out)
+}
+
+/// Build one `Region` (Source-anchored at its bbox), content-addressed by
+/// `(label, page, bbox)` so the same detection mints the same id.
+fn region_artifact(doc: DocHash, page: u32, bbox: BBox, label: &str, generation: Generation) -> Region {
+    let key = format!("region:{label}:{page}:{}:{}:{}:{}", bbox.x0, bbox.y0, bbox.x1, bbox.y1);
+    let content = DocHash::of(key.as_bytes());
+    Region {
+        meta: Meta {
+            id: ArtifactId::mint(&content, generation),
+            content_hash: content,
+            provenance: Provenance::Source(SourceAnchor::Pdf { doc, page, bbox }),
+            generation,
+            risk: RiskMarkers::default(),
+            origin: Origin::default(),
+        },
+        label: label.to_string(),
+        confidence: 1.0,
     }
 }
 
@@ -338,6 +394,24 @@ mod tests {
 
     const SAMPLE: &str = include_str!("../tests/data/sample.docling.json");
     const FULL: &str = include_str!("../tests/data/sample.docling_full.json");
+
+    #[test]
+    fn regions_from_layout_boxes() {
+        let json = r#"{
+          "pages": {"1": {"size": {"width": 600, "height": 800}}},
+          "texts": [{"label":"section_header","text":"H","prov":[{"page_no":1,"bbox":{"l":10,"t":20,"r":100,"b":40,"coord_origin":"TOPLEFT"}}]}],
+          "tables": [{"prov":[{"page_no":1,"bbox":{"l":50,"t":300,"r":400,"b":500,"coord_origin":"TOPLEFT"}}],"data":{"num_rows":0,"num_cols":0,"table_cells":[]}}],
+          "pictures": [{"prov":[{"page_no":1,"bbox":{"l":0,"t":600,"r":200,"b":700,"coord_origin":"TOPLEFT"}}]}]
+        }"#;
+        let regs = regions_from_docling(json, DocHash::of(b"d"), Generation(0)).unwrap();
+        assert_eq!(regs.len(), 3, "one region per text/table/picture");
+        let roles: Vec<RegionRole> = regs.iter().map(|r| r.role()).collect();
+        assert!(roles.contains(&RegionRole::Text));
+        assert!(roles.contains(&RegionRole::Table));
+        assert!(roles.contains(&RegionRole::Figure));
+        let table = regs.iter().find(|r| r.role() == RegionRole::Table).unwrap();
+        assert_eq!(table.bbox(), BBox::new(50.0, 300.0, 400.0, 500.0), "bbox preserved");
+    }
 
     #[test]
     fn recurses_into_groups() {
