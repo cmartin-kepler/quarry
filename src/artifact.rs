@@ -451,6 +451,9 @@ pub enum DocRole {
     Paragraph,
     Caption,
     ListItem,
+    /// Text OCR'd from inside a figure (docling `do_ocr=True`) — kept out of the prose
+    /// spine and grouped into its own section.
+    Figure,
     Other,
 }
 
@@ -476,13 +479,31 @@ impl StructuredDoc {
     /// reading-order extraction).
     pub fn to_markdown(&self) -> String {
         let mut s = String::new();
+        let mut figures: Vec<&DocElement> = Vec::new();
         for el in &self.elements {
             match el.role {
                 DocRole::Title => s.push_str(&format!("# {}\n\n", el.text)),
                 DocRole::Heading => s.push_str(&format!("## {}\n\n", el.text)),
                 DocRole::ListItem => s.push_str(&format!("- {}\n", el.text)),
                 DocRole::Caption => s.push_str(&format!("*{}*\n\n", el.text)),
+                // figure OCR text is held back for its own section (below)
+                DocRole::Figure => figures.push(el),
                 DocRole::Paragraph | DocRole::Other => s.push_str(&format!("{}\n\n", el.text)),
+            }
+        }
+        if !figures.is_empty() {
+            s.push_str("\n## Figure text (OCR)\n\n");
+            let mut page = 0;
+            for el in figures {
+                let p = match &el.anchor {
+                    SourceAnchor::Pdf { page, .. } => *page,
+                    _ => 0,
+                };
+                if p != page {
+                    page = p;
+                    s.push_str(&format!("\n**page {p}**\n\n"));
+                }
+                s.push_str(&format!("- {}\n", el.text));
             }
         }
         s

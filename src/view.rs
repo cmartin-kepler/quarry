@@ -57,6 +57,7 @@ fn role_color(r: DocRole) -> &'static str {
         DocRole::Paragraph => "#93c5fd",
         DocRole::Caption => "#0d9488",
         DocRole::ListItem => "#16a34a",
+        DocRole::Figure => "#7c3aed",
         DocRole::Other => "#9ca3af",
     }
 }
@@ -322,6 +323,11 @@ pub fn render_store(
     let mut text_html = String::new();
     for sd in &docs {
         for el in &sd.elements {
+            // figure OCR text is shown positioned on the page (purple) — keep it out of
+            // the prose spine here so the structured text stays clean
+            if el.role == DocRole::Figure {
+                continue;
+            }
             let t = esc(&el.text);
             text_html.push_str(&match el.role {
                 DocRole::Title => format!("<h2>{t}</h2>"),
